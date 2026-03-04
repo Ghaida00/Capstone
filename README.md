@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 <div align="center">
 
 # ⚡ Exploding User Data Scalabilities
@@ -34,6 +35,23 @@ Engineered to handle **1 million transactions per hour** with built-in resilienc
 - [License](#-license)
 
 ---
+=======
+Project: Exploding User Data Scalabilities (Topik B.4)
+"Built for Speed, Designed for Resilience."
+Repository ini berisi arsitektur dan implementasi prototype sistem manajemen beban puncak (Peak Load) yang mampu menangani lonjakan trafik secara efisien dan aman.
+
+🛡️ Key Features:
+High Performance: Backend menggunakan Rust (Axum & Tokio) untuk efisiensi memori dan latensi rendah.
+Resilience: Proteksi berlapis dengan Rate Limiting, Circuit Breaker, dan Dead Letter Queue (DLQ).
+Data Integrity: Mengimplementasikan Idempotency Key dan Asynchronous Processing via RabbitMQ.
+High Availability: Database PostgreSQL dengan konfigurasi 1 Primary & 2 Replicas serta mekanisme Failover/Promotion.
+Full Observability: Monitoring real-time menggunakan Prometheus & Grafana (Metrics, Logs, Tracing).
+
+📊 SLO Targets:
+Availability: 99.0%
+Latency: P95 < 500ms
+Error Budget: 100 Failed Transactions per 1M Request
+>>>>>>> parent of 56be1b3 (Revise README with project details and features)
 
 ## 🎯 Overview
 
