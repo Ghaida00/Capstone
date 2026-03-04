@@ -1,4 +1,5 @@
 <<<<<<< HEAD
+<<<<<<< HEAD
 <div align="center">
 
 # ⚡ Exploding User Data Scalabilities
@@ -36,6 +37,8 @@ Engineered to handle **1 million transactions per hour** with built-in resilienc
 
 ---
 =======
+=======
+>>>>>>> parent of 56be1b3 (Revise README with project details and features)
 Project: Exploding User Data Scalabilities (Topik B.4)
 "Built for Speed, Designed for Resilience."
 Repository ini berisi arsitektur dan implementasi prototype sistem manajemen beban puncak (Peak Load) yang mampu menangani lonjakan trafik secara efisien dan aman.
