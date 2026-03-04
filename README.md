@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⚡ GN Backend
+# ⚡ Exploding User Data Scalabilities
 
 **High-performance transaction processing backend built with Rust**
 
