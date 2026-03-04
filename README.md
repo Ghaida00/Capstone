@@ -122,6 +122,7 @@ flowchart TB
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
 | **Language** | Rust | Memory-safe, zero-cost abstractions |
+| **Memory Allocator** | mimalloc | Faster memory allocation under concurrency |
 | **HTTP Framework** | Axum 0.8 | Async, ergonomic HTTP server |
 | **Async Runtime** | Tokio | Multi-threaded work-stealing runtime |
 | **Database** | PostgreSQL 17 (2 Shards) | ACID-compliant, horizontally sharded DB |
@@ -154,6 +155,7 @@ flowchart TB
 │   ├── db/
 │   │   ├── mod.rs
 │   │   ├── pool.rs                # Read/write separated database pools
+│   │   ├── shard.rs               # Sharding logic and routing
 │   │   └── models.rs              # Transaction models (SQLx ↔ JSON)
 │   ├── cache/
 │   │   ├── mod.rs
@@ -166,7 +168,9 @@ flowchart TB
 │       ├── mod.rs
 │       ├── rate_limit.rs           # Per-IP token bucket rate limiter
 │       ├── circuit_breaker.rs      # Closed → Open → HalfOpen circuit breaker
-│       └── backpressure.rs         # Concurrency limiter with load shedding
+│       ├── backpressure.rs         # Concurrency limiter with load shedding
+│       ├── metrics.rs              # Prometheus metrics collector middleware
+│       └── request_id.rs           # Request ID injection and tracking
 ├── db/
 │   ├── init.sql                   # Schema with optimized indexes
 │   ├── primary-setup.sh           # PostgreSQL replication setup
@@ -185,7 +189,7 @@ flowchart TB
 │   └── load-test.js               # Load test: smoke, load, stress, spike
 ├── Cargo.toml                     # Dependencies + release optimizations
 ├── Dockerfile                     # Multi-stage build (~30MB final image)
-├── docker-compose.yml             # Full stack: 9 services
+├── docker-compose.yml             # Full stack: 19 services
 ├── .env.example                   # Configuration template
 ├── .gitignore
 ├── LICENSE
@@ -227,7 +231,8 @@ Expected health response:
 {
   "status": "healthy",
   "services": {
-    "database": true,
+    "database_write": true,
+    "database_read": true,
     "redis": true,
     "rabbitmq": true
   }
@@ -279,7 +284,7 @@ Response (`202 Accepted`):
   "data": {
     "reference_id": "550e8400-e29b-41d4-a716-446655440000",
     "status": "accepted",
-    "message": "Transaction queued for processing"
+    "message": "Transaction queued for processing (shard 0)"
   }
 }
 ```
@@ -384,6 +389,9 @@ k6 run --scenario smoke k6/load-test.js
 
 # Export results to JSON
 k6 run --out json=k6/output/results.json k6/load-test.js
+
+# Run 1 million transactions per hour test (sustained 278 TPS for 15+ mins)
+k6 run k6/load-test-1m.js
 ```
 
 ### Test Scenarios
@@ -394,12 +402,13 @@ k6 run --out json=k6/output/results.json k6/load-test.js
 | **Load** | 0 → 500 | 7min | Sustained target throughput |
 | **Stress** | 0 → 1,000 | 3min | Find breaking point |
 | **Spike** | 50 → 2,000 | 50s | Test sudden traffic burst |
+| **1M/Hour Sustained** | up to 1,500 | 15m+ | Guarantee 1 Million Transactions / hour (~278 TPS) |
 
 ### Thresholds
 
-- **p95 response time** < 500ms
-- **p99 response time** < 1000ms
-- **Error rate** < 5%
+- **p95 response time** < 100ms
+- **p99 response time** < 400ms
+- **Error rate** < 0.01%
 
 ---
 
