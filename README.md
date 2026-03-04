@@ -4,7 +4,7 @@
 
 **High-performance transaction processing backend built with Rust**
 
-Engineered to handle **10 million transactions per hour** with built-in resilience, caching, and observability.
+Engineered to handle **1 million transactions per hour** with built-in resilience, caching, and observability.
 
 [![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com/)
@@ -39,7 +39,7 @@ Engineered to handle **10 million transactions per hour** with built-in resilien
 
 GN Backend is a **production-grade transaction processing system** designed for extreme throughput and reliability. It demonstrates modern backend engineering patterns in Rust:
 
-- **~2,800 TPS sustained** (10M+ transactions/hour)
+- **~280 TPS sustained** (1M+ transactions/hour)
 - **Sub-millisecond cache reads** via Redis
 - **Async transaction processing** via RabbitMQ with dead-letter queues
 - **Read/write database separation** with streaming replication
@@ -51,24 +51,60 @@ GN Backend is a **production-grade transaction processing system** designed for 
 
 ## 🏗 Architecture
 
-```text
-                           ┌─────────────────────────────────────────────────────────┐
-                           │                    Docker Compose                       │
-                           │                                                         │
-    Client ──→ [ Nginx ] ──┼──→ [ Rust App ×N ] ─────→ [ Redis HA ] (cache)          │
-               (L1 rate    │        │    │                                           │
-                limit,     │        │    ├──→ [ pgBouncer S0 ] ──→ [ PG Shard 0 ]    │
-                LB)        │        │    │                                           │
-                           │        │    └──→ [ pgBouncer S1 ] ──→ [ PG Shard 1 ]    │
-                           │        │                                                │
-                           │        └──→ [ RabbitMQ ] ──→ [ Consumer Worker ]        │
-                           │                                     │                   │
-                           │   [ Prometheus ] ←── scrape ──── /metrics               │
-                           │        │                                                │
-                           │   [ Grafana ] ← dashboards                              │
-                           │        │                                                │
-                           │   [ cAdvisor ] ← container metrics                      │
-                           └─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    Client((Client)) -->|API Requests| Nginx{Nginx<br>Reverse Proxy & LB}
+    
+    subgraph "Docker Compose Environment - GN Backend"
+        direction TB
+        
+        Nginx -->|Round Robin| RustApp[Rust App API ×N<br>L2 Rate Limit, Circuit Breaker]
+        
+        subgraph "Caching Layer"
+            RustApp -- "Read/Cache Miss<br>Sub-millisecond" --> Redis[(Redis HA<br>Cluster)]
+        end
+        
+        subgraph "Message Broker"
+            RustApp -- "Publish<br>(Async Write)" --> RabbitMQ[[RabbitMQ<br>Exchanges & Queues]]
+            RabbitMQ -- "Consume" --> Worker[Consumer Worker]
+        end
+        
+        subgraph "Database Layer (Sharded)"
+            Worker -- "Persist Transaction" --> PgBouncerS0[pgBouncer S0]
+            Worker -- "Persist Transaction" --> PgBouncerS1[pgBouncer S1]
+            
+            RustApp -- "Read Fallback" --> PgBouncerS0
+            RustApp -- "Read Fallback" --> PgBouncerS1
+            
+            PgBouncerS0 --> PG0[(PostgreSQL<br>Shard 0 Primary)]
+            PgBouncerS1 --> PG1[(PostgreSQL<br>Shard 1 Primary)]
+            
+            PG0 -.->|Streaming Replication| PG0Rep[(PG Shard 0 Replica)]
+            PG1 -.->|Streaming Replication| PG1Rep[(PG Shard 1 Replica)]
+            
+            PgBouncerS0 -.-> PG0Rep
+            PgBouncerS1 -.-> PG1Rep
+        end
+        
+        subgraph "Observability Stack"
+            RustApp -.-> |/metrics| Prometheus((Prometheus))
+            Worker -.-> |/metrics| Prometheus
+            cAdvisor[cAdvisor] -.->|Container Metrics| Prometheus
+            Prometheus -.-> |Query| Grafana[Grafana Dashboard]
+        end
+    end
+    
+    classDef primary fill:#4169E1,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef replica fill:#7b9ded,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef broker fill:#FF6600,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef cache fill:#DC382D,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef app fill:#000000,stroke:#fff,stroke-width:2px,color:#fff;
+    
+    class PG0,PG1 primary;
+    class PG0Rep,PG1Rep replica;
+    class RabbitMQ broker;
+    class Redis cache;
+    class RustApp,Worker app;
 ```
 
 ### Request Flow
