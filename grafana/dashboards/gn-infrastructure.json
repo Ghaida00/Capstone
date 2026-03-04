@@ -1,0 +1,604 @@
+{
+    "annotations": {
+        "list": []
+    },
+    "editable": true,
+    "fiscalYearStartMonth": 0,
+    "graphTooltip": 1,
+    "id": null,
+    "links": [],
+    "panels": [
+        {
+            "title": "🖥️ CPU Usage per Container",
+            "type": "row",
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 0
+            },
+            "collapsed": false
+        },
+        {
+            "title": "CPU Usage % (all containers)",
+            "description": "CPU utilization per container — shows which containers consume the most CPU",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 10,
+                "w": 24,
+                "x": 0,
+                "y": 1
+            },
+            "targets": [
+                {
+                    "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"gn-.*\"}[30s])) * 100",
+                    "legendFormat": "{{name}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "percent",
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 15,
+                        "spanNulls": true,
+                        "stacking": {
+                            "mode": "none"
+                        }
+                    },
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 50
+                            },
+                            {
+                                "color": "red",
+                                "value": 80
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "title": "CPU — Top 5 Consumers (current)",
+            "description": "Containers consuming the most CPU right now",
+            "type": "bargauge",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 11
+            },
+            "targets": [
+                {
+                    "expr": "topk(5, sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"gn-.*\"}[1m])) * 100)",
+                    "legendFormat": "{{name}}",
+                    "refId": "A",
+                    "instant": true
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "percent",
+                    "thresholds": {
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 30
+                            },
+                            {
+                                "color": "red",
+                                "value": 60
+                            }
+                        ]
+                    }
+                }
+            },
+            "options": {
+                "orientation": "horizontal",
+                "displayMode": "gradient"
+            }
+        },
+        {
+            "title": "CPU — App Replicas",
+            "description": "CPU per app replica — should be roughly even",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 11
+            },
+            "targets": [
+                {
+                    "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"gn-app-.*\"}[30s])) * 100",
+                    "legendFormat": "{{name}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "percent",
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 2,
+                        "fillOpacity": 20,
+                        "spanNulls": true
+                    }
+                }
+            }
+        },
+        {
+            "title": "💾 Memory Usage per Container",
+            "type": "row",
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 19
+            },
+            "collapsed": false
+        },
+        {
+            "title": "Memory Usage (all containers)",
+            "description": "Working set memory per container — shows who's consuming the most RAM",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 10,
+                "w": 24,
+                "x": 0,
+                "y": 20
+            },
+            "targets": [
+                {
+                    "expr": "container_memory_working_set_bytes{name=~\"gn-.*\"}",
+                    "legendFormat": "{{name}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "bytes",
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 15,
+                        "spanNulls": true
+                    }
+                }
+            }
+        },
+        {
+            "title": "Memory — Top 5 Consumers (current)",
+            "description": "Containers using the most memory right now",
+            "type": "bargauge",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 30
+            },
+            "targets": [
+                {
+                    "expr": "topk(5, container_memory_working_set_bytes{name=~\"gn-.*\"})",
+                    "legendFormat": "{{name}}",
+                    "refId": "A",
+                    "instant": true
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "bytes",
+                    "thresholds": {
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 268435456
+                            },
+                            {
+                                "color": "red",
+                                "value": 536870912
+                            }
+                        ]
+                    }
+                }
+            },
+            "options": {
+                "orientation": "horizontal",
+                "displayMode": "gradient"
+            }
+        },
+        {
+            "title": "Memory — DB Shards",
+            "description": "Memory per PostgreSQL / pgBouncer container",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 30
+            },
+            "targets": [
+                {
+                    "expr": "container_memory_working_set_bytes{name=~\"gn-pg.*|gn-pgbouncer.*\"}",
+                    "legendFormat": "{{name}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "bytes",
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 2,
+                        "fillOpacity": 15,
+                        "spanNulls": true
+                    }
+                }
+            }
+        },
+        {
+            "title": "🌐 Network I/O per Container",
+            "type": "row",
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 38
+            },
+            "collapsed": false
+        },
+        {
+            "title": "Network Receive (bytes/s)",
+            "description": "Incoming network traffic per container",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 39
+            },
+            "targets": [
+                {
+                    "expr": "sum by (name) (rate(container_network_receive_bytes_total{name=~\"gn-.*\"}[30s]))",
+                    "legendFormat": "{{name}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "Bps",
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 15,
+                        "spanNulls": true
+                    }
+                }
+            }
+        },
+        {
+            "title": "Network Transmit (bytes/s)",
+            "description": "Outgoing network traffic per container",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 39
+            },
+            "targets": [
+                {
+                    "expr": "sum by (name) (rate(container_network_transmit_bytes_total{name=~\"gn-.*\"}[30s]))",
+                    "legendFormat": "{{name}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "Bps",
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 15,
+                        "spanNulls": true
+                    }
+                }
+            }
+        },
+        {
+            "title": "📊 Resource Summary",
+            "type": "row",
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 47
+            },
+            "collapsed": false
+        },
+        {
+            "title": "Total Containers",
+            "type": "stat",
+            "gridPos": {
+                "h": 5,
+                "w": 4,
+                "x": 0,
+                "y": 48
+            },
+            "targets": [
+                {
+                    "expr": "count(container_memory_working_set_bytes{name=~\"gn-.*\"})",
+                    "refId": "A",
+                    "instant": true
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "thresholds": {
+                        "steps": [
+                            {
+                                "color": "blue",
+                                "value": null
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "title": "Total CPU Usage",
+            "type": "stat",
+            "gridPos": {
+                "h": 5,
+                "w": 5,
+                "x": 4,
+                "y": 48
+            },
+            "targets": [
+                {
+                    "expr": "sum(rate(container_cpu_usage_seconds_total{name=~\"gn-.*\"}[1m])) * 100",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "percent",
+                    "thresholds": {
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 200
+                            },
+                            {
+                                "color": "red",
+                                "value": 500
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "title": "Total Memory",
+            "type": "stat",
+            "gridPos": {
+                "h": 5,
+                "w": 5,
+                "x": 9,
+                "y": 48
+            },
+            "targets": [
+                {
+                    "expr": "sum(container_memory_working_set_bytes{name=~\"gn-.*\"})",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "bytes",
+                    "thresholds": {
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 4294967296
+                            },
+                            {
+                                "color": "red",
+                                "value": 8589934592
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "title": "Total Network RX",
+            "type": "stat",
+            "gridPos": {
+                "h": 5,
+                "w": 5,
+                "x": 14,
+                "y": 48
+            },
+            "targets": [
+                {
+                    "expr": "sum(rate(container_network_receive_bytes_total{name=~\"gn-.*\"}[30s]))",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "Bps",
+                    "thresholds": {
+                        "steps": [
+                            {
+                                "color": "purple",
+                                "value": null
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "title": "Total Network TX",
+            "type": "stat",
+            "gridPos": {
+                "h": 5,
+                "w": 5,
+                "x": 19,
+                "y": 48
+            },
+            "targets": [
+                {
+                    "expr": "sum(rate(container_network_transmit_bytes_total{name=~\"gn-.*\"}[30s]))",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "Bps",
+                    "thresholds": {
+                        "steps": [
+                            {
+                                "color": "semi-dark-blue",
+                                "value": null
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "title": "Container Memory Usage (table)",
+            "description": "Sortable table of all container memory and CPU",
+            "type": "table",
+            "gridPos": {
+                "h": 10,
+                "w": 24,
+                "x": 0,
+                "y": 53
+            },
+            "targets": [
+                {
+                    "expr": "container_memory_working_set_bytes{name=~\"gn-.*\"}",
+                    "legendFormat": "{{name}}",
+                    "refId": "A",
+                    "instant": true,
+                    "format": "table"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "bytes"
+                },
+                "overrides": [
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "name"
+                        },
+                        "properties": [
+                            {
+                                "id": "custom.width",
+                                "value": 250
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "Value"
+                        },
+                        "properties": [
+                            {
+                                "id": "displayName",
+                                "value": "Memory (bytes)"
+                            },
+                            {
+                                "id": "custom.width",
+                                "value": 150
+                            }
+                        ]
+                    }
+                ]
+            },
+            "transformations": [
+                {
+                    "id": "organize",
+                    "options": {
+                        "excludeByName": {
+                            "Time": true,
+                            "__name__": true,
+                            "id": true,
+                            "image": true,
+                            "instance": true,
+                            "job": true
+                        },
+                        "renameByName": {
+                            "name": "Container",
+                            "Value": "Memory"
+                        }
+                    }
+                },
+                {
+                    "id": "sortBy",
+                    "options": {
+                        "sort": [
+                            {
+                                "field": "Memory",
+                                "desc": true
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    ],
+    "refresh": "5s",
+    "schemaVersion": 39,
+    "tags": [
+        "gn-backend",
+        "infrastructure",
+        "containers"
+    ],
+    "templating": {
+        "list": []
+    },
+    "time": {
+        "from": "now-15m",
+        "to": "now"
+    },
+    "timepicker": {},
+    "timezone": "browser",
+    "title": "GN Infrastructure — Container Resources",
+    "uid": "gn-infra-containers",
+    "version": 1
+}

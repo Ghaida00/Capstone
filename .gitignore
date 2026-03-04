@@ -1,0 +1,40 @@
+# ─── Build Artifacts ────────────────────────────────────────
+/target/
+**/*.rs.bk
+*.pdb
+
+# ─── Environment ────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ─── Docker ─────────────────────────────────────────────────
+docker-compose.override.yml
+
+# ─── IDE / Editor ───────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── OS ─────────────────────────────────────────────────────
+*.exe
+*.dll
+*.so
+*.dylib
+
+# ─── Test / Coverage ───────────────────────────────────────
+lcov.info
+tarpaulin-report.html
+coverage/
+
+# ─── Logs ───────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── k6 output ──────────────────────────────────────────────
+k6/output/
+*.json.gz

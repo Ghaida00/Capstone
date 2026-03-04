@@ -1,0 +1,54 @@
+[package]
+name = "gn-backend"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance transaction processing backend"
+
+[dependencies]
+# Memory allocator (faster than default under concurrency)
+mimalloc = { version = "0.1", default-features = false }
+# Web framework & async runtime
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace", "timeout"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "migrate", "bigdecimal"] }
+bigdecimal = "0.4"
+
+# Cache
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+deadpool-redis = "0.18"
+
+# Message Queue (RabbitMQ) — native Tokio async
+amqprs = { version = "2", features = ["urispec", "traces"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+
+# Logging & Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Prometheus metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # GN Backend Application (all replicas via Docker DNS)
+  - job_name: "gn-backend"
+    dns_sd_configs:
+      - names:
+          - "app"
+        type: A
+        port: 3000
+    metrics_path: /metrics
+
+  # cAdvisor — per-container resource metrics
+  - job_name: "cadvisor"
+    static_configs:
+      - targets: ["cadvisor:8080"]
+    metric_relabel_configs:
+      - source_labels: [name]
+        regex: "^/(.*)"
+        target_label: name
+        replacement: "$1"
+      - source_labels: [name]
+        regex: "gn-.*"
+        action: keep
+
+  # Prometheus self-monitoring
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

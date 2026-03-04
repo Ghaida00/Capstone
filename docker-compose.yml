@@ -1,0 +1,579 @@
+name: gn
+
+services:
+  # ============================================================
+  # Nginx — Reverse Proxy & Load Balancer
+  # ============================================================
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: gn-nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "1"
+
+  # ============================================================
+  # Rust Application — 6 replicas
+  # ============================================================
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    expose:
+      - "3000"
+    depends_on:
+      pgbouncer-shard0:
+        condition: service_healthy
+      pgbouncer-shard1:
+        condition: service_healthy
+      redis-master:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          memory: 512M
+          cpus: "2"
+
+  # ============================================================
+  # SHARD 0 — PostgreSQL Primary + 2 Replicas + pgBouncer
+  # ============================================================
+  pg-shard0-primary:
+    image: postgres:17-alpine
+    container_name: gn-pg-shard0-primary
+    environment:
+      POSTGRES_DB: gn_db
+      POSTGRES_USER: gn_user
+      POSTGRES_PASSWORD: gn_secure_pass
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - pg_shard0_primary_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./db/primary-setup.sh:/docker-entrypoint-initdb.d/02-primary-setup.sh:ro
+    command: >
+      postgres
+        -c wal_level=replica
+        -c max_wal_senders=10
+        -c max_replication_slots=10
+        -c hot_standby=on
+        -c shared_buffers=128MB
+        -c effective_cache_size=768MB
+        -c work_mem=4MB
+        -c maintenance_work_mem=64MB
+        -c max_connections=300
+        -c checkpoint_completion_target=0.9
+        -c random_page_cost=1.1
+        -c synchronous_commit=off
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U gn_user -d gn_db" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1"
+
+  pg-shard0-replica1:
+    image: postgres:17-alpine
+    container_name: gn-pg-shard0-replica1
+    environment:
+      PGUSER: gn_user
+      PGPASSWORD: gn_secure_pass
+      PRIMARY_HOST: pg-shard0-primary
+    volumes:
+      - pg_shard0_replica1_data:/var/lib/postgresql/data
+      - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+    entrypoint: [ "/bin/sh", "/replica-entrypoint.sh" ]
+    depends_on:
+      pg-shard0-primary:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U gn_user" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1"
+
+  pg-shard0-replica2:
+    image: postgres:17-alpine
+    container_name: gn-pg-shard0-replica2
+    environment:
+      PGUSER: gn_user
+      PGPASSWORD: gn_secure_pass
+      PRIMARY_HOST: pg-shard0-primary
+    volumes:
+      - pg_shard0_replica2_data:/var/lib/postgresql/data
+      - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+    entrypoint: [ "/bin/sh", "/replica-entrypoint.sh" ]
+    depends_on:
+      pg-shard0-primary:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U gn_user" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1"
+
+  pgbouncer-shard0:
+    image: edoburu/pgbouncer:latest
+    container_name: gn-pgbouncer-shard0
+    environment:
+      DATABASE_URL: postgres://gn_user:gn_secure_pass@pg-shard0-primary:5432/gn_db
+      AUTH_TYPE: plain
+      POOL_MODE: transaction
+      DEFAULT_POOL_SIZE: 40
+      MAX_CLIENT_CONN: 500
+      MAX_DB_CONNECTIONS: 100
+      MIN_POOL_SIZE: 15
+      RESERVE_POOL_SIZE: 10
+      RESERVE_POOL_TIMEOUT: 3
+      SERVER_IDLE_TIMEOUT: 300
+      SERVER_LIFETIME: 3600
+      LOG_CONNECTIONS: 0
+      LOG_DISCONNECTIONS: 0
+    expose:
+      - "5432"
+    depends_on:
+      pg-shard0-primary:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U gn_user" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.5"
+
+  # ============================================================
+  # SHARD 1 — PostgreSQL Primary + 2 Replicas + pgBouncer
+  # ============================================================
+  pg-shard1-primary:
+    image: postgres:17-alpine
+    container_name: gn-pg-shard1-primary
+    environment:
+      POSTGRES_DB: gn_db
+      POSTGRES_USER: gn_user
+      POSTGRES_PASSWORD: gn_secure_pass
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - pg_shard1_primary_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./db/primary-setup.sh:/docker-entrypoint-initdb.d/02-primary-setup.sh:ro
+    command: >
+      postgres
+        -c wal_level=replica
+        -c max_wal_senders=10
+        -c max_replication_slots=10
+        -c hot_standby=on
+        -c shared_buffers=128MB
+        -c effective_cache_size=768MB
+        -c work_mem=4MB
+        -c maintenance_work_mem=64MB
+        -c max_connections=300
+        -c checkpoint_completion_target=0.9
+        -c random_page_cost=1.1
+        -c synchronous_commit=off
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U gn_user -d gn_db" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1"
+
+  pg-shard1-replica1:
+    image: postgres:17-alpine
+    container_name: gn-pg-shard1-replica1
+    environment:
+      PGUSER: gn_user
+      PGPASSWORD: gn_secure_pass
+      PRIMARY_HOST: pg-shard1-primary
+    volumes:
+      - pg_shard1_replica1_data:/var/lib/postgresql/data
+      - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+    entrypoint: [ "/bin/sh", "/replica-entrypoint.sh" ]
+    depends_on:
+      pg-shard1-primary:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U gn_user" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1"
+
+  pg-shard1-replica2:
+    image: postgres:17-alpine
+    container_name: gn-pg-shard1-replica2
+    environment:
+      PGUSER: gn_user
+      PGPASSWORD: gn_secure_pass
+      PRIMARY_HOST: pg-shard1-primary
+    volumes:
+      - pg_shard1_replica2_data:/var/lib/postgresql/data
+      - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+    entrypoint: [ "/bin/sh", "/replica-entrypoint.sh" ]
+    depends_on:
+      pg-shard1-primary:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U gn_user" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1"
+
+  pgbouncer-shard1:
+    image: edoburu/pgbouncer:latest
+    container_name: gn-pgbouncer-shard1
+    environment:
+      DATABASE_URL: postgres://gn_user:gn_secure_pass@pg-shard1-primary:5432/gn_db
+      AUTH_TYPE: plain
+      POOL_MODE: transaction
+      DEFAULT_POOL_SIZE: 40
+      MAX_CLIENT_CONN: 500
+      MAX_DB_CONNECTIONS: 100
+      MIN_POOL_SIZE: 15
+      RESERVE_POOL_SIZE: 10
+      RESERVE_POOL_TIMEOUT: 3
+      SERVER_IDLE_TIMEOUT: 300
+      SERVER_LIFETIME: 3600
+      LOG_CONNECTIONS: 0
+      LOG_DISCONNECTIONS: 0
+    expose:
+      - "5432"
+    depends_on:
+      pg-shard1-primary:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U gn_user" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.5"
+
+  # ============================================================
+  # Redis HA — Master + Replica + Sentinel
+  # ============================================================
+  redis-master:
+    image: redis:7-alpine
+    container_name: gn-redis-master
+    command: >
+      redis-server
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+        --save ""
+        --appendonly no
+        --tcp-backlog 511
+        --tcp-keepalive 300
+        --hz 100
+        --requirepass gn_redis_pass
+        --masterauth gn_redis_pass
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "gn_redis_pass", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1"
+
+  redis-replica:
+    image: redis:7-alpine
+    container_name: gn-redis-replica
+    command: >
+      redis-server
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+        --save ""
+        --appendonly no
+        --tcp-backlog 511
+        --tcp-keepalive 300
+        --hz 100
+        --requirepass gn_redis_pass
+        --masterauth gn_redis_pass
+        --replicaof redis-master 6379
+    expose:
+      - "6379"
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "gn_redis_pass", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+
+  redis-sentinel-1:
+    image: redis:7-alpine
+    container_name: gn-redis-sentinel-1
+    command: >
+      sh -c "cp /tmp/sentinel.conf /etc/sentinel.conf &&
+             chmod 644 /etc/sentinel.conf &&
+             redis-sentinel /etc/sentinel.conf"
+    volumes:
+      - ./redis/sentinel.conf:/tmp/sentinel.conf:ro
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    expose:
+      - "26379"
+    restart: unless-stopped
+    networks:
+      - gn-network
+
+  redis-sentinel-2:
+    image: redis:7-alpine
+    container_name: gn-redis-sentinel-2
+    command: >
+      sh -c "cp /tmp/sentinel.conf /etc/sentinel.conf &&
+             chmod 644 /etc/sentinel.conf &&
+             redis-sentinel /etc/sentinel.conf"
+    volumes:
+      - ./redis/sentinel.conf:/tmp/sentinel.conf:ro
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    expose:
+      - "26379"
+    restart: unless-stopped
+    networks:
+      - gn-network
+
+  redis-sentinel-3:
+    image: redis:7-alpine
+    container_name: gn-redis-sentinel-3
+    command: >
+      sh -c "cp /tmp/sentinel.conf /etc/sentinel.conf &&
+             chmod 644 /etc/sentinel.conf &&
+             redis-sentinel /etc/sentinel.conf"
+    volumes:
+      - ./redis/sentinel.conf:/tmp/sentinel.conf:ro
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    expose:
+      - "26379"
+    restart: unless-stopped
+    networks:
+      - gn-network
+
+  # ============================================================
+  # RabbitMQ — Async Message Queue
+  # ============================================================
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    container_name: gn-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: gn_user
+      RABBITMQ_DEFAULT_PASS: gn_secure_pass
+      RABBITMQ_DEFAULT_VHOST: /
+    expose:
+      - "5672"
+    ports:
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "-q", "check_running" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1"
+
+  # ============================================================
+  # Prometheus — Metrics Collection
+  # ============================================================
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    container_name: gn-prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1"
+
+  # ============================================================
+  # Grafana — Metrics Visualization
+  # ============================================================
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: gn-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "1"
+
+  # ============================================================
+  # cAdvisor — Per-Container Resource Monitoring
+  # ============================================================
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: gn-cadvisor
+    privileged: true
+    ports:
+      - "8081:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    restart: unless-stopped
+    networks:
+      - gn-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+
+volumes:
+  pg_shard0_primary_data:
+  pg_shard0_replica1_data:
+  pg_shard0_replica2_data:
+  pg_shard1_primary_data:
+  pg_shard1_replica1_data:
+  pg_shard1_replica2_data:
+  redis_data:
+  rabbitmq_data:
+  prometheus_data:
+  grafana_data:
+
+
+networks:
+  gn-network:
+    driver: bridge
