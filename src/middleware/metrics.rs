@@ -1,11 +1,10 @@
-use axum::{
-    extract::Request,
-    middleware::Next,
-    response::Response,
-};
+use axum::{extract::Request, middleware::Next, response::Response};
 
 /// Prometheus metrics middleware — automatically captures request count
-/// and latency for every route. Eliminates per-handler instrumentation.
+/// and latency for every route.
+///
+/// Uses OpenTelemetry semantic convention attribute keys for
+/// cross-service compatibility with tools like Grafana Tempo and Jaeger.
 pub async fn metrics_middleware(req: Request, next: Next) -> Response {
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
@@ -16,20 +15,20 @@ pub async fn metrics_middleware(req: Request, next: Next) -> Response {
     let status = response.status().as_u16().to_string();
     let duration = start.elapsed().as_secs_f64();
 
-    // Record request count
+    // Record request count (OTel semantic convention keys)
     metrics::counter!(
         "http_requests_total",
-        "method" => method.clone(),
-        "path" => path.clone(),
-        "status" => status
+        "http.request.method" => method.clone(),
+        "url.path" => path.clone(),
+        "http.response.status_code" => status
     )
     .increment(1);
 
     // Record latency histogram
     metrics::histogram!(
         "http_request_duration_seconds",
-        "method" => method,
-        "path" => path
+        "http.request.method" => method,
+        "url.path" => path
     )
     .record(duration);
 

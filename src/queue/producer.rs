@@ -1,8 +1,7 @@
 use amqprs::{
     callbacks::{DefaultChannelCallback, DefaultConnectionCallback},
     channel::{
-        BasicPublishArguments, ExchangeDeclareArguments, QueueBindArguments,
-        QueueDeclareArguments,
+        BasicPublishArguments, ExchangeDeclareArguments, QueueBindArguments, QueueDeclareArguments,
     },
     connection::{Connection, OpenConnectionArguments},
     BasicProperties,
@@ -238,14 +237,17 @@ pub fn parse_amqp_url(url: &str) -> Result<(String, u16, String, String), AppErr
         .split_once(':')
         .ok_or_else(|| AppError::Internal("Invalid AMQP URL: missing password".into()))?;
 
-    let (host, port_str) = hostport
-        .split_once(':')
-        .unwrap_or((hostport, "5672"));
+    let (host, port_str) = hostport.split_once(':').unwrap_or((hostport, "5672"));
 
     let port_str = port_str.split('/').next().unwrap_or("5672");
     let port: u16 = port_str
         .parse()
         .map_err(|_| AppError::Internal("Invalid AMQP port".into()))?;
 
-    Ok((host.to_string(), port, username.to_string(), password.to_string()))
+    Ok((
+        host.to_string(),
+        port,
+        username.to_string(),
+        password.to_string(),
+    ))
 }

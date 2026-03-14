@@ -1,5 +1,31 @@
 # ============================================================
-# Stage 1: Build the Rust application
+# Stage 1: Planner — generate the dependency recipe
+# ============================================================
+FROM rust:slim-bookworm AS planner
+
+RUN cargo install cargo-chef --locked
+
+WORKDIR /app
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ============================================================
+# Stage 2: Cacher — build only dependencies from the recipe
+# ============================================================
+FROM rust:slim-bookworm AS cacher
+
+RUN cargo install cargo-chef --locked
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# ============================================================
+# Stage 3: Builder — compile the actual application source
 # ============================================================
 FROM rust:slim-bookworm AS builder
 
@@ -10,37 +36,27 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Cache dependency builds
-COPY Cargo.toml Cargo.lock* ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release && rm -rf src
+# Re-use the cached dependency artifacts from the cacher stage
+COPY --from=cacher /app/target target
+COPY --from=cacher /usr/local/cargo /usr/local/cargo
 
-# Build actual application
-COPY src/ src/
-RUN touch src/main.rs && cargo build --release
+COPY . .
+RUN cargo build --release
 
 # ============================================================
-# Stage 2: Minimal runtime image
+# Stage 4: Runtime — Distroless production image
 # ============================================================
-FROM debian:bookworm-slim AS runtime
-
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libssl3 \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
+FROM gcr.io/distroless/cc-debian12 AS runtime
 
 COPY --from=builder /app/target/release/gn-backend /app/gn-backend
 
-# Non-root user for security
-RUN groupadd -r appuser && useradd -r -g appuser appuser
-USER appuser
+# Distroless ships with a built-in nonroot user (UID 65534)
+USER nonroot:nonroot
 
 EXPOSE 3000
 
-HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:3000/health || exit 1
+# No HEALTHCHECK here — distroless has no shell.
+# Health probes are defined in docker-compose.yml using the
+# container's exposed HTTP endpoint via service-level checks.
 
 CMD ["/app/gn-backend"]

@@ -1,10 +1,10 @@
-use thiserror::Error;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
 use serde_json::json;
+use thiserror::Error;
 
 /// Application-wide error type.
 #[derive(Error, Debug)]

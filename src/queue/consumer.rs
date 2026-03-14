@@ -1,13 +1,12 @@
 use amqprs::{
     callbacks::{DefaultChannelCallback, DefaultConnectionCallback},
-    channel::{
-        BasicAckArguments, BasicConsumeArguments, BasicNackArguments, BasicQosArguments,
-    },
+    channel::{BasicAckArguments, BasicConsumeArguments, BasicNackArguments, BasicQosArguments},
     connection::{Connection, OpenConnectionArguments},
     consumer::AsyncConsumer,
     BasicProperties, Deliver,
 };
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -52,15 +51,23 @@ pub struct QueueConsumer;
 
 impl QueueConsumer {
     /// Start consuming messages from the transaction queue.
-    pub async fn start(config: &Config, shard_router: ShardRouter) -> Result<JoinHandle<()>, AppError> {
+    ///
+    /// The `cancel` token enables coordinated graceful shutdown: when
+    /// triggered, the flush-timer loop will drain any remaining buffer
+    /// and then exit rather than sleeping forever.
+    pub async fn start(
+        config: &Config,
+        shard_router: ShardRouter,
+        cancel: CancellationToken,
+    ) -> Result<JoinHandle<()>, AppError> {
         let (host, port, username, password) =
             super::producer::parse_amqp_url(&config.rabbitmq_url)?;
 
         let args = OpenConnectionArguments::new(&host, port, &username, &password);
 
-        let connection = Connection::open(&args)
-            .await
-            .map_err(|e| AppError::Internal(format!("Consumer RabbitMQ connection error: {}", e)))?;
+        let connection = Connection::open(&args).await.map_err(|e| {
+            AppError::Internal(format!("Consumer RabbitMQ connection error: {}", e))
+        })?;
 
         connection
             .register_callback(DefaultConnectionCallback)
@@ -87,18 +94,38 @@ impl QueueConsumer {
             buffer: Arc::new(Mutex::new(Vec::with_capacity(BATCH_SIZE))),
         };
 
-        // Spawn flush timer
+        // Spawn flush timer — respects the cancellation token
         let buffer_ref = consumer.buffer.clone();
         let router_ref = consumer.shard_router.clone();
+        let flush_cancel = cancel.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_millis(BATCH_FLUSH_MS)).await;
-                let mut buf = buffer_ref.lock().await;
-                if !buf.is_empty() {
-                    let batch: Vec<PendingMessage> = buf.drain(..).collect();
-                    drop(buf);
-                    if let Err(e) = flush_batch_to_shards(&batch, &router_ref).await {
-                        tracing::error!(error = %e, "Timer flush error");
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(BATCH_FLUSH_MS)) => {
+                        let mut buf = buffer_ref.lock().await;
+                        if !buf.is_empty() {
+                            let batch: Vec<PendingMessage> = buf.drain(..).collect();
+                            drop(buf);
+                            if let Err(e) = flush_batch_to_shards(&batch, &router_ref).await {
+                                tracing::error!(error = %e, "Timer flush error");
+                            }
+                        }
+                    }
+                    _ = flush_cancel.cancelled() => {
+                        // Final flush on shutdown
+                        tracing::info!("Consumer flush timer: cancellation received, draining buffer...");
+                        let mut buf = buffer_ref.lock().await;
+                        if !buf.is_empty() {
+                            let batch: Vec<PendingMessage> = buf.drain(..).collect();
+                            drop(buf);
+                            if let Err(e) = flush_batch_to_shards(&batch, &router_ref).await {
+                                tracing::error!(error = %e, "Final flush error during shutdown");
+                            } else {
+                                tracing::info!(count = batch.len(), "Final buffer flushed successfully");
+                            }
+                        }
+                        tracing::info!("Consumer flush timer exiting");
+                        break;
                     }
                 }
             }
@@ -117,12 +144,12 @@ impl QueueConsumer {
             "RabbitMQ shard-aware batch consumer started"
         );
 
+        // Keep the connection alive until cancellation
         let handle = tokio::spawn(async move {
             let _connection = connection;
             let _channel = channel;
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
-            }
+            cancel.cancelled().await;
+            tracing::info!("Consumer connection holder: cancellation received, closing...");
         });
 
         Ok(handle)
@@ -278,7 +305,9 @@ async fn flush_batch_to_shards(
     }
 
     for handle in handles {
-        handle.await.map_err(|e| AppError::Internal(format!("Join error: {}", e)))??;
+        handle
+            .await
+            .map_err(|e| AppError::Internal(format!("Join error: {}", e)))??;
     }
 
     Ok(total)
