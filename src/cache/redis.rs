@@ -1,6 +1,6 @@
-use deadpool_redis::{Config as RedisConfig, Pool, Runtime, Connection};
 use ::redis::AsyncCommands;
-use serde::{Serialize, de::DeserializeOwned};
+use deadpool_redis::{Config as RedisConfig, Connection, Pool, Runtime};
+use serde::{de::DeserializeOwned, Serialize};
 use std::time::Duration;
 
 use crate::config::Config;
@@ -18,7 +18,7 @@ pub struct RedisCache {
 
 impl RedisCache {
     /// Create a new Redis cache from configuration.
-    pub fn new(config: &Config) -> Result<Self, AppError> {
+    pub async fn new(config: &Config) -> Result<Self, AppError> {
         // Write pool → redis-master
         let write_cfg = RedisConfig::from_url(&config.redis_url);
         let write_pool = write_cfg
@@ -51,10 +51,30 @@ impl RedisCache {
             "Redis cache pools initialized (read/write split)"
         );
 
-        Ok(Self {
+        let cache = Self {
             write_pool,
             read_pool,
-        })
+        };
+
+        // Warm-up: eagerly establish connections and verify connectivity
+        tracing::info!("Warming up Redis write pool...");
+        if let Err(e) = cache.health_check().await {
+            tracing::warn!(error = %e, "Redis write pool warm-up failed (non-fatal)");
+        }
+        tracing::info!("Warming up Redis read pool...");
+        match cache.read_conn().await {
+            Ok(mut conn) => {
+                let result: Result<String, _> = ::redis::cmd("PING").query_async(&mut *conn).await;
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "Redis read pool warm-up failed (non-fatal)");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Redis read pool warm-up connection failed (non-fatal)");
+            }
+        }
+
+        Ok(cache)
     }
 
     /// Create a separate connection pool (for rate limiter, etc.)

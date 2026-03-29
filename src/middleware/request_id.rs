@@ -1,6 +1,6 @@
 use axum::{
     extract::Request,
-    http::{HeaderValue, header},
+    http::{header, HeaderValue},
     middleware::Next,
     response::Response,
 };
@@ -31,10 +31,9 @@ pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
 
     // Add to response headers
     if let Ok(val) = HeaderValue::from_str(&request_id) {
-        response.headers_mut().insert(
-            header::HeaderName::from_static("x-request-id"),
-            val,
-        );
+        response
+            .headers_mut()
+            .insert(header::HeaderName::from_static("x-request-id"), val);
     }
 
     response

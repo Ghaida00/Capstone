@@ -1,8 +1,7 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    Extension,
-    Json,
+    Extension, Json,
 };
 use uuid::Uuid;
 
@@ -35,7 +34,10 @@ pub async fn create_transaction(
         ));
     }
 
-    let reference_id = req.reference_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+    let reference_id = req
+        .reference_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // ─── Idempotency Check (Redis) ─────────────────────────
     let idempotency_key = format!("idempotency:{}", reference_id);
@@ -91,10 +93,7 @@ pub async fn create_transaction(
 
     metrics::counter!("transactions_created_total").increment(1);
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ApiResponse::success(response)),
-    ))
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse::success(response))))
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -124,7 +123,6 @@ pub async fn get_transaction(
     let mut handles = Vec::new();
     for shard_idx in 0..state.shard_router.num_shards() {
         let pool = state.shard_router.reader(shard_idx).clone();
-        let id = id;
         handles.push(tokio::spawn(async move {
             sqlx::query_as::<_, TransactionRow>("SELECT * FROM transactions WHERE id = $1")
                 .bind(id)
@@ -156,7 +154,11 @@ pub async fn list_transactions(
 
     // 1s cache for list endpoint
     let cache_key = format!("txn_list:{}:{}", limit, offset);
-    if let Ok(Some(cached)) = state.cache.get::<Vec<TransactionResponse>>(&cache_key).await {
+    if let Ok(Some(cached)) = state
+        .cache
+        .get::<Vec<TransactionResponse>>(&cache_key)
+        .await
+    {
         metrics::counter!("cache_hits_total").increment(1);
         return Ok(Json(ApiResponse::success(cached)));
     }
@@ -165,8 +167,6 @@ pub async fn list_transactions(
     let mut handles = Vec::new();
     for shard_idx in 0..state.shard_router.num_shards() {
         let pool = state.shard_router.reader(shard_idx).clone();
-        let limit = limit;
-        let offset = offset;
         handles.push(tokio::spawn(async move {
             sqlx::query_as::<_, TransactionRow>(
                 "SELECT * FROM transactions ORDER BY created_at DESC LIMIT $1 OFFSET $2",

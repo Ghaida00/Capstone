@@ -65,11 +65,28 @@ impl DatabasePool {
             read_pools.push(write_pool.clone());
         }
 
-        Ok(Self {
+        let pool = Self {
             write_pool,
             read_pools,
             read_index: std::sync::Arc::new(AtomicUsize::new(0)),
-        })
+        };
+
+        // Warm-up: eagerly establish minimum connections and verify connectivity.
+        // This eliminates the latency spike on the first request after deployment.
+        tracing::info!("Warming up write pool...");
+        sqlx::query("SELECT 1")
+            .execute(pool.writer())
+            .await
+            .map_err(|e| AppError::Internal(format!("Write pool warm-up failed: {}", e)))?;
+
+        for (i, rp) in pool.read_pools.iter().enumerate() {
+            tracing::info!(replica = i, "Warming up read pool...");
+            if let Err(e) = sqlx::query("SELECT 1").execute(rp).await {
+                tracing::warn!(replica = i, error = %e, "Read pool warm-up failed (non-fatal)");
+            }
+        }
+
+        Ok(pool)
     }
 
     /// Get the write pool.

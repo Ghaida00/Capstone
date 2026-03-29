@@ -9,7 +9,7 @@ use crate::error::AppError;
 use super::pool::DatabasePool;
 
 /// Number of database shards.
-const NUM_SHARDS: usize = 2;
+const NUM_SHARDS: usize = 3;
 
 /// Application-level shard router.
 /// Routes queries to the correct shard based on hash(from_account) % NUM_SHARDS.
@@ -32,6 +32,10 @@ impl ShardRouter {
                 &config.database_shard1_write_url,
                 &config.database_shard1_read_urls,
             ),
+            (
+                &config.database_shard2_write_url,
+                &config.database_shard2_read_urls,
+            ),
         ];
 
         for (i, (write_url, read_urls)) in shard_configs.into_iter().enumerate() {
@@ -42,9 +46,7 @@ impl ShardRouter {
                 config.db_read_pool_size,
             )
             .await
-            .map_err(|e| {
-                AppError::Internal(format!("Failed to connect to shard {}: {}", i, e))
-            })?;
+            .map_err(|e| AppError::Internal(format!("Failed to connect to shard {}: {}", i, e)))?;
 
             tracing::info!(shard = i, "Shard pool initialized");
             shards.push(pool);
@@ -108,10 +110,18 @@ impl ShardRouter {
         let mut all_read_ok = true;
 
         for shard in &self.shards {
-            if sqlx::query("SELECT 1").execute(shard.writer()).await.is_err() {
+            if sqlx::query("SELECT 1")
+                .execute(shard.writer())
+                .await
+                .is_err()
+            {
                 all_write_ok = false;
             }
-            if sqlx::query("SELECT 1").execute(shard.reader()).await.is_err() {
+            if sqlx::query("SELECT 1")
+                .execute(shard.reader())
+                .await
+                .is_err()
+            {
                 all_read_ok = false;
             }
         }
