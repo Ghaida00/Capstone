@@ -454,6 +454,15 @@ pub async fn get_balance(
     Ok(Json(ApiResponse::success(response)))
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct BalanceResponse {
+    pub account_number: String,
+    pub balance: String,
+    pub currency: String,
+    pub status: String,
+}
+
+
 // ─── Health & Metrics Handlers ─────────────────────────────────
 
 /// GET /health
