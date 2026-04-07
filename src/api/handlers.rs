@@ -382,6 +382,77 @@ pub struct ListParams {
     pub offset: Option<u32>,
 }
 
+/// GET /api/v1/transactions/status/{reference_id}
+/// Read-heavy endpoint (uses read replica + Redis cache)
+pub async fn get_transaction_status(
+    State(state): State<AppState>,
+    Path(reference_id): Path<String>,
+) -> AppResult<Json<ApiResponse<TransactionStatusResponse>>> {
+
+    if reference_id.is_empty() {
+        return Err(AppError::BadRequest(
+            "reference_id must not be empty".into()
+        ));
+    }
+
+    let cache_key = format!("tx_status:{}", reference_id);
+
+    // 1️⃣ Try Redis first
+    if let Some(cached) = state
+        .cache
+        .get::<TransactionStatusResponse>(&cache_key)
+        .await?
+    {
+        metrics::counter!("cache_hits_total").increment(1);
+
+        return Ok(Json(ApiResponse::success(cached)));
+    }
+
+    metrics::counter!("cache_misses_total").increment(1);
+
+    // 2️⃣ Search across shards
+    for shard in state.shard_router.all_shards() {
+
+        if let Some(row) = sqlx::query!(
+            r#"
+            SELECT reference_id, status, processed_at
+            FROM transactions
+            WHERE reference_id = $1
+            "#,
+            reference_id
+        )
+        .fetch_optional(shard.reader())
+        .await?
+        {
+
+            let response = TransactionStatusResponse {
+                reference_id: row.reference_id.unwrap_or_default(),
+                status: row.status,
+                processed_at: row.processed_at,
+            };
+
+            let _ = state
+                .cache
+                .set(&cache_key, &response, 60)
+                .await;
+
+            return Ok(Json(ApiResponse::success(response)));
+        }
+    }
+
+    Err(AppError::NotFound(format!(
+        "Transaction {} not found",
+        reference_id
+    )))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct TransactionStatusResponse {
+    pub reference_id: String,
+    pub status: String,
+    pub processed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// GET /api/v1/users/:account_number/balance
 /// Read-heavy endpoint (uses read replica + Redis cache)
 pub async fn get_balance(
