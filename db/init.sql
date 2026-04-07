@@ -90,16 +90,20 @@ CREATE TRIGGER trigger_update_users_updated_at
 -- ============================================================
 -- Idempotency Keys Table
 -- ============================================================
-CREATE TABLE idempotency_keys (
-    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    idempotency_key     VARCHAR(120) NOT NULL UNIQUE,
-    request_hash        VARCHAR(128) NOT NULL,
-    status              VARCHAR(20) NOT NULL DEFAULT 'pending'
-                        CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'expired')),
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    id UUID             PRIMARY KEY DEFAULT uuid_generate_v4(),
+
+    idempotency_key     TEXT UNIQUE NOT NULL,
+    request_hash        TEXT NOT NULL,
+
+    status VARCHAR(20)  NOT NULL DEFAULT 'pending',
+
     response_payload    JSONB,
+
     expires_at          TIMESTAMPTZ NOT NULL,
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX idx_idempotency_keys_status ON idempotency_keys (status);
