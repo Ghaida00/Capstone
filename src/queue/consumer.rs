@@ -24,6 +24,7 @@ const BATCH_SIZE: usize = 50;
 const BATCH_FLUSH_MS: u64 = 100;
 
 /// Pending message awaiting batch flush.
+#[derive(Clone)]
 struct PendingMessage {
     delivery_tag: u64,
     request: CreateTransactionRequest,
@@ -263,7 +264,12 @@ async fn flush_batch_to_shards(
     let mut handles = Vec::new();
     for (shard_idx, messages) in shard_groups {
         let pool = router.writer(shard_idx).clone();
-        let count = messages.len();
+
+        // clone messages supaya owned
+        let owned_messages: Vec<PendingMessage> =
+            messages.into_iter().cloned().collect();
+
+        let count = owned_messages.len();
 
         let mut ids: Vec<Uuid> = Vec::with_capacity(count);
         let mut from_accounts: Vec<String> = Vec::with_capacity(count);
@@ -272,7 +278,7 @@ async fn flush_batch_to_shards(
         let mut currencies: Vec<String> = Vec::with_capacity(count);
         let mut reference_ids: Vec<Option<String>> = Vec::with_capacity(count);
 
-        for msg in &messages {
+        for msg in &owned_messages {
             ids.push(Uuid::new_v4());
             from_accounts.push(msg.request.from_account.clone());
             to_accounts.push(msg.request.to_account.clone());
@@ -282,15 +288,45 @@ async fn flush_batch_to_shards(
         }
 
         handles.push(tokio::spawn(async move {
+
+            apply_balance_updates(&pool, &owned_messages).await?;
+
+            let count = owned_messages.len();
+
+            let mut ids = Vec::with_capacity(count);
+            let mut from_accounts = Vec::with_capacity(count);
+            let mut to_accounts = Vec::with_capacity(count);
+            let mut amounts = Vec::with_capacity(count);
+            let mut currencies = Vec::with_capacity(count);
+            let mut reference_ids = Vec::with_capacity(count);
+
+            for msg in &owned_messages {
+                ids.push(Uuid::new_v4());
+                from_accounts.push(msg.request.from_account.clone());
+                to_accounts.push(msg.request.to_account.clone());
+                amounts.push(msg.request.amount);
+                currencies.push(msg.request.currency.clone());
+                reference_ids.push(msg.request.reference_id.clone());
+            }
+
             sqlx::query(
                 r#"
-                INSERT INTO transactions (id, from_account, to_account, amount, currency, status, reference_id, processed_at)
-                SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::float8[], $5::text[], 
-                                     ARRAY_FILL('completed'::text, ARRAY[$7::int]),
-                                     $6::text[], 
-                                     ARRAY_FILL(NOW()::timestamptz, ARRAY[$7::int]))
+                INSERT INTO transactions (
+                    id, from_account, to_account, amount,
+                    currency, status, reference_id, processed_at
+                )
+                SELECT * FROM UNNEST(
+                    $1::uuid[],
+                    $2::text[],
+                    $3::text[],
+                    $4::float8[],
+                    $5::text[],
+                    ARRAY_FILL('completed'::text, ARRAY[$7::int]),
+                    $6::text[],
+                    ARRAY_FILL(NOW()::timestamptz, ARRAY[$7::int])
+                )
                 ON CONFLICT (reference_id) DO NOTHING
-                "#,
+                "#
             )
             .bind(&ids)
             .bind(&from_accounts)
@@ -301,6 +337,9 @@ async fn flush_batch_to_shards(
             .bind(count as i32)
             .execute(&pool)
             .await
+            .map_err(AppError::Database)?;
+
+            Ok::<(), AppError>(())
         }));
     }
 
@@ -311,4 +350,52 @@ async fn flush_batch_to_shards(
     }
 
     Ok(total)
+}
+
+async fn apply_balance_updates(
+    pool: &sqlx::PgPool,
+    messages: &[PendingMessage],
+) -> Result<(), AppError> {
+
+    let mut tx = pool.begin().await?;
+
+    for msg in messages {
+
+        // debit sender
+        let updated = sqlx::query(
+            r#"
+            UPDATE users
+            SET balance = balance - $1
+            WHERE account_number = $2
+            AND balance >= $1
+            "#,
+        )
+        .bind(msg.request.amount)
+        .bind(&msg.request.from_account)
+        .execute(&mut *tx)
+        .await?;
+
+        if updated.rows_affected() == 0 {
+            return Err(AppError::BadRequest(
+                "Insufficient balance".into()
+            ));
+        }
+
+        // credit receiver
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET balance = balance + $1
+            WHERE account_number = $2
+            "#,
+        )
+        .bind(msg.request.amount)
+        .bind(&msg.request.to_account)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+
+    Ok(())
 }
