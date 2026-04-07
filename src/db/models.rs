@@ -72,3 +72,15 @@ impl From<TransactionRow> for TransactionResponse {
         }
     }
 }
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct UserRow {
+    pub id: Uuid,
+    pub account_number: String,
+    pub full_name: String,
+    pub email: Option<String>,
+    pub balance: sqlx::types::BigDecimal,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
