@@ -9,7 +9,9 @@ use chrono::Utc;
 use serde_json::json;
 
 use crate::api::responses::{ApiResponse, HealthResponse, HealthServices};
-use crate::db::models::{CreateTransactionRequest, IdempotencyKeyRow, TransactionResponse, TransactionRow};
+use crate::db::models::{
+    CreateTransactionRequest, IdempotencyKeyRow, TransactionResponse, TransactionRow,
+};
 use crate::db::shard::ShardRouter;
 use crate::error::{AppError, AppResult};
 use crate::middleware::request_id::RequestId;
@@ -225,10 +227,7 @@ pub async fn create_transaction(
                     }
                 }
 
-                return Ok((
-                    StatusCode::ACCEPTED,
-                    Json(ApiResponse::success(response)),
-                ));
+                return Ok((StatusCode::ACCEPTED, Json(ApiResponse::success(response))));
             }
         } else {
             // Unexpected state: safest fallback is to return the current accepted response.
