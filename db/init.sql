@@ -61,6 +61,31 @@ CREATE TRIGGER trigger_update_transactions_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
+
+-- ============================================================
+-- Users Table
+-- ============================================================
+CREATE TABLE users (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    account_number  VARCHAR(50) NOT NULL UNIQUE,
+    full_name       VARCHAR(150) NOT NULL,
+    email           VARCHAR(150) UNIQUE,
+    balance         DECIMAL(18, 2) NOT NULL DEFAULT 0.00 CHECK (balance >= 0),
+    status          VARCHAR(20) NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'inactive', 'blocked')),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_users_account_number ON users (account_number);
+CREATE INDEX idx_users_email ON users (email);
+CREATE INDEX idx_users_status ON users (status);
+
+CREATE TRIGGER trigger_update_users_updated_at
+    BEFORE UPDATE ON users
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
 -- ============================================================
 -- Replication user for read replica
 -- ============================================================
