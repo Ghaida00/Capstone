@@ -388,21 +388,16 @@ pub async fn get_balance(
     State(state): State<AppState>,
     Path(account_number): Path<String>,
 ) -> AppResult<Json<ApiResponse<BalanceResponse>>> {
-
     if account_number.is_empty() {
         return Err(AppError::BadRequest(
-            "Account number must not be empty".into()
+            "Account number must not be empty".into(),
         ));
     }
 
     let cache_key = format!("balance:{}", account_number);
 
     // Try Redis cache first
-    if let Some(cached) = state
-        .cache
-        .get::<BalanceResponse>(&cache_key)
-        .await?
-    {
+    if let Some(cached) = state.cache.get::<BalanceResponse>(&cache_key).await? {
         metrics::counter!("cache_hits_total").increment(1);
 
         return Ok(Json(ApiResponse::success(cached)));
@@ -422,7 +417,7 @@ pub async fn get_balance(
         FROM users
         WHERE account_number = $1
         AND status = 'active'
-        "#
+        "#,
     )
     .bind(&account_number)
     .fetch_optional(reader)
@@ -446,10 +441,7 @@ pub async fn get_balance(
     };
 
     // Cache response (TTL 30 seconds)
-    let _ = state
-        .cache
-        .set(&cache_key, &response, 30)
-        .await;
+    let _ = state.cache.set(&cache_key, &response, 30).await;
 
     Ok(Json(ApiResponse::success(response)))
 }
@@ -461,7 +453,6 @@ pub struct BalanceResponse {
     pub currency: String,
     pub status: String,
 }
-
 
 // ─── Health & Metrics Handlers ─────────────────────────────────
 
