@@ -167,6 +167,10 @@ pub fn build_router(
             get(crate::api::handlers::get_transaction),
         )
         .route(
+            "/transactions/status/{reference_id}",
+            get(crate::api::handlers::get_transaction_status),
+        )
+        .route(
             "/users/{account_number}/balance",
             get(crate::api::handlers::get_balance),
         )
