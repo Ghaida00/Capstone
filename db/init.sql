@@ -86,6 +86,31 @@ CREATE TRIGGER trigger_update_users_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
+
+-- ============================================================
+-- Idempotency Keys Table
+-- ============================================================
+CREATE TABLE idempotency_keys (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    idempotency_key     VARCHAR(120) NOT NULL UNIQUE,
+    request_hash        VARCHAR(128) NOT NULL,
+    status              VARCHAR(20) NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'expired')),
+    response_payload    JSONB,
+    expires_at          TIMESTAMPTZ NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_idempotency_keys_status ON idempotency_keys (status);
+CREATE INDEX idx_idempotency_keys_expires_at ON idempotency_keys (expires_at);
+
+CREATE TRIGGER trigger_update_idempotency_keys_updated_at
+    BEFORE UPDATE ON idempotency_keys
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+
 -- ============================================================
 -- Replication user for read replica
 -- ============================================================
