@@ -10,7 +10,7 @@ use serde_json::json;
 
 use crate::api::responses::{ApiResponse, HealthResponse, HealthServices};
 use crate::db::models::{
-    CreateTransactionRequest, IdempotencyKeyRow, TransactionResponse, TransactionRow,
+    CreateTransactionRequest, IdempotencyKeyRow, TransactionResponse, TransactionRow, UserRow,
 };
 use crate::db::shard::ShardRouter;
 use crate::error::{AppError, AppResult};
@@ -380,6 +380,78 @@ pub async fn list_transactions(
 pub struct ListParams {
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+}
+
+/// GET /api/v1/users/:account_number/balance
+/// Read-heavy endpoint (uses read replica + Redis cache)
+pub async fn get_balance(
+    State(state): State<AppState>,
+    Path(account_number): Path<String>,
+) -> AppResult<Json<ApiResponse<BalanceResponse>>> {
+
+    if account_number.is_empty() {
+        return Err(AppError::BadRequest(
+            "Account number must not be empty".into()
+        ));
+    }
+
+    let cache_key = format!("balance:{}", account_number);
+
+    // Try Redis cache first
+    if let Some(cached) = state
+        .cache
+        .get::<BalanceResponse>(&cache_key)
+        .await?
+    {
+        metrics::counter!("cache_hits_total").increment(1);
+
+        return Ok(Json(ApiResponse::success(cached)));
+    }
+
+    metrics::counter!("cache_misses_total").increment(1);
+
+    // Route to correct shard (read replica)
+    let shard = ShardRouter::shard_for(&account_number);
+
+    let reader = state.shard_router.reader(shard);
+
+    // Query DB
+    let row: Option<UserRow> = sqlx::query_as(
+        r#"
+        SELECT *
+        FROM users
+        WHERE account_number = $1
+        AND status = 'active'
+        "#
+    )
+    .bind(&account_number)
+    .fetch_optional(reader)
+    .await?;
+
+    let row = match row {
+        Some(r) => r,
+        None => {
+            return Err(AppError::NotFound(format!(
+                "Account {} not found",
+                account_number
+            )))
+        }
+    };
+
+    let response = BalanceResponse {
+        account_number: row.account_number,
+        balance: row.balance.to_string(),
+        currency: "IDR".to_string(),
+        status: row.status,
+    };
+
+    // Cache response (TTL 30 seconds)
+    let _ = state
+        .cache
+        .set(&cache_key, &response, 30)
+        .await;
+
+    Ok(Json(ApiResponse::success(response)))
 }
 
 // ─── Health & Metrics Handlers ─────────────────────────────────
