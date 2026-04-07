@@ -413,7 +413,7 @@ pub async fn get_transaction_status(
     // 2️⃣ Search across shards
     for shard in state.shard_router.all_shards() {
 
-        if let Some(row) = sqlx::query!(
+        if let Some(row) = sqlx::query_as::<_, TransactionStatusRow>(
             r#"
             SELECT reference_id, status, processed_at
             FROM transactions
