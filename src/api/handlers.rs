@@ -10,7 +10,7 @@ use serde_json::json;
 
 use crate::api::responses::{ApiResponse, HealthResponse, HealthServices};
 use crate::db::models::{
-    CreateTransactionRequest, IdempotencyKeyRow, TransactionResponse, TransactionRow, UserRow,
+    CreateTransactionRequest, IdempotencyKeyRow, TransactionResponse, TransactionRow, TransactionStatusRow, UserRow,
 };
 use crate::db::shard::ShardRouter;
 use crate::error::{AppError, AppResult};
@@ -397,7 +397,7 @@ pub async fn get_transaction_status(
 
     let cache_key = format!("tx_status:{}", reference_id);
 
-    // 1️⃣ Try Redis first
+    // Try Redis first
     if let Some(cached) = state
         .cache
         .get::<TransactionStatusResponse>(&cache_key)
@@ -410,7 +410,7 @@ pub async fn get_transaction_status(
 
     metrics::counter!("cache_misses_total").increment(1);
 
-    // 2️⃣ Search across shards
+    // Search across shards
     for shard in state.shard_router.all_shards() {
 
         if let Some(row) = sqlx::query_as::<_, TransactionStatusRow>(
@@ -418,9 +418,9 @@ pub async fn get_transaction_status(
             SELECT reference_id, status, processed_at
             FROM transactions
             WHERE reference_id = $1
-            "#,
-            reference_id
+            "#
         )
+        .bind(&reference_id)
         .fetch_optional(shard.reader())
         .await?
         {
@@ -431,10 +431,7 @@ pub async fn get_transaction_status(
                 processed_at: row.processed_at,
             };
 
-            let _ = state
-                .cache
-                .set(&cache_key, &response, 60)
-                .await;
+            let _ = state.cache.set(&cache_key, &response, 60).await;
 
             return Ok(Json(ApiResponse::success(response)));
         }

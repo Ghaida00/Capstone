@@ -73,6 +73,13 @@ impl From<TransactionRow> for TransactionResponse {
     }
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct TransactionStatusRow {
+    pub reference_id: Option<String>,
+    pub status: String,
+    pub processed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct UserRow {
     pub id: Uuid,
