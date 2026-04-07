@@ -84,3 +84,15 @@ pub struct UserRow {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct IdempotencyKeyRow {
+    pub id: Uuid,
+    pub idempotency_key: String,
+    pub request_hash: String,
+    pub status: String,
+    pub response_payload: Option<serde_json::Value>,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
