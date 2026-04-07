@@ -42,8 +42,13 @@ pub async fn create_transaction(
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    // ─── Idempotency Check (Redis) ─────────────────────────
-    let idempotency_key = format!("idempotency:{}", reference_id);
+    // Route transaction to shard first; idempotency key is shard-scoped too.
+    let shard = ShardRouter::shard_for(&req.from_account);
+    let writer = state.shard_router.writer(shard);
+
+    // Keep Redis as fast-path, but align key with DB-backed idempotency.
+    let idempotency_key = format!("txn:{}:{}", shard, reference_id);
+
     if let Ok(Some(cached_response)) = state
         .cache
         .get::<TransactionCreatedResponse>(&idempotency_key)
@@ -59,10 +64,180 @@ pub async fn create_transaction(
     // Extract request ID for tracing
     let req_id = request_id.map(|r| r.0 .0.clone()).unwrap_or_default();
 
-    // Determine shard for this transaction
-    let shard = ShardRouter::shard_for(&req.from_account);
+    // Stable request hash for duplicate detection
+    let request_hash = json!({
+        "from_account": req.from_account,
+        "to_account": req.to_account,
+        "amount": req.amount,
+        "currency": req.currency,
+        "reference_id": reference_id,
+        "description": req.description,
+    })
+    .to_string();
 
-    // Create the message to enqueue (include shard info)
+    let response = TransactionCreatedResponse {
+        reference_id: reference_id.clone(),
+        status: "accepted".to_string(),
+        message: format!("Transaction queued for processing (shard {})", shard),
+    };
+
+    let response_payload = serde_json::to_value(&response)
+        .map_err(|e| AppError::Internal(format!("Failed to serialize idempotency payload: {e}")))?;
+
+    // Reserve idempotency key in DB first.
+    let insert_res = sqlx::query(
+        r#"
+        INSERT INTO idempotency_keys (
+            idempotency_key,
+            request_hash,
+            status,
+            response_payload,
+            expires_at
+        )
+        VALUES ($1, $2, 'processing', $3, NOW() + INTERVAL '24 hours')
+        ON CONFLICT (idempotency_key) DO NOTHING
+        "#,
+    )
+    .bind(&idempotency_key)
+    .bind(&request_hash)
+    .bind(&response_payload)
+    .execute(writer)
+    .await?;
+
+    // If the row already exists, validate and return the stored response
+    // unless it is failed/expired, in which case we can try to revive it.
+    if insert_res.rows_affected() == 0 {
+        let existing: Option<IdempotencyKeyRow> = sqlx::query_as(
+            r#"
+            SELECT
+                id,
+                idempotency_key,
+                request_hash,
+                status,
+                response_payload,
+                expires_at,
+                created_at,
+                updated_at
+            FROM idempotency_keys
+            WHERE idempotency_key = $1
+            "#,
+        )
+        .bind(&idempotency_key)
+        .fetch_optional(writer)
+        .await?;
+
+        let existing = match existing {
+            Some(row) => row,
+            None => {
+                return Err(AppError::Internal(
+                    "Idempotency row disappeared after conflict".into(),
+                ))
+            }
+        };
+
+        if existing.request_hash != request_hash {
+            return Err(AppError::BadRequest(
+                "Idempotency key already used with a different request payload".into(),
+            ));
+        }
+
+        // Normal duplicate replay: return the cached accepted response.
+        if existing.status == "processing"
+            || existing.status == "completed"
+            || existing.status == "pending"
+        {
+            metrics::counter!("idempotency_hits_total").increment(1);
+
+            if let Some(payload) = existing.response_payload {
+                if let Ok(cached_response) =
+                    serde_json::from_value::<TransactionCreatedResponse>(payload)
+                {
+                    let _ = state
+                        .cache
+                        .set(&idempotency_key, &cached_response, 86400)
+                        .await;
+
+                    return Ok((
+                        StatusCode::ACCEPTED,
+                        Json(ApiResponse::success(cached_response)),
+                    ));
+                }
+            }
+
+            let _ = state.cache.set(&idempotency_key, &response, 86400).await;
+            return Ok((StatusCode::ACCEPTED, Json(ApiResponse::success(response))));
+        }
+
+        // Revive failed/expired reservation so the same key can be retried safely.
+        if existing.status == "failed" || existing.expires_at <= Utc::now() {
+            let revive_res = sqlx::query(
+                r#"
+                UPDATE idempotency_keys
+                SET status = 'processing',
+                    response_payload = $2,
+                    expires_at = NOW() + INTERVAL '24 hours',
+                    updated_at = NOW()
+                WHERE idempotency_key = $1
+                  AND (status = 'failed' OR expires_at <= NOW())
+                "#,
+            )
+            .bind(&idempotency_key)
+            .bind(&response_payload)
+            .execute(writer)
+            .await?;
+
+            if revive_res.rows_affected() == 0 {
+                // Another request may have revived it first; return the latest stored response.
+                let latest: Option<IdempotencyKeyRow> = sqlx::query_as(
+                    r#"
+                    SELECT
+                        id,
+                        idempotency_key,
+                        request_hash,
+                        status,
+                        response_payload,
+                        expires_at,
+                        created_at,
+                        updated_at
+                    FROM idempotency_keys
+                    WHERE idempotency_key = $1
+                    "#,
+                )
+                .bind(&idempotency_key)
+                .fetch_optional(writer)
+                .await?;
+
+                if let Some(latest) = latest {
+                    if let Some(payload) = latest.response_payload {
+                        if let Ok(cached_response) =
+                            serde_json::from_value::<TransactionCreatedResponse>(payload)
+                        {
+                            let _ = state
+                                .cache
+                                .set(&idempotency_key, &cached_response, 86400)
+                                .await;
+
+                            return Ok((
+                                StatusCode::ACCEPTED,
+                                Json(ApiResponse::success(cached_response)),
+                            ));
+                        }
+                    }
+                }
+
+                return Ok((
+                    StatusCode::ACCEPTED,
+                    Json(ApiResponse::success(response)),
+                ));
+            }
+        } else {
+            // Unexpected state: safest fallback is to return the current accepted response.
+            let _ = state.cache.set(&idempotency_key, &response, 86400).await;
+            return Ok((StatusCode::ACCEPTED, Json(ApiResponse::success(response))));
+        }
+    }
+
+    // Build queue message
     let queue_message = serde_json::json!({
         "from_account": req.from_account,
         "to_account": req.to_account,
@@ -72,27 +247,29 @@ pub async fn create_transaction(
         "description": req.description,
         "request_id": req_id,
         "shard": shard,
+        "idempotency_key": idempotency_key,
+        "request_hash": request_hash,
     });
 
-    let response = TransactionCreatedResponse {
-        reference_id: reference_id.clone(),
-        status: "accepted".to_string(),
-        message: format!("Transaction queued for processing (shard {})", shard),
-    };
+    // Publish to RabbitMQ
+    if let Err(e) = state.queue_producer.publish(&queue_message).await {
+        let _ = sqlx::query(
+            r#"
+            UPDATE idempotency_keys
+            SET status = 'failed',
+                updated_at = NOW()
+            WHERE idempotency_key = $1
+            "#,
+        )
+        .bind(&idempotency_key)
+        .execute(writer)
+        .await;
 
-    // Execute RabbitMQ publish and Redis cache set concurrently
-    let publish_future = state.queue_producer.publish(&queue_message);
-    let cache_future = state.cache.set(&idempotency_key, &response, 86400);
-
-    let (publish_res, cache_res) = tokio::join!(publish_future, cache_future);
-
-    // Propagate RabbitMQ publish error if it fails
-    publish_res?;
-
-    // Log cache error but don't fail the transaction
-    if let Err(e) = cache_res {
-        tracing::warn!(error = %e, "Failed to set idempotency cache");
+        return Err(e.into());
     }
+
+    // Keep Redis as a fast-path cache for accepted responses.
+    let _ = state.cache.set(&idempotency_key, &response, 86400).await;
 
     metrics::counter!("transactions_created_total").increment(1);
 
