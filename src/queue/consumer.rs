@@ -376,9 +376,37 @@ async fn apply_balance_updates(
         .await?;
 
         if updated.rows_affected() == 0 {
-            return Err(AppError::BadRequest(
-                "Insufficient balance".into()
-            ));
+            tracing::warn!(
+                from_account = %msg.request.from_account,
+                amount = %msg.request.amount,
+                "Insufficient balance — marking transaction as failed"
+            );
+
+            sqlx::query(
+                r#"
+                INSERT INTO transactions (
+                    from_account,
+                    to_account,
+                    amount,
+                    currency,
+                    status,
+                    reference_id,
+                    description
+                )
+                VALUES ($1,$2,$3,$4,'failed',$5,$6)
+                ON CONFLICT (reference_id) DO NOTHING
+                "#
+            )
+            .bind(&msg.request.from_account)
+            .bind(&msg.request.to_account)
+            .bind(&msg.request.amount)
+            .bind(&msg.request.currency)
+            .bind(&msg.request.reference_id)
+            .bind(&msg.request.description)
+            .execute(pool)
+            .await?;
+
+            continue;
         }
 
         // credit receiver
