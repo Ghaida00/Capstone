@@ -166,6 +166,14 @@ pub fn build_router(
             "/transactions/{id}",
             get(crate::api::handlers::get_transaction),
         )
+        .route(
+            "/transactions/status/{reference_id}",
+            get(crate::api::handlers::get_transaction_status),
+        )
+        .route(
+            "/users/{account_number}/balance",
+            get(crate::api::handlers::get_balance),
+        )
         .layer(axum_middleware::from_fn_with_state(
             rate_limiter,
             crate::middleware::rate_limit::rate_limit_middleware,

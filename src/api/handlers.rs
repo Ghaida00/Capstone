@@ -5,8 +5,13 @@ use axum::{
 };
 use uuid::Uuid;
 
+use chrono::Utc;
+use serde_json::json;
+
 use crate::api::responses::{ApiResponse, HealthResponse, HealthServices};
-use crate::db::models::{CreateTransactionRequest, TransactionResponse, TransactionRow};
+use crate::db::models::{
+    CreateTransactionRequest, IdempotencyKeyRow, TransactionResponse, TransactionRow, TransactionStatusRow, UserRow,
+};
 use crate::db::shard::ShardRouter;
 use crate::error::{AppError, AppResult};
 use crate::middleware::request_id::RequestId;
@@ -39,8 +44,13 @@ pub async fn create_transaction(
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    // ─── Idempotency Check (Redis) ─────────────────────────
-    let idempotency_key = format!("idempotency:{}", reference_id);
+    // Route transaction to shard first; idempotency key is shard-scoped too.
+    let shard = ShardRouter::shard_for(&req.from_account);
+    let writer = state.shard_router.writer(shard);
+
+    // Keep Redis as fast-path, but align key with DB-backed idempotency.
+    let idempotency_key = format!("txn:{}:{}", shard, reference_id);
+
     if let Ok(Some(cached_response)) = state
         .cache
         .get::<TransactionCreatedResponse>(&idempotency_key)
@@ -56,10 +66,177 @@ pub async fn create_transaction(
     // Extract request ID for tracing
     let req_id = request_id.map(|r| r.0 .0.clone()).unwrap_or_default();
 
-    // Determine shard for this transaction
-    let shard = ShardRouter::shard_for(&req.from_account);
+    // Stable request hash for duplicate detection
+    let request_hash = json!({
+        "from_account": req.from_account,
+        "to_account": req.to_account,
+        "amount": req.amount,
+        "currency": req.currency,
+        "reference_id": reference_id,
+        "description": req.description,
+    })
+    .to_string();
 
-    // Create the message to enqueue (include shard info)
+    let response = TransactionCreatedResponse {
+        reference_id: reference_id.clone(),
+        status: "accepted".to_string(),
+        message: format!("Transaction queued for processing (shard {})", shard),
+    };
+
+    let response_payload = serde_json::to_value(&response)
+        .map_err(|e| AppError::Internal(format!("Failed to serialize idempotency payload: {e}")))?;
+
+    // Reserve idempotency key in DB first.
+    let insert_res = sqlx::query(
+        r#"
+        INSERT INTO idempotency_keys (
+            idempotency_key,
+            request_hash,
+            status,
+            response_payload,
+            expires_at
+        )
+        VALUES ($1, $2, 'processing', $3, NOW() + INTERVAL '24 hours')
+        ON CONFLICT (idempotency_key) DO NOTHING
+        "#,
+    )
+    .bind(&idempotency_key)
+    .bind(&request_hash)
+    .bind(&response_payload)
+    .execute(writer)
+    .await?;
+
+    // If the row already exists, validate and return the stored response
+    // unless it is failed/expired, in which case we can try to revive it.
+    if insert_res.rows_affected() == 0 {
+        let existing: Option<IdempotencyKeyRow> = sqlx::query_as(
+            r#"
+            SELECT
+                id,
+                idempotency_key,
+                request_hash,
+                status,
+                response_payload,
+                expires_at,
+                created_at,
+                updated_at
+            FROM idempotency_keys
+            WHERE idempotency_key = $1
+            "#,
+        )
+        .bind(&idempotency_key)
+        .fetch_optional(writer)
+        .await?;
+
+        let existing = match existing {
+            Some(row) => row,
+            None => {
+                return Err(AppError::Internal(
+                    "Idempotency row disappeared after conflict".into(),
+                ))
+            }
+        };
+
+        if existing.request_hash != request_hash {
+            return Err(AppError::BadRequest(
+                "Idempotency key already used with a different request payload".into(),
+            ));
+        }
+
+        // Normal duplicate replay: return the cached accepted response.
+        if existing.status == "processing"
+            || existing.status == "completed"
+            || existing.status == "pending"
+        {
+            metrics::counter!("idempotency_hits_total").increment(1);
+
+            if let Some(payload) = existing.response_payload {
+                if let Ok(cached_response) =
+                    serde_json::from_value::<TransactionCreatedResponse>(payload)
+                {
+                    let _ = state
+                        .cache
+                        .set(&idempotency_key, &cached_response, 86400)
+                        .await;
+
+                    return Ok((
+                        StatusCode::ACCEPTED,
+                        Json(ApiResponse::success(cached_response)),
+                    ));
+                }
+            }
+
+            let _ = state.cache.set(&idempotency_key, &response, 86400).await;
+            return Ok((StatusCode::ACCEPTED, Json(ApiResponse::success(response))));
+        }
+
+        // Revive failed/expired reservation so the same key can be retried safely.
+        if existing.status == "failed" || existing.expires_at <= Utc::now() {
+            let revive_res = sqlx::query(
+                r#"
+                UPDATE idempotency_keys
+                SET status = 'processing',
+                    response_payload = $2,
+                    expires_at = NOW() + INTERVAL '24 hours',
+                    updated_at = NOW()
+                WHERE idempotency_key = $1
+                  AND (status = 'failed' OR expires_at <= NOW())
+                "#,
+            )
+            .bind(&idempotency_key)
+            .bind(&response_payload)
+            .execute(writer)
+            .await?;
+
+            if revive_res.rows_affected() == 0 {
+                // Another request may have revived it first; return the latest stored response.
+                let latest: Option<IdempotencyKeyRow> = sqlx::query_as(
+                    r#"
+                    SELECT
+                        id,
+                        idempotency_key,
+                        request_hash,
+                        status,
+                        response_payload,
+                        expires_at,
+                        created_at,
+                        updated_at
+                    FROM idempotency_keys
+                    WHERE idempotency_key = $1
+                    "#,
+                )
+                .bind(&idempotency_key)
+                .fetch_optional(writer)
+                .await?;
+
+                if let Some(latest) = latest {
+                    if let Some(payload) = latest.response_payload {
+                        if let Ok(cached_response) =
+                            serde_json::from_value::<TransactionCreatedResponse>(payload)
+                        {
+                            let _ = state
+                                .cache
+                                .set(&idempotency_key, &cached_response, 86400)
+                                .await;
+
+                            return Ok((
+                                StatusCode::ACCEPTED,
+                                Json(ApiResponse::success(cached_response)),
+                            ));
+                        }
+                    }
+                }
+
+                return Ok((StatusCode::ACCEPTED, Json(ApiResponse::success(response))));
+            }
+        } else {
+            // Unexpected state: safest fallback is to return the current accepted response.
+            let _ = state.cache.set(&idempotency_key, &response, 86400).await;
+            return Ok((StatusCode::ACCEPTED, Json(ApiResponse::success(response))));
+        }
+    }
+
+    // Build queue message
     let queue_message = serde_json::json!({
         "from_account": req.from_account,
         "to_account": req.to_account,
@@ -69,27 +246,29 @@ pub async fn create_transaction(
         "description": req.description,
         "request_id": req_id,
         "shard": shard,
+        "idempotency_key": idempotency_key,
+        "request_hash": request_hash,
     });
 
-    let response = TransactionCreatedResponse {
-        reference_id: reference_id.clone(),
-        status: "accepted".to_string(),
-        message: format!("Transaction queued for processing (shard {})", shard),
-    };
+    // Publish to RabbitMQ
+    if let Err(e) = state.queue_producer.publish(&queue_message).await {
+        let _ = sqlx::query(
+            r#"
+            UPDATE idempotency_keys
+            SET status = 'failed',
+                updated_at = NOW()
+            WHERE idempotency_key = $1
+            "#,
+        )
+        .bind(&idempotency_key)
+        .execute(writer)
+        .await;
 
-    // Execute RabbitMQ publish and Redis cache set concurrently
-    let publish_future = state.queue_producer.publish(&queue_message);
-    let cache_future = state.cache.set(&idempotency_key, &response, 86400);
-
-    let (publish_res, cache_res) = tokio::join!(publish_future, cache_future);
-
-    // Propagate RabbitMQ publish error if it fails
-    publish_res?;
-
-    // Log cache error but don't fail the transaction
-    if let Err(e) = cache_res {
-        tracing::warn!(error = %e, "Failed to set idempotency cache");
+        return Err(e.into());
     }
+
+    // Keep Redis as a fast-path cache for accepted responses.
+    let _ = state.cache.set(&idempotency_key, &response, 86400).await;
 
     metrics::counter!("transactions_created_total").increment(1);
 
@@ -201,6 +380,146 @@ pub async fn list_transactions(
 pub struct ListParams {
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+}
+
+/// GET /api/v1/transactions/status/{reference_id}
+/// Read-heavy endpoint (uses read replica + Redis cache)
+pub async fn get_transaction_status(
+    State(state): State<AppState>,
+    Path(reference_id): Path<String>,
+) -> AppResult<Json<ApiResponse<TransactionStatusResponse>>> {
+
+    if reference_id.is_empty() {
+        return Err(AppError::BadRequest(
+            "reference_id must not be empty".into()
+        ));
+    }
+
+    let cache_key = format!("tx_status:{}", reference_id);
+
+    // Try Redis first
+    if let Some(cached) = state
+        .cache
+        .get::<TransactionStatusResponse>(&cache_key)
+        .await?
+    {
+        metrics::counter!("cache_hits_total").increment(1);
+
+        return Ok(Json(ApiResponse::success(cached)));
+    }
+
+    metrics::counter!("cache_misses_total").increment(1);
+
+    // Search across shards
+    for shard in state.shard_router.all_shards() {
+
+        if let Some(row) = sqlx::query_as::<_, TransactionStatusRow>(
+            r#"
+            SELECT reference_id, status, processed_at
+            FROM transactions
+            WHERE reference_id = $1
+            "#
+        )
+        .bind(&reference_id)
+        .fetch_optional(shard.reader())
+        .await?
+        {
+
+            let response = TransactionStatusResponse {
+                reference_id: row.reference_id.unwrap_or_default(),
+                status: row.status,
+                processed_at: row.processed_at,
+            };
+
+            let _ = state.cache.set(&cache_key, &response, 60).await;
+
+            return Ok(Json(ApiResponse::success(response)));
+        }
+    }
+
+    Err(AppError::NotFound(format!(
+        "Transaction {} not found",
+        reference_id
+    )))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct TransactionStatusResponse {
+    pub reference_id: String,
+    pub status: String,
+    pub processed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// GET /api/v1/users/:account_number/balance
+/// Read-heavy endpoint (uses read replica + Redis cache)
+pub async fn get_balance(
+    State(state): State<AppState>,
+    Path(account_number): Path<String>,
+) -> AppResult<Json<ApiResponse<BalanceResponse>>> {
+    if account_number.is_empty() {
+        return Err(AppError::BadRequest(
+            "Account number must not be empty".into(),
+        ));
+    }
+
+    let cache_key = format!("balance:{}", account_number);
+
+    // Try Redis cache first
+    if let Some(cached) = state.cache.get::<BalanceResponse>(&cache_key).await? {
+        metrics::counter!("cache_hits_total").increment(1);
+
+        return Ok(Json(ApiResponse::success(cached)));
+    }
+
+    metrics::counter!("cache_misses_total").increment(1);
+
+    // Route to correct shard (read replica)
+    let shard = ShardRouter::shard_for(&account_number);
+
+    let reader = state.shard_router.reader(shard);
+
+    // Query DB
+    let row: Option<UserRow> = sqlx::query_as(
+        r#"
+        SELECT *
+        FROM users
+        WHERE account_number = $1
+        AND status = 'active'
+        "#,
+    )
+    .bind(&account_number)
+    .fetch_optional(reader)
+    .await?;
+
+    let row = match row {
+        Some(r) => r,
+        None => {
+            return Err(AppError::NotFound(format!(
+                "Account {} not found",
+                account_number
+            )))
+        }
+    };
+
+    let response = BalanceResponse {
+        account_number: row.account_number,
+        balance: row.balance.to_string(),
+        currency: "IDR".to_string(),
+        status: row.status,
+    };
+
+    // Cache response (TTL 30 seconds)
+    let _ = state.cache.set(&cache_key, &response, 30).await;
+
+    Ok(Json(ApiResponse::success(response)))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct BalanceResponse {
+    pub account_number: String,
+    pub balance: String,
+    pub currency: String,
+    pub status: String,
 }
 
 // ─── Health & Metrics Handlers ─────────────────────────────────

@@ -72,3 +72,34 @@ impl From<TransactionRow> for TransactionResponse {
         }
     }
 }
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct TransactionStatusRow {
+    pub reference_id: Option<String>,
+    pub status: String,
+    pub processed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct UserRow {
+    pub id: Uuid,
+    pub account_number: String,
+    pub full_name: String,
+    pub email: Option<String>,
+    pub balance: sqlx::types::BigDecimal,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct IdempotencyKeyRow {
+    pub id: Uuid,
+    pub idempotency_key: String,
+    pub request_hash: String,
+    pub status: String,
+    pub response_payload: Option<serde_json::Value>,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
