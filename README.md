@@ -2,19 +2,16 @@
 Repository ini berisi arsitektur dan implementasi prototype sistem manajemen beban puncak (Peak Load) yang mampu menangani lonjakan trafik secara efisien dan aman.
 
 🛡️ Key Features:
-High Performance: Backend menggunakan Rust (Axum & Tokio) untuk efisiensi memori dan latensi rendah.
-
-Resilience: Proteksi berlapis dengan Rate Limiting, Circuit Breaker, dan Dead Letter Queue (DLQ).
-
-Data Integrity: Mengimplementasikan Idempotency Key dan Asynchronous Processing via RabbitMQ.
-
-High Availability: Database PostgreSQL dengan konfigurasi 1 Primary & 2 Replicas serta mekanisme Failover/Promotion.
-
-Full Observability: Monitoring real-time menggunakan Prometheus & Grafana (Metrics, Logs, Tracing).
+- **High Performance**: Backend menggunakan Rust (Axum & Tokio) untuk efisiensi memori dan latensi rendah.
+- **Horizontal Scalability**: Load balancing menggunakan Nginx ke 2 replicas application server.
+- **Database Sharding**: PostgreSQL dengan konfigurasi **3 Shards**, masing-masing menggunakan pola **1 Primary & 1 Replica** untuk skalabilitas data (Total 6 DB instances).
+- **Resilience**: Proteksi berlapis dengan Rate Limiting, Circuit Breaker, Retries, dan mekanisme Backpressure.
+- **Data Integrity**: Menjamin konsistensi data dengan Idempotency Key dan pemrosesan asinkron via RabbitMQ.
+- **Full Observability**: Monitoring real-time menggunakan Prometheus, Grafana, dan cAdvisor (Metrics, Logs, Tracing).
 
 📊 SLO Targets:
 
-Availability: 99.0%
+Availability: 99.9%
 
 Latency: P95 < 500ms
 
@@ -26,8 +23,9 @@ Bagian ini akan memandu Anda dari awal untuk menjalankan project ini secara loka
 
 ### 1️⃣ Persiapan Kebutuhan (Prerequisites)
 Pastikan Anda sudah menginstal alat-alat berikut di sistem Anda:
-- **Rust** (stable toolchain) - [Panduan Install](https://www.rust-lang.org/tools/install)
+- **Rust** - [Panduan Install](https://www.rust-lang.org/tools/install)
 - **Docker** & **Docker Compose** - [Panduan Install](https://docs.docker.com/get-docker/)
+- **Make** - [Panduan Install](https://github.com/chocolatey/choco/releases/tag/2.7.1)
 
 ### 2️⃣ Clone Repository
 Pertama, _clone_ repository ini:
@@ -56,18 +54,20 @@ docker-compose ps
 Setelah semuanya berjalan tanpa error, Anda dapat mengakses platform beserta alat _monitoring_ di _port_ berikut:
 - **API Backend**: `http://localhost:8080` (di-load balance otomatis oleh NGINX ke backend replicas)
 - **Monitoring Grafana**: `http://localhost:3001` (Username `admin`, Password `admin`)
-- **Prometheus UI**: `http://localhost:9090`
-- **RabbitMQ Management**: `http://localhost:15672` (Username `gn_user`, Password `gn_secure_pass`)
 
 ### 6️⃣ Testing dan Development Lanjutan
 Untuk kepentingan pengembangan (_development_) serta pengujian aplikasi (_tests_):
-- **Cek Code Quality**: Menjalankan formatter dan clippy secara otomatis sesuai _check-in policy_. 
+- **Cek Code Quality**: Menjalankan formatter, clippy (linting), dan unit tests secara otomatis.
   ```bash
   make check
   ```
-- **Menjalankan Tests**: Menjalankan _unit test_ dan _property-based test_.
+- **Menjalankan Unit Tests**: Menjalankan seluruh _unit test_ dan _property-based test_ secara manual.
   ```bash
   cargo test
+  ```
+- **Performance/Load Test (k6)**: Menjalankan pengujian beban tinggi (High Load Scenario) sesuai target SLO.
+  ```bash
+  k6 run k6/load-test-1m.js
   ```
 
 ### 🛑 Menghentikan Layanan
