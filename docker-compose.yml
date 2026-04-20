@@ -1,5 +1,152 @@
 name: peakload
 
+# ============================================================
+# Shared config via YAML anchors
+# ============================================================
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-pg-common: &pg-common
+  image: postgres:18.3-alpine3.23
+  restart: unless-stopped
+  logging: *default-logging
+  networks:
+    - peakload-network
+
+x-pg-primary-env: &pg-primary-env
+  POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+  POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+  POSTGRES_INITDB_ARGS: "--data-checksums"
+  REPL_PASSWORD: ${REPL_PASSWORD:?set REPL_PASSWORD in .env}
+
+x-pg-primary-command: &pg-primary-command >
+  postgres
+    -c wal_level=replica
+    -c max_wal_senders=10
+    -c max_replication_slots=10
+    -c hot_standby=on
+    -c shared_buffers=64MB
+    -c effective_cache_size=192MB
+    -c work_mem=4MB
+    -c maintenance_work_mem=32MB
+    -c max_connections=120
+    -c checkpoint_completion_target=0.9
+    -c random_page_cost=1.1
+
+x-pg-healthcheck: &pg-healthcheck
+  test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
+  interval: 5s
+  timeout: 3s
+  retries: 10
+  start_period: 15s
+
+x-pg-replica-healthcheck: &pg-replica-healthcheck
+  test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
+  interval: 5s
+  timeout: 3s
+  retries: 10
+  start_period: 30s
+
+x-pg-primary-deploy: &pg-primary-deploy
+  resources:
+    limits:
+      memory: 256M
+      cpus: "0.5"
+
+x-pg-replica-deploy: &pg-replica-deploy
+  resources:
+    limits:
+      memory: 256M
+      cpus: "0.25"
+
+x-pgbouncer-common: &pgbouncer-common
+  image: edoburu/pgbouncer:v1.25.1-p0
+  restart: unless-stopped
+  logging: *default-logging
+  networks:
+    - peakload-network
+  expose:
+    - "5432"
+
+x-pgbouncer-env: &pgbouncer-env
+  AUTH_TYPE: scram-sha-256
+  POOL_MODE: transaction
+  DEFAULT_POOL_SIZE: 40
+  MAX_CLIENT_CONN: 500
+  MAX_DB_CONNECTIONS: 100
+  MIN_POOL_SIZE: 15
+  RESERVE_POOL_SIZE: 10
+  RESERVE_POOL_TIMEOUT: 3
+  SERVER_IDLE_TIMEOUT: 300
+  SERVER_LIFETIME: 3600
+  LOG_CONNECTIONS: 0
+  LOG_DISCONNECTIONS: 0
+
+x-pgbouncer-healthcheck: &pgbouncer-healthcheck
+  test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U ${POSTGRES_USER}" ]
+  interval: 5s
+  timeout: 3s
+  retries: 5
+  start_period: 10s
+
+x-pgbouncer-deploy: &pgbouncer-deploy
+  resources:
+    limits:
+      memory: 32M
+      cpus: "0.1"
+
+x-redis-command: &redis-command >
+  redis-server
+    --maxmemory 96mb
+    --maxmemory-policy allkeys-lru
+    --save ""
+    --appendonly no
+    --tcp-backlog 511
+    --tcp-keepalive 300
+    --hz 100
+    --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    --masterauth ${REDIS_PASSWORD}
+
+x-redis-healthcheck: &redis-healthcheck
+  test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping" ]
+  interval: 5s
+  timeout: 3s
+  retries: 5
+  start_period: 5s
+
+x-sentinel-common: &sentinel-common
+  image: redis:8.6.1-alpine3.23
+  restart: unless-stopped
+  logging: *default-logging
+  networks:
+    - peakload-network
+  volumes:
+    - ./redis/sentinel.conf:/tmp/sentinel.conf:ro
+  command: >
+    sh -c "cp /tmp/sentinel.conf /etc/sentinel.conf &&
+           chmod 644 /etc/sentinel.conf &&
+           redis-sentinel /etc/sentinel.conf"
+  depends_on:
+    redis-master:
+      condition: service_healthy
+  expose:
+    - "26379"
+  healthcheck:
+    test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+    interval: 5s
+    timeout: 3s
+    retries: 5
+    start_period: 10s
+  deploy:
+    resources:
+      limits:
+        memory: 32M
+        cpus: "0.1"
+
 services:
   # ============================================================
   # Nginx — Reverse Proxy & Load Balancer
@@ -15,6 +162,7 @@ services:
       app:
         condition: service_healthy
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - peakload-network
     deploy:
@@ -51,6 +199,7 @@ services:
       retries: 3
       start_period: 15s
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - peakload-network
     deploy:
@@ -64,54 +213,25 @@ services:
   # SHARD 0 — PostgreSQL Primary + 1 Replica + pgBouncer
   # ============================================================
   pg-shard0-primary:
-    image: postgres:18.3-alpine3.23
+    <<: *pg-common
     container_name: peakload-pg-shard0-primary
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-peakload_db}
-      POSTGRES_USER: ${POSTGRES_USER:-peakload_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-peakload_secure_pass}
-      POSTGRES_INITDB_ARGS: "--data-checksums"
-      REPL_PASSWORD: ${REPL_PASSWORD:-repl_secure_pass}
+    environment: *pg-primary-env
+    command: *pg-primary-command
     volumes:
       - pg_shard0_primary_data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
       - ./db/primary-setup.sh:/docker-entrypoint-initdb.d/02-primary-setup.sh:ro
-    command: >
-      postgres
-        -c wal_level=replica
-        -c max_wal_senders=10
-        -c max_replication_slots=10
-        -c hot_standby=on
-        -c shared_buffers=64MB
-        -c effective_cache_size=192MB
-        -c work_mem=4MB
-        -c maintenance_work_mem=32MB
-        -c max_connections=300
-        -c checkpoint_completion_target=0.9
-        -c random_page_cost=1.1
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-peakload_user} -d ${POSTGRES_DB:-peakload_db}" ]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 15s
-    restart: unless-stopped
-    networks:
-      - peakload-network
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: "0.5"
+    healthcheck: *pg-healthcheck
+    deploy: *pg-primary-deploy
 
   pg-shard0-replica1:
-    image: postgres:18.3-alpine3.23
+    <<: *pg-common
     container_name: peakload-pg-shard0-replica1
     environment:
-      PGUSER: ${POSTGRES_USER:-peakload_user}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-peakload_secure_pass}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
       PRIMARY_HOST: pg-shard0-primary
-      REPL_PASSWORD: ${REPL_PASSWORD:-repl_secure_pass}
+      REPL_PASSWORD: ${REPL_PASSWORD}
     volumes:
       - pg_shard0_replica1_data:/var/lib/postgresql/data
       - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
@@ -119,110 +239,44 @@ services:
     depends_on:
       pg-shard0-primary:
         condition: service_healthy
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-peakload_user} -d ${POSTGRES_DB:-peakload_db}" ]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 30s
-    restart: unless-stopped
-    networks:
-      - peakload-network
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: "0.25"
+    healthcheck: *pg-replica-healthcheck
+    deploy: *pg-replica-deploy
 
   pgbouncer-shard0:
-    image: edoburu/pgbouncer:v1.25.1-p0
+    <<: *pgbouncer-common
     container_name: peakload-pgbouncer-shard0
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-peakload_user}:${POSTGRES_PASSWORD:-peakload_secure_pass}@pg-shard0-primary:5432/${POSTGRES_DB:-peakload_db}
-      AUTH_TYPE: scram-sha-256
-      POOL_MODE: transaction
-      DEFAULT_POOL_SIZE: 40
-      MAX_CLIENT_CONN: 500
-      MAX_DB_CONNECTIONS: 100
-      MIN_POOL_SIZE: 15
-      RESERVE_POOL_SIZE: 10
-      RESERVE_POOL_TIMEOUT: 3
-      SERVER_IDLE_TIMEOUT: 300
-      SERVER_LIFETIME: 3600
-      LOG_CONNECTIONS: 0
-      LOG_DISCONNECTIONS: 0
-    expose:
-      - "5432"
+      <<: *pgbouncer-env
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-shard0-primary:5432/${POSTGRES_DB}
     depends_on:
       pg-shard0-primary:
         condition: service_healthy
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U ${POSTGRES_USER:-peakload_user}" ]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 10s
-    restart: unless-stopped
-    networks:
-      - peakload-network
-    deploy:
-      resources:
-        limits:
-          memory: 32M
-          cpus: "0.1"
+    healthcheck: *pgbouncer-healthcheck
+    deploy: *pgbouncer-deploy
 
   # ============================================================
   # SHARD 1 — PostgreSQL Primary + 1 Replica + pgBouncer
   # ============================================================
   pg-shard1-primary:
-    image: postgres:18.3-alpine3.23
+    <<: *pg-common
     container_name: peakload-pg-shard1-primary
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-peakload_db}
-      POSTGRES_USER: ${POSTGRES_USER:-peakload_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-peakload_secure_pass}
-      POSTGRES_INITDB_ARGS: "--data-checksums"
-      REPL_PASSWORD: ${REPL_PASSWORD:-repl_secure_pass}
+    environment: *pg-primary-env
+    command: *pg-primary-command
     volumes:
       - pg_shard1_primary_data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
       - ./db/primary-setup.sh:/docker-entrypoint-initdb.d/02-primary-setup.sh:ro
-    command: >
-      postgres
-        -c wal_level=replica
-        -c max_wal_senders=10
-        -c max_replication_slots=10
-        -c hot_standby=on
-        -c shared_buffers=64MB
-        -c effective_cache_size=192MB
-        -c work_mem=4MB
-        -c maintenance_work_mem=32MB
-        -c max_connections=300
-        -c checkpoint_completion_target=0.9
-        -c random_page_cost=1.1
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-peakload_user} -d ${POSTGRES_DB:-peakload_db}" ]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 15s
-    restart: unless-stopped
-    networks:
-      - peakload-network
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: "0.5"
+    healthcheck: *pg-healthcheck
+    deploy: *pg-primary-deploy
 
   pg-shard1-replica1:
-    image: postgres:18.3-alpine3.23
+    <<: *pg-common
     container_name: peakload-pg-shard1-replica1
     environment:
-      PGUSER: ${POSTGRES_USER:-peakload_user}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-peakload_secure_pass}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
       PRIMARY_HOST: pg-shard1-primary
-      REPL_PASSWORD: ${REPL_PASSWORD:-repl_secure_pass}
+      REPL_PASSWORD: ${REPL_PASSWORD}
     volumes:
       - pg_shard1_replica1_data:/var/lib/postgresql/data
       - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
@@ -230,110 +284,44 @@ services:
     depends_on:
       pg-shard1-primary:
         condition: service_healthy
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-peakload_user} -d ${POSTGRES_DB:-peakload_db}" ]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 30s
-    restart: unless-stopped
-    networks:
-      - peakload-network
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: "0.25"
+    healthcheck: *pg-replica-healthcheck
+    deploy: *pg-replica-deploy
 
   pgbouncer-shard1:
-    image: edoburu/pgbouncer:v1.25.1-p0
+    <<: *pgbouncer-common
     container_name: peakload-pgbouncer-shard1
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-peakload_user}:${POSTGRES_PASSWORD:-peakload_secure_pass}@pg-shard1-primary:5432/${POSTGRES_DB:-peakload_db}
-      AUTH_TYPE: scram-sha-256
-      POOL_MODE: transaction
-      DEFAULT_POOL_SIZE: 40
-      MAX_CLIENT_CONN: 500
-      MAX_DB_CONNECTIONS: 100
-      MIN_POOL_SIZE: 15
-      RESERVE_POOL_SIZE: 10
-      RESERVE_POOL_TIMEOUT: 3
-      SERVER_IDLE_TIMEOUT: 300
-      SERVER_LIFETIME: 3600
-      LOG_CONNECTIONS: 0
-      LOG_DISCONNECTIONS: 0
-    expose:
-      - "5432"
+      <<: *pgbouncer-env
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-shard1-primary:5432/${POSTGRES_DB}
     depends_on:
       pg-shard1-primary:
         condition: service_healthy
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U ${POSTGRES_USER:-peakload_user}" ]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 10s
-    restart: unless-stopped
-    networks:
-      - peakload-network
-    deploy:
-      resources:
-        limits:
-          memory: 32M
-          cpus: "0.1"
+    healthcheck: *pgbouncer-healthcheck
+    deploy: *pgbouncer-deploy
 
   # ============================================================
   # SHARD 2 — PostgreSQL Primary + 1 Replica + pgBouncer
   # ============================================================
   pg-shard2-primary:
-    image: postgres:18.3-alpine3.23
+    <<: *pg-common
     container_name: peakload-pg-shard2-primary
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-peakload_db}
-      POSTGRES_USER: ${POSTGRES_USER:-peakload_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-peakload_secure_pass}
-      POSTGRES_INITDB_ARGS: "--data-checksums"
-      REPL_PASSWORD: ${REPL_PASSWORD:-repl_secure_pass}
+    environment: *pg-primary-env
+    command: *pg-primary-command
     volumes:
       - pg_shard2_primary_data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
       - ./db/primary-setup.sh:/docker-entrypoint-initdb.d/02-primary-setup.sh:ro
-    command: >
-      postgres
-        -c wal_level=replica
-        -c max_wal_senders=10
-        -c max_replication_slots=10
-        -c hot_standby=on
-        -c shared_buffers=64MB
-        -c effective_cache_size=192MB
-        -c work_mem=4MB
-        -c maintenance_work_mem=32MB
-        -c max_connections=300
-        -c checkpoint_completion_target=0.9
-        -c random_page_cost=1.1
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-peakload_user} -d ${POSTGRES_DB:-peakload_db}" ]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 15s
-    restart: unless-stopped
-    networks:
-      - peakload-network
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: "0.5"
+    healthcheck: *pg-healthcheck
+    deploy: *pg-primary-deploy
 
   pg-shard2-replica1:
-    image: postgres:18.3-alpine3.23
+    <<: *pg-common
     container_name: peakload-pg-shard2-replica1
     environment:
-      PGUSER: ${POSTGRES_USER:-peakload_user}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-peakload_secure_pass}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
       PRIMARY_HOST: pg-shard2-primary
-      REPL_PASSWORD: ${REPL_PASSWORD:-repl_secure_pass}
+      REPL_PASSWORD: ${REPL_PASSWORD}
     volumes:
       - pg_shard2_replica1_data:/var/lib/postgresql/data
       - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
@@ -341,57 +329,20 @@ services:
     depends_on:
       pg-shard2-primary:
         condition: service_healthy
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-peakload_user} -d ${POSTGRES_DB:-peakload_db}" ]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 30s
-    restart: unless-stopped
-    networks:
-      - peakload-network
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: "0.25"
+    healthcheck: *pg-replica-healthcheck
+    deploy: *pg-replica-deploy
 
   pgbouncer-shard2:
-    image: edoburu/pgbouncer:v1.25.1-p0
+    <<: *pgbouncer-common
     container_name: peakload-pgbouncer-shard2
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-peakload_user}:${POSTGRES_PASSWORD:-peakload_secure_pass}@pg-shard2-primary:5432/${POSTGRES_DB:-peakload_db}
-      AUTH_TYPE: scram-sha-256
-      POOL_MODE: transaction
-      DEFAULT_POOL_SIZE: 40
-      MAX_CLIENT_CONN: 500
-      MAX_DB_CONNECTIONS: 100
-      MIN_POOL_SIZE: 15
-      RESERVE_POOL_SIZE: 10
-      RESERVE_POOL_TIMEOUT: 3
-      SERVER_IDLE_TIMEOUT: 300
-      SERVER_LIFETIME: 3600
-      LOG_CONNECTIONS: 0
-      LOG_DISCONNECTIONS: 0
-    expose:
-      - "5432"
+      <<: *pgbouncer-env
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-shard2-primary:5432/${POSTGRES_DB}
     depends_on:
       pg-shard2-primary:
         condition: service_healthy
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U ${POSTGRES_USER:-peakload_user}" ]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 10s
-    restart: unless-stopped
-    networks:
-      - peakload-network
-    deploy:
-      resources:
-        limits:
-          memory: 32M
-          cpus: "0.1"
+    healthcheck: *pgbouncer-healthcheck
+    deploy: *pgbouncer-deploy
 
   # ============================================================
   # Redis HA — Master + Replica + Sentinel
@@ -399,28 +350,14 @@ services:
   redis-master:
     image: redis:8.6.1-alpine3.23
     container_name: peakload-redis-master
-    command: >
-      redis-server
-        --maxmemory 96mb
-        --maxmemory-policy allkeys-lru
-        --save ""
-        --appendonly no
-        --tcp-backlog 511
-        --tcp-keepalive 300
-        --hz 100
-        --requirepass ${REDIS_PASSWORD:-peakload_redis_pass}
-        --masterauth ${REDIS_PASSWORD:-peakload_redis_pass}
+    command: *redis-command
     expose:
       - "6379"
     volumes:
       - redis_data:/data
-    healthcheck:
-      test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-peakload_redis_pass}", "ping" ]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
+    healthcheck: *redis-healthcheck
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - peakload-network
     deploy:
@@ -441,21 +378,17 @@ services:
         --tcp-backlog 511
         --tcp-keepalive 300
         --hz 100
-        --requirepass ${REDIS_PASSWORD:-peakload_redis_pass}
-        --masterauth ${REDIS_PASSWORD:-peakload_redis_pass}
+        --requirepass ${REDIS_PASSWORD}
+        --masterauth ${REDIS_PASSWORD}
         --replicaof redis-master 6379
     expose:
       - "6379"
     depends_on:
       redis-master:
         condition: service_healthy
-    healthcheck:
-      test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-peakload_redis_pass}", "ping" ]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
+    healthcheck: *redis-healthcheck
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - peakload-network
     deploy:
@@ -465,73 +398,16 @@ services:
           cpus: "0.25"
 
   redis-sentinel-1:
-    image: redis:8.6.1-alpine3.23
+    <<: *sentinel-common
     container_name: peakload-redis-sentinel-1
-    command: >
-      sh -c "cp /tmp/sentinel.conf /etc/sentinel.conf &&
-             chmod 644 /etc/sentinel.conf &&
-             redis-sentinel /etc/sentinel.conf"
-    volumes:
-      - ./redis/sentinel.conf:/tmp/sentinel.conf:ro
-    depends_on:
-      redis-master:
-        condition: service_healthy
-    expose:
-      - "26379"
-    restart: unless-stopped
-    networks:
-      - peakload-network
-    deploy:
-      resources:
-        limits:
-          memory: 32M
-          cpus: "0.1"
 
   redis-sentinel-2:
-    image: redis:8.6.1-alpine3.23
+    <<: *sentinel-common
     container_name: peakload-redis-sentinel-2
-    command: >
-      sh -c "cp /tmp/sentinel.conf /etc/sentinel.conf &&
-             chmod 644 /etc/sentinel.conf &&
-             redis-sentinel /etc/sentinel.conf"
-    volumes:
-      - ./redis/sentinel.conf:/tmp/sentinel.conf:ro
-    depends_on:
-      redis-master:
-        condition: service_healthy
-    expose:
-      - "26379"
-    restart: unless-stopped
-    networks:
-      - peakload-network
-    deploy:
-      resources:
-        limits:
-          memory: 32M
-          cpus: "0.1"
 
   redis-sentinel-3:
-    image: redis:8.6.1-alpine3.23
+    <<: *sentinel-common
     container_name: peakload-redis-sentinel-3
-    command: >
-      sh -c "cp /tmp/sentinel.conf /etc/sentinel.conf &&
-             chmod 644 /etc/sentinel.conf &&
-             redis-sentinel /etc/sentinel.conf"
-    volumes:
-      - ./redis/sentinel.conf:/tmp/sentinel.conf:ro
-    depends_on:
-      redis-master:
-        condition: service_healthy
-    expose:
-      - "26379"
-    restart: unless-stopped
-    networks:
-      - peakload-network
-    deploy:
-      resources:
-        limits:
-          memory: 32M
-          cpus: "0.1"
 
   # ============================================================
   # RabbitMQ — Async Message Queue
@@ -540,13 +416,13 @@ services:
     image: rabbitmq:4.2.4-alpine
     container_name: peakload-rabbitmq
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-peakload_user}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-peakload_secure_pass}
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
       RABBITMQ_DEFAULT_VHOST: /
     expose:
       - "5672"
     ports:
-      - "15672:15672"
+      - "127.0.0.1:15672:15672"
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
@@ -556,6 +432,7 @@ services:
       retries: 10
       start_period: 30s
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - peakload-network
     deploy:
@@ -579,7 +456,14 @@ services:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
       - "--storage.tsdb.retention.time=7d"
+    healthcheck:
+      test: [ "CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy" ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - peakload-network
     deploy:
@@ -595,8 +479,8 @@ services:
     image: grafana/grafana:12.3
     container_name: peakload-grafana
     environment:
-      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:?set GRAFANA_USER in .env}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in .env}
       GF_USERS_ALLOW_SIGN_UP: "false"
     ports:
       - "3001:3000"
@@ -605,8 +489,10 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
-      - prometheus
+      prometheus:
+        condition: service_healthy
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - peakload-network
     deploy:
@@ -617,7 +503,6 @@ services:
 
   # ============================================================
   # cAdvisor — Per-Container Resource Monitoring
-  # Fix #23: Use specific device access instead of privileged mode
   # ============================================================
   cadvisor:
     image: ghcr.io/google/cadvisor:0.56.2
@@ -635,6 +520,7 @@ services:
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
+    logging: *default-logging
     networks:
       - peakload-network
     deploy:
@@ -654,7 +540,6 @@ volumes:
   rabbitmq_data:
   prometheus_data:
   grafana_data:
-
 
 networks:
   peakload-network:
