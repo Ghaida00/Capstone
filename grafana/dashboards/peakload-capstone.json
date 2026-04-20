@@ -31,27 +31,27 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(http_requests_total[30s]))",
+          "expr": "sum(rate(http_requests_total[$__rate_interval]))",
           "legendFormat": "Total",
           "refId": "A"
         },
         {
-          "expr": "sum(rate(http_requests_total{status=\"200\"}[30s]))",
+          "expr": "sum(rate(http_requests_total{http_response_status_code=\"200\"}[$__rate_interval]))",
           "legendFormat": "200 OK",
           "refId": "B"
         },
         {
-          "expr": "sum(rate(http_requests_total{status=\"202\"}[30s]))",
+          "expr": "sum(rate(http_requests_total{http_response_status_code=\"202\"}[$__rate_interval]))",
           "legendFormat": "202 Accepted",
           "refId": "C"
         },
         {
-          "expr": "sum(rate(http_requests_total{status=~\"4..\"}[30s]))",
+          "expr": "sum(rate(http_requests_total{http_response_status_code=~\"4..\"}[$__rate_interval]))",
           "legendFormat": "4xx Errors",
           "refId": "D"
         },
         {
-          "expr": "sum(rate(http_requests_total{status=~\"5..\"}[30s]))",
+          "expr": "sum(rate(http_requests_total{http_response_status_code=~\"5..\"}[$__rate_interval]))",
           "legendFormat": "5xx Errors",
           "refId": "E"
         }
@@ -80,17 +80,17 @@
       },
       "targets": [
         {
-          "expr": "avg(http_request_duration_seconds{quantile=\"0.5\"})",
+          "expr": "avg(http_request_duration_seconds{quantile=\"0.5\",url_path!~\"/health|/metrics\"})",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "avg(http_request_duration_seconds{quantile=\"0.9\"})",
+          "expr": "avg(http_request_duration_seconds{quantile=\"0.9\",url_path!~\"/health|/metrics\"})",
           "legendFormat": "p90",
           "refId": "B"
         },
         {
-          "expr": "avg(http_request_duration_seconds{quantile=\"0.99\"})",
+          "expr": "avg(http_request_duration_seconds{quantile=\"0.99\",url_path!~\"/health|/metrics\"})",
           "legendFormat": "p99",
           "refId": "C"
         }
@@ -136,12 +136,12 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(http_requests_total{status=~\"[45]..\"}[30s])) / sum(rate(http_requests_total[30s])) * 100",
+          "expr": "sum(rate(http_requests_total{http_response_status_code=~\"[45]..\"}[$__rate_interval])) / sum(rate(http_requests_total[$__rate_interval])) * 100",
           "legendFormat": "Error %",
           "refId": "A"
         },
         {
-          "expr": "sum(rate(rate_limited_total[30s])) / sum(rate(http_requests_total[30s])) * 100",
+          "expr": "sum(rate(rate_limited_total[$__rate_interval])) / sum(rate(http_requests_total[$__rate_interval])) * 100",
           "legendFormat": "Rate Limited %",
           "refId": "B"
         }
@@ -255,7 +255,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(transactions_created_total[30s]))",
+          "expr": "sum(rate(transactions_created_total[$__rate_interval]))",
           "refId": "A"
         }
       ],
@@ -284,7 +284,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(transactions_processed_total[30s]))",
+          "expr": "sum(rate(transactions_processed_total[$__rate_interval]))",
           "refId": "A"
         }
       ],
@@ -380,12 +380,12 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(transactions_created_total[30s]))",
+          "expr": "sum(rate(transactions_created_total[$__rate_interval]))",
           "legendFormat": "Created /s",
           "refId": "A"
         },
         {
-          "expr": "sum(rate(transactions_processed_total[30s]))",
+          "expr": "sum(rate(transactions_processed_total[$__rate_interval]))",
           "legendFormat": "Processed /s",
           "refId": "B"
         }
@@ -535,7 +535,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(rate_limited_total[30s]))",
+          "expr": "sum(rate(rate_limited_total[$__rate_interval]))",
           "refId": "A"
         }
       ],
@@ -572,7 +572,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(backpressure_shed_total[30s]))",
+          "expr": "sum(rate(backpressure_shed_total[$__rate_interval]))",
           "refId": "A"
         }
       ],
@@ -647,7 +647,7 @@
       },
       "targets": [
         {
-          "expr": "count(up{job=\"gn-backend\"} == 1)",
+          "expr": "count(up{job=\"peakload-capstone\"} == 1)",
           "refId": "A"
         }
       ],
@@ -684,12 +684,12 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(rate_limited_total[30s]))",
+          "expr": "sum(rate(rate_limited_total[$__rate_interval]))",
           "legendFormat": "Rate Limited",
           "refId": "A"
         },
         {
-          "expr": "sum(rate(backpressure_shed_total[30s]))",
+          "expr": "sum(rate(backpressure_shed_total[$__rate_interval]))",
           "legendFormat": "Load Shed",
           "refId": "B"
         }
@@ -750,7 +750,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(cache_hits_total[30s])) / (sum(rate(cache_hits_total[30s])) + sum(rate(cache_misses_total[30s])))",
+          "expr": "sum(rate(cache_hits_total[$__rate_interval])) / (sum(rate(cache_hits_total[$__rate_interval])) + sum(rate(cache_misses_total[$__rate_interval])))",
           "legendFormat": "Hit Rate",
           "refId": "A"
         }
@@ -809,8 +809,8 @@
       },
       "targets": [
         {
-          "expr": "avg by (method, path) (http_request_duration_seconds{quantile=\"0.9\"})",
-          "legendFormat": "{{method}} {{path}}",
+          "expr": "avg by (http_request_method, url_path) (http_request_duration_seconds{quantile=\"0.9\",url_path!~\"/health|/metrics\"})",
+          "legendFormat": "{{http_request_method}} {{url_path}}",
           "refId": "A"
         }
       ],
@@ -838,8 +838,8 @@
       },
       "targets": [
         {
-          "expr": "sum by (method, path) (rate(http_requests_total[30s]))",
-          "legendFormat": "{{method}} {{path}}",
+          "expr": "sum by (http_request_method, url_path) (rate(http_requests_total{url_path!~\"/health|/metrics\"}[$__rate_interval]))",
+          "legendFormat": "{{http_request_method}} {{url_path}}",
           "refId": "A"
         }
       ],
@@ -862,7 +862,7 @@
   "refresh": "5s",
   "schemaVersion": 39,
   "tags": [
-    "gn-backend",
+    "peakload-capstone",
     "performance",
     "sharding"
   ],
@@ -875,7 +875,7 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "GN Backend — Performance Dashboard",
-  "uid": "gn-backend-perf",
-  "version": 2
+  "title": "Peakload Capstone — Performance Dashboard",
+  "uid": "peakload-capstone-perf",
+  "version": 3
 }

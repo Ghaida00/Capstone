@@ -44,7 +44,7 @@ pub fn init_tracing() {
     let provider = SdkTracerProvider::builder()
         .with_simple_exporter(exporter)
         .build();
-    let tracer = provider.tracer("gn-backend");
+    let tracer = provider.tracer("peakload-capstone");
 
     tracing_subscriber::registry()
         .with(EnvFilter::from_default_env())

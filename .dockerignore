@@ -1,6 +1,13 @@
 target/
+**/target/
 .git/
+.gitignore
 .env
+.env.*
+!.env.example
 *.md
 .vscode/
 .idea/
+Dockerfile
+.dockerignore
+docker-compose*.yml

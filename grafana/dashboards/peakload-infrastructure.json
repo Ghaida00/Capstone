@@ -31,7 +31,7 @@
             },
             "targets": [
                 {
-                    "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"gn-.*\"}[30s])) * 100",
+                    "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"peakload-.*\"}[$__rate_interval])) * 100",
                     "legendFormat": "{{name}}",
                     "refId": "A"
                 }
@@ -80,7 +80,7 @@
             },
             "targets": [
                 {
-                    "expr": "topk(5, sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"gn-.*\"}[1m])) * 100)",
+                    "expr": "topk(5, sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"peakload-.*\"}[1m])) * 100)",
                     "legendFormat": "{{name}}",
                     "refId": "A",
                     "instant": true
@@ -124,7 +124,7 @@
             },
             "targets": [
                 {
-                    "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"gn-app-.*\"}[30s])) * 100",
+                    "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"peakload-app-.*\"}[$__rate_interval])) * 100",
                     "legendFormat": "{{name}}",
                     "refId": "A"
                 }
@@ -164,7 +164,7 @@
             },
             "targets": [
                 {
-                    "expr": "container_memory_working_set_bytes{name=~\"gn-.*\"}",
+                    "expr": "container_memory_working_set_bytes{name=~\"peakload-.*\"}",
                     "legendFormat": "{{name}}",
                     "refId": "A"
                 }
@@ -193,7 +193,7 @@
             },
             "targets": [
                 {
-                    "expr": "topk(5, container_memory_working_set_bytes{name=~\"gn-.*\"})",
+                    "expr": "topk(5, container_memory_working_set_bytes{name=~\"peakload-.*\"})",
                     "legendFormat": "{{name}}",
                     "refId": "A",
                     "instant": true
@@ -237,7 +237,7 @@
             },
             "targets": [
                 {
-                    "expr": "container_memory_working_set_bytes{name=~\"gn-pg.*|gn-pgbouncer.*\"}",
+                    "expr": "container_memory_working_set_bytes{name=~\"peakload-pg.*|peakload-pgbouncer.*\"}",
                     "legendFormat": "{{name}}",
                     "refId": "A"
                 }
@@ -277,7 +277,7 @@
             },
             "targets": [
                 {
-                    "expr": "sum by (name) (rate(container_network_receive_bytes_total{name=~\"gn-.*\"}[30s]))",
+                    "expr": "sum by (name) (rate(container_network_receive_bytes_total{name=~\"peakload-.*\"}[$__rate_interval]))",
                     "legendFormat": "{{name}}",
                     "refId": "A"
                 }
@@ -306,7 +306,7 @@
             },
             "targets": [
                 {
-                    "expr": "sum by (name) (rate(container_network_transmit_bytes_total{name=~\"gn-.*\"}[30s]))",
+                    "expr": "sum by (name) (rate(container_network_transmit_bytes_total{name=~\"peakload-.*\"}[$__rate_interval]))",
                     "legendFormat": "{{name}}",
                     "refId": "A"
                 }
@@ -345,7 +345,7 @@
             },
             "targets": [
                 {
-                    "expr": "count(container_memory_working_set_bytes{name=~\"gn-.*\"})",
+                    "expr": "count(container_memory_working_set_bytes{name=~\"peakload-.*\"})",
                     "refId": "A",
                     "instant": true
                 }
@@ -375,7 +375,7 @@
             },
             "targets": [
                 {
-                    "expr": "sum(rate(container_cpu_usage_seconds_total{name=~\"gn-.*\"}[1m])) * 100",
+                    "expr": "sum(rate(container_cpu_usage_seconds_total{name=~\"peakload-.*\"}[1m])) * 100",
                     "refId": "A"
                 }
             ],
@@ -412,7 +412,7 @@
             },
             "targets": [
                 {
-                    "expr": "sum(container_memory_working_set_bytes{name=~\"gn-.*\"})",
+                    "expr": "sum(container_memory_working_set_bytes{name=~\"peakload-.*\"})",
                     "refId": "A"
                 }
             ],
@@ -449,7 +449,7 @@
             },
             "targets": [
                 {
-                    "expr": "sum(rate(container_network_receive_bytes_total{name=~\"gn-.*\"}[30s]))",
+                    "expr": "sum(rate(container_network_receive_bytes_total{name=~\"peakload-.*\"}[$__rate_interval]))",
                     "refId": "A"
                 }
             ],
@@ -478,7 +478,7 @@
             },
             "targets": [
                 {
-                    "expr": "sum(rate(container_network_transmit_bytes_total{name=~\"gn-.*\"}[30s]))",
+                    "expr": "sum(rate(container_network_transmit_bytes_total{name=~\"peakload-.*\"}[$__rate_interval]))",
                     "refId": "A"
                 }
             ],
@@ -508,7 +508,7 @@
             },
             "targets": [
                 {
-                    "expr": "container_memory_working_set_bytes{name=~\"gn-.*\"}",
+                    "expr": "container_memory_working_set_bytes{name=~\"peakload-.*\"}",
                     "legendFormat": "{{name}}",
                     "refId": "A",
                     "instant": true,
@@ -585,7 +585,7 @@
     "refresh": "5s",
     "schemaVersion": 39,
     "tags": [
-        "gn-backend",
+        "peakload-capstone",
         "infrastructure",
         "containers"
     ],
@@ -598,7 +598,7 @@
     },
     "timepicker": {},
     "timezone": "browser",
-    "title": "GN Infrastructure — Container Resources",
-    "uid": "gn-infra-containers",
-    "version": 1
+    "title": "Peakload Infrastructure — Container Resources",
+    "uid": "peakload-infra-containers",
+    "version": 2
 }

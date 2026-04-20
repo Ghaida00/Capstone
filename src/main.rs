@@ -30,7 +30,7 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Distroless health probe: `gn-backend --health-check`
+    // Distroless health probe: `peakload-capstone --health-check`
     if std::env::args().any(|a| a == "--health-check") {
         return health_probe().await;
     }

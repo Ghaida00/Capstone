@@ -62,29 +62,29 @@ impl Config {
             // Shard 0
             database_shard0_write_url: env_or(
                 "DATABASE_SHARD0_WRITE_URL",
-                "postgres://gn_user:gn_secure_pass@pgbouncer-shard0:5432/gn_db",
+                "postgres://peakload_user:peakload_secure_pass@pgbouncer-shard0:5432/peakload_db",
             ),
             database_shard0_read_urls: parse_csv_env(
                 "DATABASE_SHARD0_READ_URLS",
-                "postgres://gn_user:gn_secure_pass@pg-shard0-replica1:5432/gn_db",
+                "postgres://peakload_user:peakload_secure_pass@pg-shard0-replica1:5432/peakload_db",
             ),
             // Shard 1
             database_shard1_write_url: env_or(
                 "DATABASE_SHARD1_WRITE_URL",
-                "postgres://gn_user:gn_secure_pass@pgbouncer-shard1:5432/gn_db",
+                "postgres://peakload_user:peakload_secure_pass@pgbouncer-shard1:5432/peakload_db",
             ),
             database_shard1_read_urls: parse_csv_env(
                 "DATABASE_SHARD1_READ_URLS",
-                "postgres://gn_user:gn_secure_pass@pg-shard1-replica1:5432/gn_db",
+                "postgres://peakload_user:peakload_secure_pass@pg-shard1-replica1:5432/peakload_db",
             ),
             // Shard 2
             database_shard2_write_url: env_or(
                 "DATABASE_SHARD2_WRITE_URL",
-                "postgres://gn_user:gn_secure_pass@pgbouncer-shard2:5432/gn_db",
+                "postgres://peakload_user:peakload_secure_pass@pgbouncer-shard2:5432/peakload_db",
             ),
             database_shard2_read_urls: parse_csv_env(
                 "DATABASE_SHARD2_READ_URLS",
-                "postgres://gn_user:gn_secure_pass@pg-shard2-replica1:5432/gn_db",
+                "postgres://peakload_user:peakload_secure_pass@pg-shard2-replica1:5432/peakload_db",
             ),
 
             db_write_pool_size: env_or("DB_WRITE_POOL_SIZE", "30")
@@ -112,7 +112,7 @@ impl Config {
 
             rabbitmq_url: env_or(
                 "RABBITMQ_URL",
-                "amqp://gn_user:gn_secure_pass@localhost:5672",
+                "amqp://peakload_user:peakload_secure_pass@localhost:5672",
             ),
 
             rate_limit_per_second: env_or("RATE_LIMIT_PER_SECOND", "10000")
@@ -436,8 +436,8 @@ mod tests {
     #[test]
     fn mask_url_hides_password() {
         assert_eq!(
-            mask_url("postgres://gn_user:gn_secure_pass@host:5432/db"),
-            "postgres://gn_user:****@host:5432/db"
+            mask_url("postgres://peakload_user:peakload_secure_pass@host:5432/db"),
+            "postgres://peakload_user:****@host:5432/db"
         );
     }
 

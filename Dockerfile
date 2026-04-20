@@ -1,62 +1,51 @@
+# syntax=docker/dockerfile:1.7
 # ============================================================
-# Stage 1: Planner — generate the dependency recipe
+# Base — pinned Rust + cargo-chef + system build deps (shared)
 # ============================================================
-FROM rust:slim-bookworm AS planner
+FROM rust:1.95-slim-bookworm AS chef
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN cargo install cargo-chef --locked
 
 WORKDIR /app
+
+# ============================================================
+# Planner — generate dependency recipe
+# ============================================================
+FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ============================================================
-# Stage 2: Cacher — build only dependencies from the recipe
+# Builder — cook deps (cached), then compile app
 # ============================================================
-FROM rust:slim-bookworm AS cacher
-
-RUN cargo install cargo-chef --locked
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
+FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
 
-# ============================================================
-# Stage 3: Builder — compile the actual application source
-# ============================================================
-FROM rust:slim-bookworm AS builder
-
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# Re-use the cached dependency artifacts from the cacher stage
-COPY --from=cacher /app/target target
-COPY --from=cacher /usr/local/cargo /usr/local/cargo
+# Cache the cargo registry across builds (BuildKit)
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo chef cook --release --recipe-path recipe.json
 
 COPY . .
-RUN cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --release --locked --bin peakload-capstone
 
 # ============================================================
-# Stage 4: Runtime — Distroless production image
+# Runtime — distroless (nonroot baked in: UID 65532)
 # ============================================================
-FROM gcr.io/distroless/cc-debian12 AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
-COPY --from=builder /app/target/release/gn-backend /app/gn-backend
-
-# Distroless ships with a built-in nonroot user (UID 65534)
-USER nonroot:nonroot
+WORKDIR /app
+COPY --from=builder /app/target/release/peakload-capstone /app/peakload-capstone
 
 EXPOSE 3000
 
 # No HEALTHCHECK here — distroless has no shell.
-# Health probes are defined in docker-compose.yml using the
-# container's exposed HTTP endpoint via service-level checks.
+# docker-compose performs health probes via direct binary exec.
 
-CMD ["/app/gn-backend"]
+ENTRYPOINT ["/app/peakload-capstone"]

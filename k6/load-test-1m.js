@@ -136,5 +136,5 @@ export default function () {
 export function teardown(data) {
     console.log(`\n📈 1 Million/hr Load test complete!`);
     console.log(`   Check Grafana dashboard: http://localhost:3001`);
-    console.log(`   Dashboard: GN Backend — Performance Dashboard`);
+    console.log(`   Dashboard: Peakload Capstone — Performance Dashboard`);
 }

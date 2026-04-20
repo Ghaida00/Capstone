@@ -20,7 +20,7 @@ use crate::db::shard::ShardRouter;
 use crate::error::AppError;
 
 const QUEUE_NAME: &str = "transactions.process";
-const CONSUMER_TAG: &str = "gn-consumer";
+const CONSUMER_TAG: &str = "peakload-consumer";
 const BATCH_SIZE: usize = 50;
 const BATCH_FLUSH_MS: u64 = 100;
 

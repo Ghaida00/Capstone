@@ -1,5 +1,5 @@
 [package]
-name = "gn-backend"
+name = "peakload-capstone"
 version = "0.1.0"
 edition = "2021"
 description = "High-performance transaction processing backend"
