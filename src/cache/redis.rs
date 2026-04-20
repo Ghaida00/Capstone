@@ -137,12 +137,22 @@ impl RedisCache {
     }
 
     /// Check if Redis connection is healthy.
+    /// Fix #13: Checks BOTH write (master) and read (replica) pools.
     pub async fn health_check(&self) -> Result<bool, AppError> {
-        let mut conn = self.write_conn().await?;
-        let result: String = ::redis::cmd("PING")
-            .query_async(&mut *conn)
+        // Check write pool (master)
+        let mut write_conn = self.write_conn().await?;
+        let write_result: String = ::redis::cmd("PING")
+            .query_async(&mut *write_conn)
             .await
             .map_err(AppError::Redis)?;
-        Ok(result == "PONG")
+
+        // Check read pool (replica)
+        let mut read_conn = self.read_conn().await?;
+        let read_result: String = ::redis::cmd("PING")
+            .query_async(&mut *read_conn)
+            .await
+            .map_err(AppError::Redis)?;
+
+        Ok(write_result == "PONG" && read_result == "PONG")
     }
 }

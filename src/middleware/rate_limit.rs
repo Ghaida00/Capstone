@@ -12,6 +12,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 /// Local counter entry: request count + window start time.
 struct CounterEntry {
@@ -22,6 +23,9 @@ struct CounterEntry {
 /// Redis-based rate limiter with local in-memory cache.
 /// Each replica keeps per-IP counters in memory and syncs to Redis periodically.
 /// This reduces Redis round-trips from ~2800/s to ~4/s (one sync per replica per second).
+///
+/// Fix #16: Background tasks now participate in graceful shutdown via
+/// `CancellationToken` instead of running forever.
 #[derive(Clone)]
 pub struct RateLimiter {
     pool: Arc<Pool>,
@@ -34,7 +38,7 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    pub fn new(pool: Pool, per_second: u64, burst: u32) -> Self {
+    pub fn new(pool: Pool, per_second: u64, burst: u32, cancel: CancellationToken) -> Self {
         let window_secs = if per_second > 0 {
             (burst as u64) / per_second
         } else {
@@ -49,26 +53,45 @@ impl RateLimiter {
             local_counters: Arc::new(RwLock::new(HashMap::with_capacity(1024))),
         };
 
-        // Spawn background task to sync local counters to Redis every second
+        // Fix #16: Spawn background task to sync local counters to Redis every second
+        // with cancellation support
         let sync_limiter = limiter.clone();
+        let sync_cancel = cancel.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
             loop {
-                interval.tick().await;
-                sync_limiter.sync_to_redis().await;
+                tokio::select! {
+                    _ = interval.tick() => {
+                        sync_limiter.sync_to_redis().await;
+                    }
+                    _ = sync_cancel.cancelled() => {
+                        tracing::info!("Rate limiter sync task: shutting down");
+                        // Final sync before exit
+                        sync_limiter.sync_to_redis().await;
+                        break;
+                    }
+                }
             }
         });
 
-        // Spawn cleanup task every 10 seconds to remove expired entries
+        // Fix #16: Spawn cleanup task every 10 seconds with cancellation support
         let cleanup_limiter = limiter.clone();
+        let cleanup_cancel = cancel.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
             loop {
-                interval.tick().await;
-                let mut counters = cleanup_limiter.local_counters.write().await;
-                let now = Instant::now();
-                let window = std::time::Duration::from_secs(cleanup_limiter.window_secs);
-                counters.retain(|_, entry| now.duration_since(entry.window_start) < window);
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let mut counters = cleanup_limiter.local_counters.write().await;
+                        let now = Instant::now();
+                        let window = std::time::Duration::from_secs(cleanup_limiter.window_secs);
+                        counters.retain(|_, entry| now.duration_since(entry.window_start) < window);
+                    }
+                    _ = cleanup_cancel.cancelled() => {
+                        tracing::info!("Rate limiter cleanup task: shutting down");
+                        break;
+                    }
+                }
             }
         });
 

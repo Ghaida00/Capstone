@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use axum::{
     error_handling::HandleErrorLayer,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     middleware as axum_middleware,
     routing::{get, post},
     BoxError, Router,
@@ -10,9 +10,10 @@ use axum::{
 use tower::timeout::TimeoutLayer;
 use tower::ServiceBuilder;
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::CorsLayer,
     trace::TraceLayer,
 };
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::cache::redis::RedisCache;
@@ -75,6 +76,7 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics::describe_counter!("idempotency_hits_total", "Idempotency hits");
     metrics::describe_counter!("rabbitmq_reconnections_total", "RabbitMQ reconnections");
     metrics::describe_histogram!("transactions_batch_size", "Batch sizes");
+    metrics::describe_counter!("dlq_messages_total", "Dead letter queue messages");
 
     // Initialise to zero
     metrics::counter!("transactions_created_total").absolute(0);
@@ -85,6 +87,7 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics::counter!("backpressure_shed_total").absolute(0);
     metrics::counter!("idempotency_hits_total").absolute(0);
     metrics::counter!("rabbitmq_reconnections_total").absolute(0);
+    metrics::counter!("dlq_messages_total").absolute(0);
     metrics::gauge!("backpressure_in_flight").set(0.0);
     metrics::gauge!("circuit_breaker_state").set(0.0);
     metrics::histogram!("transactions_batch_size").record(0.0);
@@ -107,7 +110,13 @@ pub struct Infrastructure {
 
 /// Create all infrastructure resources (DB shards, Redis, RabbitMQ,
 /// middleware components).
-pub async fn init_infrastructure(config: &Config) -> anyhow::Result<Infrastructure> {
+///
+/// Fix #16: `cancel` token is passed to `RateLimiter` so its background
+/// tasks can shut down gracefully.
+pub async fn init_infrastructure(
+    config: &Config,
+    cancel: CancellationToken,
+) -> anyhow::Result<Infrastructure> {
     tracing::info!("Connecting to database shards...");
     let shard_router = ShardRouter::new(config).await?;
 
@@ -122,6 +131,7 @@ pub async fn init_infrastructure(config: &Config) -> anyhow::Result<Infrastructu
         rate_limit_pool,
         config.rate_limit_per_second,
         config.rate_limit_burst,
+        cancel,
     );
     let circuit_breaker = CircuitBreaker::new(
         config.circuit_breaker_failure_threshold,
@@ -151,8 +161,28 @@ pub fn build_router(
     rate_limiter: RateLimiter,
     circuit_breaker: CircuitBreaker,
     backpressure: BackpressureController,
-    api_timeout_secs: u64,
+    config: &Config,
 ) -> Router {
+    // Fix #18: Optional JWT auth, disabled by default. When enabled we
+    // install the decoding key once and then attach the middleware —
+    // otherwise the middleware is still attached but in pass-through mode
+    // so we have a single code path and tests never need to special-case.
+    if config.enable_auth {
+        if let Some(secret) = config.auth_secret.as_deref() {
+            crate::middleware::auth::init_auth(secret);
+            tracing::info!("JWT auth middleware enabled");
+        } else {
+            tracing::error!(
+                "ENABLE_AUTH=true but AUTH_SECRET is missing — all requests will 500"
+            );
+        }
+    } else {
+        tracing::info!("JWT auth middleware disabled (ENABLE_AUTH=false)");
+    }
+    let auth_state = crate::middleware::auth::AuthState {
+        enabled: config.enable_auth,
+    };
+
     let api_routes = Router::new()
         .route(
             "/transactions",
@@ -175,6 +205,10 @@ pub fn build_router(
             get(crate::api::handlers::get_balance),
         )
         .layer(axum_middleware::from_fn_with_state(
+            auth_state,
+            crate::middleware::auth::auth_middleware,
+        ))
+        .layer(axum_middleware::from_fn_with_state(
             rate_limiter,
             crate::middleware::rate_limit::rate_limit_middleware,
         ))
@@ -186,6 +220,9 @@ pub fn build_router(
             backpressure,
             crate::middleware::backpressure::backpressure_middleware,
         ));
+
+    // Fix #10: Build CORS layer from configuration
+    let cors = build_cors_layer(config);
 
     Router::new()
         .nest("/api/v1", api_routes)
@@ -213,13 +250,41 @@ pub fn build_router(
                         )
                     }
                 }))
-                .layer(TimeoutLayer::new(Duration::from_secs(api_timeout_secs))),
+                .layer(TimeoutLayer::new(Duration::from_secs(
+                    config.api_timeout_secs,
+                ))),
         )
         .layer(TraceLayer::new_for_http())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(cors)
+}
+
+/// Fix #10: Build CORS layer from config instead of blanket `Any`.
+///
+/// For development (CORS_ALLOWED_ORIGINS=*), allows all origins.
+/// For production, restricts to configured domains.
+fn build_cors_layer(config: &Config) -> CorsLayer {
+    use tower_http::cors::Any;
+
+    let is_wildcard = config.cors_allowed_origins.len() == 1
+        && config.cors_allowed_origins[0] == "*";
+
+    if is_wildcard {
+        // Development mode — wide open
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    } else {
+        // Production mode — restrict to specific origins
+        let origins: Vec<HeaderValue> = config
+            .cors_allowed_origins
+            .iter()
+            .filter_map(|o| o.parse::<HeaderValue>().ok())
+            .collect();
+
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    }
 }

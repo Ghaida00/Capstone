@@ -35,21 +35,22 @@ impl App {
         tracing::info!("{}", config);
 
         let metrics_handle = bootstrap::init_metrics();
-        let infra = bootstrap::init_infrastructure(&config).await?;
+        let cancel = CancellationToken::new();
+
+        // Fix #16: pass cancel token so rate limiter tasks can shut down
+        let infra = bootstrap::init_infrastructure(&config, cancel.child_token()).await?;
 
         let state = AppState {
             shard_router: infra.shard_router,
             cache: infra.cache,
             queue_producer: infra.queue_producer,
-            circuit_breaker: infra.circuit_breaker.clone(),
-            backpressure: infra.backpressure.clone(),
             metrics_handle,
         };
 
         Ok(Self {
             state,
             config,
-            cancel: CancellationToken::new(),
+            cancel,
             rate_limiter: infra.rate_limiter,
             circuit_breaker: infra.circuit_breaker,
             backpressure: infra.backpressure,
@@ -80,7 +81,7 @@ impl App {
             self.rate_limiter,
             self.circuit_breaker,
             self.backpressure,
-            self.config.api_timeout_secs,
+            &self.config,
         );
 
         // Bind and start the server

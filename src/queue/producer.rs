@@ -145,30 +145,11 @@ impl QueueProducer {
         Ok(channel)
     }
 
-    /// Attempt to reconnect to RabbitMQ.
-    async fn reconnect(&self) -> Result<(), AppError> {
-        tracing::warn!("RabbitMQ: attempting reconnection...");
-
-        let new_channel = Self::connect_and_setup(
-            &self.config.host,
-            self.config.port,
-            &self.config.username,
-            &self.config.password,
-        )
-        .await?;
-
-        let mut channel_guard = self.channel.lock().await;
-        *channel_guard = Some(new_channel);
-        self.connected
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-
-        tracing::info!("RabbitMQ: reconnected successfully");
-        metrics::counter!("rabbitmq_reconnections_total").increment(1);
-        Ok(())
-    }
-
     /// Publish a message to the transaction queue.
     /// Automatically attempts reconnection on failure.
+    ///
+    /// Fix #27: Uses a single lock scope covering check-reconnect-retry
+    /// to prevent thundering herd of concurrent reconnections.
     pub async fn publish<T: Serialize>(&self, message: &T) -> Result<(), AppError> {
         let payload = serde_json::to_vec(message)?;
 
@@ -179,31 +160,45 @@ impl QueueProducer {
 
         let args = BasicPublishArguments::new(EXCHANGE_NAME, ROUTING_KEY);
 
+        // Single lock scope: attempt → reconnect → retry
+        // This prevents multiple tasks from triggering concurrent reconnections.
+        let mut channel_guard = self.channel.lock().await;
+
         // First attempt
-        {
-            let channel_guard = self.channel.lock().await;
-            if let Some(ref channel) = *channel_guard {
-                match channel
-                    .basic_publish(properties.clone(), payload.clone(), args.clone())
-                    .await
-                {
-                    Ok(_) => {
-                        tracing::trace!("Message published");
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "RabbitMQ publish failed, will retry after reconnect");
-                        self.connected
-                            .store(false, std::sync::atomic::Ordering::SeqCst);
-                    }
+        if let Some(ref channel) = *channel_guard {
+            match channel
+                .basic_publish(properties.clone(), payload.clone(), args.clone())
+                .await
+            {
+                Ok(_) => {
+                    tracing::trace!("Message published");
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "RabbitMQ publish failed, reconnecting...");
+                    self.connected
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         }
 
-        // Reconnect and retry once
-        self.reconnect().await?;
+        // Reconnect within the same lock scope
+        tracing::warn!("RabbitMQ: attempting reconnection...");
+        let new_channel = Self::connect_and_setup(
+            &self.config.host,
+            self.config.port,
+            &self.config.username,
+            &self.config.password,
+        )
+        .await?;
 
-        let channel_guard = self.channel.lock().await;
+        *channel_guard = Some(new_channel);
+        self.connected
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!("RabbitMQ: reconnected successfully");
+        metrics::counter!("rabbitmq_reconnections_total").increment(1);
+
+        // Retry with new channel
         if let Some(ref channel) = *channel_guard {
             channel
                 .basic_publish(properties, payload, args)

@@ -66,10 +66,14 @@ pub async fn backpressure_middleware(
         }
     };
 
+    // Fix #30: Gauge is updated eagerly here so the metrics handler no
+    // longer needs a reference to the controller via AppState.
+    metrics::gauge!("backpressure_in_flight").set(controller.current_in_flight() as f64);
+
     let response = next.run(req).await;
 
-    // Permit is dropped here, releasing the slot
     drop(permit);
+    metrics::gauge!("backpressure_in_flight").set(controller.current_in_flight() as f64);
 
     response
 }

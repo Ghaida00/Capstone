@@ -13,18 +13,18 @@ mod queue;
 
 use crate::cache::redis::RedisCache;
 use crate::db::shard::ShardRouter;
-use crate::middleware::backpressure::BackpressureController;
-use crate::middleware::circuit_breaker::CircuitBreaker;
 use crate::queue::producer::QueueProducer;
 
 /// Shared application state.
+///
+/// Fix #30: `circuit_breaker` and `backpressure` live only in middleware.
+/// Their metrics are now published eagerly from the middleware layers,
+/// so the `/metrics` handler does not need a reference to them.
 #[derive(Clone)]
 pub struct AppState {
     pub shard_router: ShardRouter,
     pub cache: RedisCache,
     pub queue_producer: QueueProducer,
-    pub circuit_breaker: CircuitBreaker,
-    pub backpressure: BackpressureController,
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
