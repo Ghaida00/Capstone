@@ -16,7 +16,7 @@ if [ -z "$(ls -A "$PGDATA" 2>/dev/null)" ]; then
     chown -R postgres:postgres "$PGDATA"
     chmod 700 "$PGDATA"
 
-    until pg_isready -h "$PRIMARY_HOST" -p 5432 -U gn_user; do
+    until pg_isready -h "$PRIMARY_HOST" -p 5432 -U peakload_user; do
         echo "Waiting for primary ($PRIMARY_HOST) to be ready..."
         sleep 2
     done

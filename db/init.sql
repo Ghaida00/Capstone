@@ -1,5 +1,5 @@
 -- ============================================================
--- GN Backend Database Schema
+-- Peakload Capstone Database Schema
 -- High-performance transaction processing
 -- ============================================================
 

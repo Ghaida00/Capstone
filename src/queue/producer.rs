@@ -13,10 +13,10 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::error::AppError;
 
-const EXCHANGE_NAME: &str = "gn.transactions";
+const EXCHANGE_NAME: &str = "peakload.transactions";
 const QUEUE_NAME: &str = "transactions.process";
 const ROUTING_KEY: &str = "transaction.created";
-const DLX_EXCHANGE: &str = "gn.transactions.dlx";
+const DLX_EXCHANGE: &str = "peakload.transactions.dlx";
 const DLX_QUEUE: &str = "transactions.dead_letter";
 
 /// RabbitMQ message producer with automatic reconnection.

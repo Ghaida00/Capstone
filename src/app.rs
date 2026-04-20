@@ -28,7 +28,7 @@ impl App {
     /// Bootstrap the entire application: tracing, metrics, infrastructure.
     pub async fn new() -> anyhow::Result<Self> {
         bootstrap::init_tracing();
-        tracing::info!("Starting GN High-Performance Backend (3-shard, mimalloc)");
+        tracing::info!("Starting Peakload Capstone High-Performance Backend (3-shard, mimalloc)");
 
         let config = Config::from_env();
         config.validate()?;

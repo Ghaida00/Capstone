@@ -3,8 +3,8 @@ global:
   evaluation_interval: 5s
 
 scrape_configs:
-  # GN Backend Application (all replicas via Docker DNS)
-  - job_name: "gn-backend"
+  # Peakload Capstone Application (all replicas via Docker DNS)
+  - job_name: "peakload-capstone"
     dns_sd_configs:
       - names:
           - "app"
@@ -22,7 +22,7 @@ scrape_configs:
         target_label: name
         replacement: "$1"
       - source_labels: [name]
-        regex: "gn-.*"
+        regex: "peakload-.*"
         action: keep
 
   # Prometheus self-monitoring
