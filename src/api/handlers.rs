@@ -3,6 +3,7 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
+use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use chrono::Utc;
@@ -10,12 +11,66 @@ use serde_json::json;
 
 use crate::api::responses::{ApiResponse, HealthResponse, HealthServices};
 use crate::db::models::{
-    CreateTransactionRequest, IdempotencyKeyRow, TransactionResponse, TransactionRow, TransactionStatusRow, UserRow,
+    CreateTransactionRequest, IdempotencyKeyRow, TransactionResponse, TransactionRow,
+    TransactionStatusRow, UserRow,
 };
 use crate::db::shard::ShardRouter;
 use crate::error::{AppError, AppResult};
 use crate::middleware::request_id::RequestId;
 use crate::AppState;
+
+// ─── Input Validation ──────────────────────────────────────────
+
+/// Maximum length for account numbers (matches DB VARCHAR(50)).
+const MAX_ACCOUNT_LEN: usize = 50;
+/// Maximum length for reference IDs (matches DB VARCHAR(100)).
+const MAX_REFERENCE_ID_LEN: usize = 100;
+
+/// Validate an account number: non-empty, within length, safe characters.
+fn validate_account(account: &str, field_name: &str) -> AppResult<()> {
+    if account.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "{} must not be empty",
+            field_name
+        )));
+    }
+    if account.len() > MAX_ACCOUNT_LEN {
+        return Err(AppError::BadRequest(format!(
+            "{} must be at most {} characters",
+            field_name, MAX_ACCOUNT_LEN
+        )));
+    }
+    // Allow alphanumeric, hyphens, underscores, and dots
+    if !account
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(AppError::BadRequest(format!(
+            "{} contains invalid characters (alphanumeric, hyphens, underscores, dots only)",
+            field_name
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a reference ID: within length, safe characters.
+fn validate_reference_id(reference_id: &str) -> AppResult<()> {
+    if reference_id.len() > MAX_REFERENCE_ID_LEN {
+        return Err(AppError::BadRequest(format!(
+            "reference_id must be at most {} characters",
+            MAX_REFERENCE_ID_LEN
+        )));
+    }
+    if !reference_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(AppError::BadRequest(
+            "reference_id contains invalid characters".into(),
+        ));
+    }
+    Ok(())
+}
 
 // ─── Transaction Handlers ──────────────────────────────────────
 
@@ -26,13 +81,12 @@ pub async fn create_transaction(
     request_id: Option<Extension<RequestId>>,
     Json(req): Json<CreateTransactionRequest>,
 ) -> AppResult<(StatusCode, Json<ApiResponse<TransactionCreatedResponse>>)> {
-    // Validate input
-    if req.amount <= 0.0 {
+    // --- Input validation (#26) ---
+    if req.amount <= Decimal::ZERO {
         return Err(AppError::BadRequest("Amount must be positive".into()));
     }
-    if req.from_account.is_empty() || req.to_account.is_empty() {
-        return Err(AppError::BadRequest("Account IDs must not be empty".into()));
-    }
+    validate_account(&req.from_account, "from_account")?;
+    validate_account(&req.to_account, "to_account")?;
     if req.from_account == req.to_account {
         return Err(AppError::BadRequest(
             "Source and destination accounts must be different".into(),
@@ -43,6 +97,9 @@ pub async fn create_transaction(
         .reference_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    if let Some(ref rid) = req.reference_id {
+        validate_reference_id(rid)?;
+    }
 
     // Route transaction to shard first; idempotency key is shard-scoped too.
     let shard = ShardRouter::shard_for(&req.from_account);
@@ -70,7 +127,7 @@ pub async fn create_transaction(
     let request_hash = json!({
         "from_account": req.from_account,
         "to_account": req.to_account,
-        "amount": req.amount,
+        "amount": req.amount.to_string(),
         "currency": req.currency,
         "reference_id": reference_id,
         "description": req.description,
@@ -109,138 +166,17 @@ pub async fn create_transaction(
     // If the row already exists, validate and return the stored response
     // unless it is failed/expired, in which case we can try to revive it.
     if insert_res.rows_affected() == 0 {
-        let existing: Option<IdempotencyKeyRow> = sqlx::query_as(
-            r#"
-            SELECT
-                id,
-                idempotency_key,
-                request_hash,
-                status,
-                response_payload,
-                expires_at,
-                created_at,
-                updated_at
-            FROM idempotency_keys
-            WHERE idempotency_key = $1
-            "#,
+        return handle_existing_idempotency_key(
+            &state, writer, &idempotency_key, &request_hash, &response, &response_payload,
         )
-        .bind(&idempotency_key)
-        .fetch_optional(writer)
-        .await?;
-
-        let existing = match existing {
-            Some(row) => row,
-            None => {
-                return Err(AppError::Internal(
-                    "Idempotency row disappeared after conflict".into(),
-                ))
-            }
-        };
-
-        if existing.request_hash != request_hash {
-            return Err(AppError::BadRequest(
-                "Idempotency key already used with a different request payload".into(),
-            ));
-        }
-
-        // Normal duplicate replay: return the cached accepted response.
-        if existing.status == "processing"
-            || existing.status == "completed"
-            || existing.status == "pending"
-        {
-            metrics::counter!("idempotency_hits_total").increment(1);
-
-            if let Some(payload) = existing.response_payload {
-                if let Ok(cached_response) =
-                    serde_json::from_value::<TransactionCreatedResponse>(payload)
-                {
-                    let _ = state
-                        .cache
-                        .set(&idempotency_key, &cached_response, 86400)
-                        .await;
-
-                    return Ok((
-                        StatusCode::ACCEPTED,
-                        Json(ApiResponse::success(cached_response)),
-                    ));
-                }
-            }
-
-            let _ = state.cache.set(&idempotency_key, &response, 86400).await;
-            return Ok((StatusCode::ACCEPTED, Json(ApiResponse::success(response))));
-        }
-
-        // Revive failed/expired reservation so the same key can be retried safely.
-        if existing.status == "failed" || existing.expires_at <= Utc::now() {
-            let revive_res = sqlx::query(
-                r#"
-                UPDATE idempotency_keys
-                SET status = 'processing',
-                    response_payload = $2,
-                    expires_at = NOW() + INTERVAL '24 hours',
-                    updated_at = NOW()
-                WHERE idempotency_key = $1
-                  AND (status = 'failed' OR expires_at <= NOW())
-                "#,
-            )
-            .bind(&idempotency_key)
-            .bind(&response_payload)
-            .execute(writer)
-            .await?;
-
-            if revive_res.rows_affected() == 0 {
-                // Another request may have revived it first; return the latest stored response.
-                let latest: Option<IdempotencyKeyRow> = sqlx::query_as(
-                    r#"
-                    SELECT
-                        id,
-                        idempotency_key,
-                        request_hash,
-                        status,
-                        response_payload,
-                        expires_at,
-                        created_at,
-                        updated_at
-                    FROM idempotency_keys
-                    WHERE idempotency_key = $1
-                    "#,
-                )
-                .bind(&idempotency_key)
-                .fetch_optional(writer)
-                .await?;
-
-                if let Some(latest) = latest {
-                    if let Some(payload) = latest.response_payload {
-                        if let Ok(cached_response) =
-                            serde_json::from_value::<TransactionCreatedResponse>(payload)
-                        {
-                            let _ = state
-                                .cache
-                                .set(&idempotency_key, &cached_response, 86400)
-                                .await;
-
-                            return Ok((
-                                StatusCode::ACCEPTED,
-                                Json(ApiResponse::success(cached_response)),
-                            ));
-                        }
-                    }
-                }
-
-                return Ok((StatusCode::ACCEPTED, Json(ApiResponse::success(response))));
-            }
-        } else {
-            // Unexpected state: safest fallback is to return the current accepted response.
-            let _ = state.cache.set(&idempotency_key, &response, 86400).await;
-            return Ok((StatusCode::ACCEPTED, Json(ApiResponse::success(response))));
-        }
+        .await;
     }
 
     // Build queue message
     let queue_message = serde_json::json!({
         "from_account": req.from_account,
         "to_account": req.to_account,
-        "amount": req.amount,
+        "amount": req.amount.to_string(),
         "currency": req.currency,
         "reference_id": reference_id,
         "description": req.description,
@@ -264,7 +200,7 @@ pub async fn create_transaction(
         .execute(writer)
         .await;
 
-        return Err(e.into());
+        return Err(e);
     }
 
     // Keep Redis as a fast-path cache for accepted responses.
@@ -273,6 +209,152 @@ pub async fn create_transaction(
     metrics::counter!("transactions_created_total").increment(1);
 
     Ok((StatusCode::ACCEPTED, Json(ApiResponse::success(response))))
+}
+
+/// Handle the case where an idempotency key already exists in the database.
+/// Extracted from create_transaction for clarity (#31: service extraction).
+async fn handle_existing_idempotency_key(
+    state: &AppState,
+    writer: &sqlx::PgPool,
+    idempotency_key: &str,
+    request_hash: &str,
+    response: &TransactionCreatedResponse,
+    response_payload: &serde_json::Value,
+) -> AppResult<(StatusCode, Json<ApiResponse<TransactionCreatedResponse>>)> {
+    let existing: Option<IdempotencyKeyRow> = sqlx::query_as(
+        r#"
+        SELECT
+            id,
+            idempotency_key,
+            request_hash,
+            status,
+            response_payload,
+            expires_at,
+            created_at,
+            updated_at
+        FROM idempotency_keys
+        WHERE idempotency_key = $1
+        "#,
+    )
+    .bind(idempotency_key)
+    .fetch_optional(writer)
+    .await?;
+
+    let existing = match existing {
+        Some(row) => row,
+        None => {
+            return Err(AppError::Internal(
+                "Idempotency row disappeared after conflict".into(),
+            ))
+        }
+    };
+
+    if existing.request_hash != request_hash {
+        return Err(AppError::BadRequest(
+            "Idempotency key already used with a different request payload".into(),
+        ));
+    }
+
+    // Normal duplicate replay: return the cached accepted response.
+    if existing.status == "processing"
+        || existing.status == "completed"
+        || existing.status == "pending"
+    {
+        metrics::counter!("idempotency_hits_total").increment(1);
+
+        if let Some(payload) = existing.response_payload {
+            if let Ok(cached_response) =
+                serde_json::from_value::<TransactionCreatedResponse>(payload)
+            {
+                let _ = state
+                    .cache
+                    .set(idempotency_key, &cached_response, 86400)
+                    .await;
+
+                return Ok((
+                    StatusCode::ACCEPTED,
+                    Json(ApiResponse::success(cached_response)),
+                ));
+            }
+        }
+
+        let _ = state.cache.set(idempotency_key, response, 86400).await;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(ApiResponse::success(response.clone())),
+        ));
+    }
+
+    // Revive failed/expired reservation so the same key can be retried safely.
+    if existing.status == "failed" || existing.expires_at <= Utc::now() {
+        let revive_res = sqlx::query(
+            r#"
+            UPDATE idempotency_keys
+            SET status = 'processing',
+                response_payload = $2,
+                expires_at = NOW() + INTERVAL '24 hours',
+                updated_at = NOW()
+            WHERE idempotency_key = $1
+              AND (status = 'failed' OR expires_at <= NOW())
+            "#,
+        )
+        .bind(idempotency_key)
+        .bind(response_payload)
+        .execute(writer)
+        .await?;
+
+        if revive_res.rows_affected() == 0 {
+            // Another request may have revived it first; return the latest stored response.
+            let latest: Option<IdempotencyKeyRow> = sqlx::query_as(
+                r#"
+                SELECT
+                    id, idempotency_key, request_hash, status,
+                    response_payload, expires_at, created_at, updated_at
+                FROM idempotency_keys
+                WHERE idempotency_key = $1
+                "#,
+            )
+            .bind(idempotency_key)
+            .fetch_optional(writer)
+            .await?;
+
+            if let Some(latest) = latest {
+                if let Some(payload) = latest.response_payload {
+                    if let Ok(cached_response) =
+                        serde_json::from_value::<TransactionCreatedResponse>(payload)
+                    {
+                        let _ = state
+                            .cache
+                            .set(idempotency_key, &cached_response, 86400)
+                            .await;
+
+                        return Ok((
+                            StatusCode::ACCEPTED,
+                            Json(ApiResponse::success(cached_response)),
+                        ));
+                    }
+                }
+            }
+
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(ApiResponse::success(response.clone())),
+            ));
+        }
+    } else {
+        // Unexpected state: safest fallback is to return the current accepted response.
+        let _ = state.cache.set(idempotency_key, response, 86400).await;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(ApiResponse::success(response.clone())),
+        ));
+    }
+
+    let _ = state.cache.set(idempotency_key, response, 86400).await;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ApiResponse::success(response.clone())),
+    ))
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -323,16 +405,27 @@ pub async fn get_transaction(
 
 /// GET /api/v1/transactions
 /// Cross-shard: queries all shards and merges results.
-/// Cached with 1s TTL.
+/// Fix #14: Uses cursor-based (keyset) pagination instead of broken LIMIT/OFFSET.
 pub async fn list_transactions(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<ListParams>,
 ) -> AppResult<Json<ApiResponse<Vec<TransactionResponse>>>> {
     let limit = params.limit.unwrap_or(20).min(100) as i64;
-    let offset = params.offset.unwrap_or(0) as i64;
 
-    // 1s cache for list endpoint
-    let cache_key = format!("txn_list:{}:{}", limit, offset);
+    // Fix #14: cursor-based pagination. `before` is an ISO8601 timestamp that
+    // acts as the keyset cursor — we only return rows created before this time.
+    let cursor = params.before.as_deref().and_then(|s| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    });
+
+    // Short-lived cache keyed by cursor + limit
+    let cache_key = format!(
+        "txn_list:{}:{}",
+        limit,
+        cursor.map_or("latest".to_string(), |c| c.timestamp_millis().to_string())
+    );
     if let Ok(Some(cached)) = state
         .cache
         .get::<Vec<TransactionResponse>>(&cache_key)
@@ -342,18 +435,31 @@ pub async fn list_transactions(
         return Ok(Json(ApiResponse::success(cached)));
     }
 
-    // Query all shards in parallel
+    // Query all shards in parallel with keyset filter
     let mut handles = Vec::new();
     for shard_idx in 0..state.shard_router.num_shards() {
         let pool = state.shard_router.reader(shard_idx).clone();
+
         handles.push(tokio::spawn(async move {
-            sqlx::query_as::<_, TransactionRow>(
-                "SELECT * FROM transactions ORDER BY created_at DESC LIMIT $1 OFFSET $2",
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&pool)
-            .await
+            match cursor {
+                Some(before) => {
+                    sqlx::query_as::<_, TransactionRow>(
+                        "SELECT * FROM transactions WHERE created_at < $1 ORDER BY created_at DESC LIMIT $2",
+                    )
+                    .bind(before)
+                    .bind(limit)
+                    .fetch_all(&pool)
+                    .await
+                }
+                None => {
+                    sqlx::query_as::<_, TransactionRow>(
+                        "SELECT * FROM transactions ORDER BY created_at DESC LIMIT $1",
+                    )
+                    .bind(limit)
+                    .fetch_all(&pool)
+                    .await
+                }
+            }
         }));
     }
 
@@ -379,21 +485,27 @@ pub async fn list_transactions(
 #[derive(serde::Deserialize)]
 pub struct ListParams {
     pub limit: Option<u32>,
+    /// ISO8601 timestamp cursor for keyset pagination. Returns results
+    /// created strictly before this timestamp. Omit for the latest page.
+    pub before: Option<String>,
+    // Kept for backward compat but unused with keyset pagination
+    #[allow(dead_code)]
     pub offset: Option<u32>,
 }
 
 /// GET /api/v1/transactions/status/{reference_id}
-/// Read-heavy endpoint (uses read replica + Redis cache)
+/// Fix #15: Searches all shards in parallel (was sequential).
 pub async fn get_transaction_status(
     State(state): State<AppState>,
     Path(reference_id): Path<String>,
 ) -> AppResult<Json<ApiResponse<TransactionStatusResponse>>> {
-
     if reference_id.is_empty() {
         return Err(AppError::BadRequest(
-            "reference_id must not be empty".into()
+            "reference_id must not be empty".into(),
         ));
     }
+    // #26: Validate reference_id input
+    validate_reference_id(&reference_id)?;
 
     let cache_key = format!("tx_status:{}", reference_id);
 
@@ -410,21 +522,27 @@ pub async fn get_transaction_status(
 
     metrics::counter!("cache_misses_total").increment(1);
 
-    // Search across shards
-    for shard in state.shard_router.all_shards() {
+    // Fix #15: Search across shards in PARALLEL (was sequential for-loop)
+    let mut handles = Vec::new();
+    for shard_idx in 0..state.shard_router.num_shards() {
+        let pool = state.shard_router.reader(shard_idx).clone();
+        let ref_id = reference_id.clone();
+        handles.push(tokio::spawn(async move {
+            sqlx::query_as::<_, TransactionStatusRow>(
+                r#"
+                SELECT reference_id, status, processed_at
+                FROM transactions
+                WHERE reference_id = $1
+                "#,
+            )
+            .bind(&ref_id)
+            .fetch_optional(&pool)
+            .await
+        }));
+    }
 
-        if let Some(row) = sqlx::query_as::<_, TransactionStatusRow>(
-            r#"
-            SELECT reference_id, status, processed_at
-            FROM transactions
-            WHERE reference_id = $1
-            "#
-        )
-        .bind(&reference_id)
-        .fetch_optional(shard.reader())
-        .await?
-        {
-
+    for handle in handles {
+        if let Ok(Ok(Some(row))) = handle.await {
             let response = TransactionStatusResponse {
                 reference_id: row.reference_id.unwrap_or_default(),
                 status: row.status,
@@ -456,11 +574,8 @@ pub async fn get_balance(
     State(state): State<AppState>,
     Path(account_number): Path<String>,
 ) -> AppResult<Json<ApiResponse<BalanceResponse>>> {
-    if account_number.is_empty() {
-        return Err(AppError::BadRequest(
-            "Account number must not be empty".into(),
-        ));
-    }
+    // #26: Validate account_number input
+    validate_account(&account_number, "account_number")?;
 
     let cache_key = format!("balance:{}", account_number);
 
@@ -549,16 +664,10 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
 }
 
 /// GET /metrics
+///
+/// Fix #30: Gauges for backpressure and the circuit breaker are now
+/// published eagerly by the middleware layers themselves, so this
+/// handler only has to render the Prometheus registry.
 pub async fn prometheus_metrics(State(state): State<AppState>) -> String {
-    metrics::gauge!("backpressure_in_flight").set(state.backpressure.current_in_flight() as f64);
-
-    let cb_state = state.circuit_breaker.current_state().await;
-    let cb_val = match cb_state {
-        crate::middleware::circuit_breaker::CircuitState::Closed => 0.0,
-        crate::middleware::circuit_breaker::CircuitState::Open => 1.0,
-        crate::middleware::circuit_breaker::CircuitState::HalfOpen => 2.0,
-    };
-    metrics::gauge!("circuit_breaker_state").set(cb_val);
-
     state.metrics_handle.render()
 }

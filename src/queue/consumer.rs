@@ -6,6 +6,7 @@ use amqprs::{
     BasicProperties, Deliver,
 };
 use async_trait::async_trait;
+use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 
 use std::sync::Arc;
@@ -36,7 +37,7 @@ struct PendingMessage {
 struct QueuePayload {
     from_account: String,
     to_account: String,
-    amount: f64,
+    amount: Decimal,
     currency: String,
     reference_id: Option<String>,
     description: Option<String>,
@@ -90,14 +91,21 @@ impl QueueConsumer {
             .await
             .map_err(|e| AppError::Internal(format!("QOS error: {}", e)))?;
 
+        // Share the channel so both the consumer callback and the timer flush
+        // can ACK messages.  The consumer callback now only buffers messages
+        // (no individual ACK), and both code-paths ACK after a successful DB write.
+        let shared_channel = Arc::new(channel);
+
         let consumer = BatchTransactionConsumer {
             shard_router: shard_router.clone(),
             buffer: Arc::new(Mutex::new(Vec::with_capacity(BATCH_SIZE))),
+            channel: shared_channel.clone(),
         };
 
         // Spawn flush timer — respects the cancellation token
         let buffer_ref = consumer.buffer.clone();
         let router_ref = consumer.shard_router.clone();
+        let timer_channel = shared_channel.clone();
         let flush_cancel = cancel.clone();
         tokio::spawn(async move {
             loop {
@@ -107,8 +115,25 @@ impl QueueConsumer {
                         if !buf.is_empty() {
                             let batch: Vec<PendingMessage> = buf.drain(..).collect();
                             drop(buf);
-                            if let Err(e) = flush_batch_to_shards(&batch, &router_ref).await {
-                                tracing::error!(error = %e, "Timer flush error");
+                            // Fix #24: timer flush now ACKs after successful DB write
+                            let max_tag = batch.iter().map(|m| m.delivery_tag).max().unwrap_or(0);
+                            match flush_batch_to_shards(&batch, &router_ref).await {
+                                Ok(count) => {
+                                    if let Err(e) = timer_channel
+                                        .basic_ack(BasicAckArguments::new(max_tag, true))
+                                        .await
+                                    {
+                                        tracing::error!(error = %e, "Timer flush: failed to batch ACK");
+                                    }
+                                    metrics::counter!("transactions_processed_total").increment(count as u64);
+                                    metrics::histogram!("transactions_batch_size").record(count as f64);
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "Timer flush error, NACKing");
+                                    let _ = timer_channel
+                                        .basic_nack(BasicNackArguments::new(max_tag, true, true))
+                                        .await;
+                                }
                             }
                         }
                     }
@@ -119,10 +144,20 @@ impl QueueConsumer {
                         if !buf.is_empty() {
                             let batch: Vec<PendingMessage> = buf.drain(..).collect();
                             drop(buf);
-                            if let Err(e) = flush_batch_to_shards(&batch, &router_ref).await {
-                                tracing::error!(error = %e, "Final flush error during shutdown");
-                            } else {
-                                tracing::info!(count = batch.len(), "Final buffer flushed successfully");
+                            let max_tag = batch.iter().map(|m| m.delivery_tag).max().unwrap_or(0);
+                            match flush_batch_to_shards(&batch, &router_ref).await {
+                                Ok(count) => {
+                                    let _ = timer_channel
+                                        .basic_ack(BasicAckArguments::new(max_tag, true))
+                                        .await;
+                                    tracing::info!(count = count, "Final buffer flushed and ACK'd successfully");
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "Final flush error during shutdown, NACKing");
+                                    let _ = timer_channel
+                                        .basic_nack(BasicNackArguments::new(max_tag, true, true))
+                                        .await;
+                                }
                             }
                         }
                         tracing::info!("Consumer flush timer exiting");
@@ -134,7 +169,9 @@ impl QueueConsumer {
 
         let consume_args = BasicConsumeArguments::new(QUEUE_NAME, CONSUMER_TAG);
 
-        channel
+        // Clone the Arc for basic_consume (it takes ownership of the consumer struct)
+        let consume_channel_ref = shared_channel.clone();
+        consume_channel_ref
             .basic_consume(consumer, consume_args)
             .await
             .map_err(|e| AppError::Internal(format!("Consume error: {}", e)))?;
@@ -148,7 +185,7 @@ impl QueueConsumer {
         // Keep the connection alive until cancellation
         let handle = tokio::spawn(async move {
             let _connection = connection;
-            let _channel = channel;
+            let _channel = shared_channel;
             cancel.cancelled().await;
             tracing::info!("Consumer connection holder: cancellation received, closing...");
         });
@@ -160,13 +197,15 @@ impl QueueConsumer {
 struct BatchTransactionConsumer {
     shard_router: ShardRouter,
     buffer: Arc<Mutex<Vec<PendingMessage>>>,
+    /// Shared channel reference for batch ACK from the consume callback
+    channel: Arc<amqprs::channel::Channel>,
 }
 
 #[async_trait]
 impl AsyncConsumer for BatchTransactionConsumer {
     async fn consume(
         &mut self,
-        channel: &amqprs::channel::Channel,
+        _channel: &amqprs::channel::Channel,
         deliver: Deliver,
         _basic_properties: BasicProperties,
         content: Vec<u8>,
@@ -176,8 +215,9 @@ impl AsyncConsumer for BatchTransactionConsumer {
         let payload: QueuePayload = match serde_json::from_slice(&content) {
             Ok(p) => p,
             Err(e) => {
-                tracing::error!(error = %e, "Invalid message format, NACKing");
-                let _ = channel
+                tracing::error!(error = %e, "Invalid message format, NACKing to DLQ");
+                metrics::counter!("dlq_messages_total").increment(1);
+                let _ = _channel
                     .basic_nack(BasicNackArguments::new(delivery_tag, false, false))
                     .await;
                 return;
@@ -215,7 +255,8 @@ impl AsyncConsumer for BatchTransactionConsumer {
 
             match flush_batch_to_shards(&batch, &self.shard_router).await {
                 Ok(count) => {
-                    if let Err(e) = channel
+                    if let Err(e) = self
+                        .channel
                         .basic_ack(BasicAckArguments::new(max_tag, true))
                         .await
                     {
@@ -226,23 +267,24 @@ impl AsyncConsumer for BatchTransactionConsumer {
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Batch flush error, NACKing");
-                    let _ = channel
+                    let _ = self
+                        .channel
                         .basic_nack(BasicNackArguments::new(max_tag, true, true))
                         .await;
                 }
             }
-        } else {
-            if let Err(e) = channel
-                .basic_ack(BasicAckArguments::new(delivery_tag, false))
-                .await
-            {
-                tracing::error!(error = %e, "Failed to ACK message");
-            }
         }
+        // Fix #3: No individual ACK here — messages stay unacknowledged
+        // until the batch is flushed (either by size threshold above or
+        // by the timer task). QoS prefetch limits how many un-ACK'd
+        // messages RabbitMQ will deliver.
     }
 }
 
 /// Flush a batch to the correct shards using bulk INSERT per shard.
+///
+/// Fix #1: Handles cross-shard transactions by routing debit and credit
+/// to their respective shard pools independently.
 async fn flush_batch_to_shards(
     batch: &[PendingMessage],
     router: &ShardRouter,
@@ -251,7 +293,7 @@ async fn flush_batch_to_shards(
         return Ok(0);
     }
 
-    // Group messages by shard
+    // Group messages by sender's shard for debit operations
     let mut shard_groups: std::collections::HashMap<usize, Vec<&PendingMessage>> =
         std::collections::HashMap::new();
     for msg in batch {
@@ -260,45 +302,27 @@ async fn flush_batch_to_shards(
 
     let total = batch.len();
 
-    // Insert into each shard in parallel
+    // Process each shard group in parallel
     let mut handles = Vec::new();
     for (shard_idx, messages) in shard_groups {
+        let router = router.clone();
         let pool = router.writer(shard_idx).clone();
 
-        // clone messages supaya owned
         let owned_messages: Vec<PendingMessage> =
             messages.into_iter().cloned().collect();
 
-        let count = owned_messages.len();
-
-        let mut ids: Vec<Uuid> = Vec::with_capacity(count);
-        let mut from_accounts: Vec<String> = Vec::with_capacity(count);
-        let mut to_accounts: Vec<String> = Vec::with_capacity(count);
-        let mut amounts: Vec<f64> = Vec::with_capacity(count);
-        let mut currencies: Vec<String> = Vec::with_capacity(count);
-        let mut reference_ids: Vec<Option<String>> = Vec::with_capacity(count);
-
-        for msg in &owned_messages {
-            ids.push(Uuid::new_v4());
-            from_accounts.push(msg.request.from_account.clone());
-            to_accounts.push(msg.request.to_account.clone());
-            amounts.push(msg.request.amount);
-            currencies.push(msg.request.currency.clone());
-            reference_ids.push(msg.request.reference_id.clone());
-        }
-
         handles.push(tokio::spawn(async move {
+            // Fix #1 + #7: Cross-shard aware balance updates
+            apply_balance_updates(&pool, &owned_messages, &router).await?;
 
-            apply_balance_updates(&pool, &owned_messages).await?;
-
+            // Build vectors for bulk transaction INSERT (Fix #4: only built once)
             let count = owned_messages.len();
-
-            let mut ids = Vec::with_capacity(count);
-            let mut from_accounts = Vec::with_capacity(count);
-            let mut to_accounts = Vec::with_capacity(count);
-            let mut amounts = Vec::with_capacity(count);
-            let mut currencies = Vec::with_capacity(count);
-            let mut reference_ids = Vec::with_capacity(count);
+            let mut ids: Vec<Uuid> = Vec::with_capacity(count);
+            let mut from_accounts: Vec<String> = Vec::with_capacity(count);
+            let mut to_accounts: Vec<String> = Vec::with_capacity(count);
+            let mut amounts: Vec<Decimal> = Vec::with_capacity(count);
+            let mut currencies: Vec<String> = Vec::with_capacity(count);
+            let mut reference_ids: Vec<Option<String>> = Vec::with_capacity(count);
 
             for msg in &owned_messages {
                 ids.push(Uuid::new_v4());
@@ -319,7 +343,7 @@ async fn flush_batch_to_shards(
                     $1::uuid[],
                     $2::text[],
                     $3::text[],
-                    $4::float8[],
+                    $4::numeric[],
                     $5::text[],
                     ARRAY_FILL('completed'::text, ARRAY[$7::int]),
                     $6::text[],
@@ -352,16 +376,24 @@ async fn flush_batch_to_shards(
     Ok(total)
 }
 
+/// Apply balance updates for a batch of transactions.
+///
+/// Fix #1: Cross-shard aware — debits happen on the sender's shard,
+/// credits happen on the receiver's shard (which may be different).
+///
+/// Fix #7: Failed transaction INSERTs now run inside the same DB
+/// transaction so they're atomic with the balance check.
 async fn apply_balance_updates(
     pool: &sqlx::PgPool,
     messages: &[PendingMessage],
+    router: &ShardRouter,
 ) -> Result<(), AppError> {
 
     let mut tx = pool.begin().await?;
 
     for msg in messages {
 
-        // debit sender
+        // Debit sender (runs on sender's shard — which is `pool`)
         let updated = sqlx::query(
             r#"
             UPDATE users
@@ -382,6 +414,7 @@ async fn apply_balance_updates(
                 "Insufficient balance — marking transaction as failed"
             );
 
+            // Fix #7: Failed INSERT runs INSIDE the transaction
             sqlx::query(
                 r#"
                 INSERT INTO transactions (
@@ -399,17 +432,20 @@ async fn apply_balance_updates(
             )
             .bind(&msg.request.from_account)
             .bind(&msg.request.to_account)
-            .bind(&msg.request.amount)
+            .bind(msg.request.amount)
             .bind(&msg.request.currency)
             .bind(&msg.request.reference_id)
             .bind(&msg.request.description)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
 
             continue;
         }
 
-        // credit receiver
+        // Fix #1: Credit receiver on the RECEIVER'S shard
+        let receiver_shard = ShardRouter::shard_for(&msg.request.to_account);
+        let receiver_pool = router.writer(receiver_shard);
+
         sqlx::query(
             r#"
             UPDATE users
@@ -419,7 +455,7 @@ async fn apply_balance_updates(
         )
         .bind(msg.request.amount)
         .bind(&msg.request.to_account)
-        .execute(&mut *tx)
+        .execute(receiver_pool)
         .await?;
     }
 

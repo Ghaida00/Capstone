@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
@@ -11,7 +12,7 @@ pub struct TransactionRow {
     pub id: Uuid,
     pub from_account: String,
     pub to_account: String,
-    pub amount: sqlx::types::BigDecimal,
+    pub amount: Decimal,
     pub currency: String,
     pub status: String,
     pub reference_id: Option<String>,
@@ -24,11 +25,12 @@ pub struct TransactionRow {
 }
 
 /// Request body for creating a new transaction.
+/// Amount is serialized as a string to preserve decimal precision.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CreateTransactionRequest {
     pub from_account: String,
     pub to_account: String,
-    pub amount: f64,
+    pub amount: Decimal,
     #[serde(default = "default_currency")]
     pub currency: String,
     pub reference_id: Option<String>,
@@ -86,7 +88,7 @@ pub struct UserRow {
     pub account_number: String,
     pub full_name: String,
     pub email: Option<String>,
-    pub balance: sqlx::types::BigDecimal,
+    pub balance: Decimal,
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

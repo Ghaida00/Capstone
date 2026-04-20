@@ -67,10 +67,11 @@ services:
     image: postgres:18.3-alpine3.23
     container_name: gn-pg-shard0-primary
     environment:
-      POSTGRES_DB: gn_db
-      POSTGRES_USER: gn_user
-      POSTGRES_PASSWORD: gn_secure_pass
+      POSTGRES_DB: ${POSTGRES_DB:-gn_db}
+      POSTGRES_USER: ${POSTGRES_USER:-gn_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gn_secure_pass}
       POSTGRES_INITDB_ARGS: "--data-checksums"
+      REPL_PASSWORD: ${REPL_PASSWORD:-repl_secure_pass}
     volumes:
       - pg_shard0_primary_data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
@@ -88,9 +89,8 @@ services:
         -c max_connections=300
         -c checkpoint_completion_target=0.9
         -c random_page_cost=1.1
-        -c synchronous_commit=off
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U gn_user -d gn_db" ]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gn_user} -d ${POSTGRES_DB:-gn_db}" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -108,9 +108,10 @@ services:
     image: postgres:18.3-alpine3.23
     container_name: gn-pg-shard0-replica1
     environment:
-      PGUSER: gn_user
-      PGPASSWORD: gn_secure_pass
+      PGUSER: ${POSTGRES_USER:-gn_user}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-gn_secure_pass}
       PRIMARY_HOST: pg-shard0-primary
+      REPL_PASSWORD: ${REPL_PASSWORD:-repl_secure_pass}
     volumes:
       - pg_shard0_replica1_data:/var/lib/postgresql/data
       - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
@@ -119,7 +120,7 @@ services:
       pg-shard0-primary:
         condition: service_healthy
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U gn_user -d gn_db" ]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gn_user} -d ${POSTGRES_DB:-gn_db}" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -137,8 +138,8 @@ services:
     image: edoburu/pgbouncer:v1.25.1-p0
     container_name: gn-pgbouncer-shard0
     environment:
-      DATABASE_URL: postgres://gn_user:gn_secure_pass@pg-shard0-primary:5432/gn_db
-      AUTH_TYPE: plain
+      DATABASE_URL: postgres://${POSTGRES_USER:-gn_user}:${POSTGRES_PASSWORD:-gn_secure_pass}@pg-shard0-primary:5432/${POSTGRES_DB:-gn_db}
+      AUTH_TYPE: scram-sha-256
       POOL_MODE: transaction
       DEFAULT_POOL_SIZE: 40
       MAX_CLIENT_CONN: 500
@@ -156,7 +157,7 @@ services:
       pg-shard0-primary:
         condition: service_healthy
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U gn_user" ]
+      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U ${POSTGRES_USER:-gn_user}" ]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -177,10 +178,11 @@ services:
     image: postgres:18.3-alpine3.23
     container_name: gn-pg-shard1-primary
     environment:
-      POSTGRES_DB: gn_db
-      POSTGRES_USER: gn_user
-      POSTGRES_PASSWORD: gn_secure_pass
+      POSTGRES_DB: ${POSTGRES_DB:-gn_db}
+      POSTGRES_USER: ${POSTGRES_USER:-gn_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gn_secure_pass}
       POSTGRES_INITDB_ARGS: "--data-checksums"
+      REPL_PASSWORD: ${REPL_PASSWORD:-repl_secure_pass}
     volumes:
       - pg_shard1_primary_data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
@@ -198,9 +200,8 @@ services:
         -c max_connections=300
         -c checkpoint_completion_target=0.9
         -c random_page_cost=1.1
-        -c synchronous_commit=off
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U gn_user -d gn_db" ]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gn_user} -d ${POSTGRES_DB:-gn_db}" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -218,9 +219,10 @@ services:
     image: postgres:18.3-alpine3.23
     container_name: gn-pg-shard1-replica1
     environment:
-      PGUSER: gn_user
-      PGPASSWORD: gn_secure_pass
+      PGUSER: ${POSTGRES_USER:-gn_user}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-gn_secure_pass}
       PRIMARY_HOST: pg-shard1-primary
+      REPL_PASSWORD: ${REPL_PASSWORD:-repl_secure_pass}
     volumes:
       - pg_shard1_replica1_data:/var/lib/postgresql/data
       - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
@@ -229,7 +231,7 @@ services:
       pg-shard1-primary:
         condition: service_healthy
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U gn_user -d gn_db" ]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gn_user} -d ${POSTGRES_DB:-gn_db}" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -247,8 +249,8 @@ services:
     image: edoburu/pgbouncer:v1.25.1-p0
     container_name: gn-pgbouncer-shard1
     environment:
-      DATABASE_URL: postgres://gn_user:gn_secure_pass@pg-shard1-primary:5432/gn_db
-      AUTH_TYPE: plain
+      DATABASE_URL: postgres://${POSTGRES_USER:-gn_user}:${POSTGRES_PASSWORD:-gn_secure_pass}@pg-shard1-primary:5432/${POSTGRES_DB:-gn_db}
+      AUTH_TYPE: scram-sha-256
       POOL_MODE: transaction
       DEFAULT_POOL_SIZE: 40
       MAX_CLIENT_CONN: 500
@@ -266,7 +268,7 @@ services:
       pg-shard1-primary:
         condition: service_healthy
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U gn_user" ]
+      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U ${POSTGRES_USER:-gn_user}" ]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -287,10 +289,11 @@ services:
     image: postgres:18.3-alpine3.23
     container_name: gn-pg-shard2-primary
     environment:
-      POSTGRES_DB: gn_db
-      POSTGRES_USER: gn_user
-      POSTGRES_PASSWORD: gn_secure_pass
+      POSTGRES_DB: ${POSTGRES_DB:-gn_db}
+      POSTGRES_USER: ${POSTGRES_USER:-gn_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gn_secure_pass}
       POSTGRES_INITDB_ARGS: "--data-checksums"
+      REPL_PASSWORD: ${REPL_PASSWORD:-repl_secure_pass}
     volumes:
       - pg_shard2_primary_data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
@@ -308,9 +311,8 @@ services:
         -c max_connections=300
         -c checkpoint_completion_target=0.9
         -c random_page_cost=1.1
-        -c synchronous_commit=off
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U gn_user -d gn_db" ]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gn_user} -d ${POSTGRES_DB:-gn_db}" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -328,9 +330,10 @@ services:
     image: postgres:18.3-alpine3.23
     container_name: gn-pg-shard2-replica1
     environment:
-      PGUSER: gn_user
-      PGPASSWORD: gn_secure_pass
+      PGUSER: ${POSTGRES_USER:-gn_user}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-gn_secure_pass}
       PRIMARY_HOST: pg-shard2-primary
+      REPL_PASSWORD: ${REPL_PASSWORD:-repl_secure_pass}
     volumes:
       - pg_shard2_replica1_data:/var/lib/postgresql/data
       - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
@@ -339,7 +342,7 @@ services:
       pg-shard2-primary:
         condition: service_healthy
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U gn_user -d gn_db" ]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gn_user} -d ${POSTGRES_DB:-gn_db}" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -357,8 +360,8 @@ services:
     image: edoburu/pgbouncer:v1.25.1-p0
     container_name: gn-pgbouncer-shard2
     environment:
-      DATABASE_URL: postgres://gn_user:gn_secure_pass@pg-shard2-primary:5432/gn_db
-      AUTH_TYPE: plain
+      DATABASE_URL: postgres://${POSTGRES_USER:-gn_user}:${POSTGRES_PASSWORD:-gn_secure_pass}@pg-shard2-primary:5432/${POSTGRES_DB:-gn_db}
+      AUTH_TYPE: scram-sha-256
       POOL_MODE: transaction
       DEFAULT_POOL_SIZE: 40
       MAX_CLIENT_CONN: 500
@@ -376,7 +379,7 @@ services:
       pg-shard2-primary:
         condition: service_healthy
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U gn_user" ]
+      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U ${POSTGRES_USER:-gn_user}" ]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -405,14 +408,14 @@ services:
         --tcp-backlog 511
         --tcp-keepalive 300
         --hz 100
-        --requirepass gn_redis_pass
-        --masterauth gn_redis_pass
+        --requirepass ${REDIS_PASSWORD:-gn_redis_pass}
+        --masterauth ${REDIS_PASSWORD:-gn_redis_pass}
     expose:
       - "6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: [ "CMD", "redis-cli", "-a", "gn_redis_pass", "ping" ]
+      test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-gn_redis_pass}", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -438,8 +441,8 @@ services:
         --tcp-backlog 511
         --tcp-keepalive 300
         --hz 100
-        --requirepass gn_redis_pass
-        --masterauth gn_redis_pass
+        --requirepass ${REDIS_PASSWORD:-gn_redis_pass}
+        --masterauth ${REDIS_PASSWORD:-gn_redis_pass}
         --replicaof redis-master 6379
     expose:
       - "6379"
@@ -447,7 +450,7 @@ services:
       redis-master:
         condition: service_healthy
     healthcheck:
-      test: [ "CMD", "redis-cli", "-a", "gn_redis_pass", "ping" ]
+      test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-gn_redis_pass}", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -537,8 +540,8 @@ services:
     image: rabbitmq:4.2.4-alpine
     container_name: gn-rabbitmq
     environment:
-      RABBITMQ_DEFAULT_USER: gn_user
-      RABBITMQ_DEFAULT_PASS: gn_secure_pass
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-gn_user}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-gn_secure_pass}
       RABBITMQ_DEFAULT_VHOST: /
     expose:
       - "5672"
@@ -592,8 +595,8 @@ services:
     image: grafana/grafana:12.3
     container_name: gn-grafana
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
       GF_USERS_ALLOW_SIGN_UP: "false"
     ports:
       - "3001:3000"
@@ -614,11 +617,11 @@ services:
 
   # ============================================================
   # cAdvisor — Per-Container Resource Monitoring
+  # Fix #23: Use specific device access instead of privileged mode
   # ============================================================
   cadvisor:
     image: ghcr.io/google/cadvisor:0.56.2
     container_name: gn-cadvisor
-    privileged: true
     ports:
       - "8081:8080"
     volumes:
@@ -627,6 +630,10 @@ services:
       - /sys:/sys:ro
       - /var/lib/docker/:/var/lib/docker:ro
       - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     networks:
       - gn-network

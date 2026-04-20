@@ -41,6 +41,13 @@ pub struct Config {
 
     // Backpressure
     pub max_concurrent_requests: usize,
+
+    // CORS
+    pub cors_allowed_origins: Vec<String>,
+
+    // Authentication (disabled by default for load testing)
+    pub enable_auth: bool,
+    pub auth_secret: Option<String>,
 }
 
 impl Config {
@@ -128,6 +135,13 @@ impl Config {
             max_concurrent_requests: env_or("MAX_CONCURRENT_REQUESTS", "20000")
                 .parse()
                 .expect("MAX_CONCURRENT_REQUESTS must be a number"),
+
+            cors_allowed_origins: parse_csv_env("CORS_ALLOWED_ORIGINS", "*"),
+
+            enable_auth: env_or("ENABLE_AUTH", "false")
+                .parse()
+                .unwrap_or(false),
+            auth_secret: std::env::var("AUTH_SECRET").ok(),
         }
     }
 
@@ -268,6 +282,16 @@ impl fmt::Display for Config {
         )?;
         writeln!(
             f,
+            "  cors_allowed_origins:         {:?}",
+            self.cors_allowed_origins
+        )?;
+        writeln!(
+            f,
+            "  enable_auth:                  {}",
+            self.enable_auth
+        )?;
+        writeln!(
+            f,
             "  database_shard0_write_url:    {}",
             mask_url(&self.database_shard0_write_url)
         )?;
@@ -354,6 +378,9 @@ mod tests {
             circuit_breaker_failure_threshold: 50,
             circuit_breaker_recovery_timeout_secs: 10,
             max_concurrent_requests: 20000,
+            cors_allowed_origins: vec!["*".to_string()],
+            enable_auth: false,
+            auth_secret: None,
         }
     }
 

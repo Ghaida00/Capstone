@@ -36,8 +36,8 @@ CREATE INDEX idx_transactions_to_account ON transactions (to_account, created_at
 -- Status-based queries (for queue processing)
 CREATE INDEX idx_transactions_status ON transactions (status) WHERE status IN ('pending', 'processing');
 
--- Reference ID lookups (idempotency)
-CREATE INDEX idx_transactions_reference_id ON transactions (reference_id) WHERE reference_id IS NOT NULL;
+-- Fix #28: Removed redundant idx_transactions_reference_id — the UNIQUE
+-- constraint on `reference_id` already creates an implicit unique index.
 
 -- Time-based queries
 CREATE INDEX idx_transactions_created_at ON transactions (created_at DESC);
@@ -116,11 +116,28 @@ CREATE TRIGGER trigger_update_idempotency_keys_updated_at
 
 
 -- ============================================================
--- Replication user for read replica
+-- Fix #21: Cleanup function for expired idempotency keys.
+-- Call periodically (e.g. via pg_cron or application-level task).
+-- Example with pg_cron:
+--   SELECT cron.schedule('cleanup-idempotency', '0 * * * *',
+--     $$SELECT cleanup_expired_idempotency_keys()$$);
 -- ============================================================
-DO $$
+CREATE OR REPLACE FUNCTION cleanup_expired_idempotency_keys()
+RETURNS INTEGER AS $$
+DECLARE
+    deleted_count INTEGER;
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'replication_user') THEN
-        CREATE ROLE replication_user WITH REPLICATION LOGIN PASSWORD 'repl_secure_pass';
-    END IF;
-END $$;
+    DELETE FROM idempotency_keys
+    WHERE expires_at < NOW() - INTERVAL '1 hour'
+      AND status IN ('completed', 'failed');
+    GET DIAGNOSTICS deleted_count = ROW_COUNT;
+    RETURN deleted_count;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ============================================================
+-- Replication user is created in primary-setup.sh using the
+-- REPL_PASSWORD environment variable (Fix #6) so the secret is not
+-- baked into this checked-in file.
+-- ============================================================

@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod backpressure;
 pub mod circuit_breaker;
 pub mod metrics;

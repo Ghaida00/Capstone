@@ -1,4 +1,3 @@
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use sqlx::PgPool;
@@ -13,6 +12,9 @@ const NUM_SHARDS: usize = 3;
 
 /// Application-level shard router.
 /// Routes queries to the correct shard based on hash(from_account) % NUM_SHARDS.
+///
+/// Uses FNV-1a hashing which is deterministic across Rust versions,
+/// unlike `DefaultHasher` which may change between compiler releases.
 #[derive(Debug, Clone)]
 pub struct ShardRouter {
     shards: Vec<DatabasePool>,
@@ -58,8 +60,13 @@ impl ShardRouter {
     }
 
     /// Get the shard index for a given account.
+    ///
+    /// Uses FNV-1a hashing for deterministic, version-stable routing.
+    /// `DefaultHasher` is explicitly NOT guaranteed stable across Rust
+    /// versions, which would silently mis-route data after a toolchain
+    /// upgrade.
     pub fn shard_for(account: &str) -> usize {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = fnv::FnvHasher::default();
         account.hash(&mut hasher);
         (hasher.finish() as usize) % NUM_SHARDS
     }
