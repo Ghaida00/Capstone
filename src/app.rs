@@ -14,6 +14,7 @@ use crate::AppState;
 ///
 /// Integration tests can bypass `App` entirely and call
 /// `bootstrap::build_router()` directly.
+
 pub struct App {
     pub state: AppState,
     pub config: Config,
