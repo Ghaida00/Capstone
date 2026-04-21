@@ -28,6 +28,16 @@ pub struct Config {
     pub redis_read_url: Option<String>,
     pub redis_pool_size: usize,
 
+    // Redis Sentinel (failover)
+    pub redis_sentinel_nodes: Vec<String>,
+    pub redis_sentinel_master_name: String,
+    pub redis_sentinel_monitor_interval_secs: u64,
+
+    // DB Failover
+    pub db_health_check_interval_secs: u64,
+    pub db_write_retry_max_attempts: u32,
+    pub db_write_retry_backoff_ms: u64,
+
     // RabbitMQ
     pub rabbitmq_url: String,
 
@@ -109,6 +119,28 @@ impl Config {
             redis_pool_size: env_or("REDIS_POOL_SIZE", "50")
                 .parse()
                 .expect("REDIS_POOL_SIZE must be a number"),
+
+            redis_sentinel_nodes: parse_csv_env("REDIS_SENTINEL_NODES", ""),
+            redis_sentinel_master_name: env_or(
+                "REDIS_SENTINEL_MASTER_NAME",
+                "peakload-master",
+            ),
+            redis_sentinel_monitor_interval_secs: env_or(
+                "REDIS_SENTINEL_MONITOR_INTERVAL_SECS",
+                "5",
+            )
+            .parse()
+            .expect("REDIS_SENTINEL_MONITOR_INTERVAL_SECS must be a number"),
+
+            db_health_check_interval_secs: env_or("DB_HEALTH_CHECK_INTERVAL_SECS", "5")
+                .parse()
+                .expect("DB_HEALTH_CHECK_INTERVAL_SECS must be a number"),
+            db_write_retry_max_attempts: env_or("DB_WRITE_RETRY_MAX_ATTEMPTS", "3")
+                .parse()
+                .expect("DB_WRITE_RETRY_MAX_ATTEMPTS must be a number"),
+            db_write_retry_backoff_ms: env_or("DB_WRITE_RETRY_BACKOFF_MS", "50")
+                .parse()
+                .expect("DB_WRITE_RETRY_BACKOFF_MS must be a number"),
 
             rabbitmq_url: env_or(
                 "RABBITMQ_URL",
@@ -213,6 +245,20 @@ impl Config {
         ensure!(
             self.circuit_breaker_recovery_timeout_secs > 0,
             "CIRCUIT_BREAKER_RECOVERY_TIMEOUT_SECS must be > 0"
+        );
+
+        // Failover
+        ensure!(
+            self.db_health_check_interval_secs > 0,
+            "DB_HEALTH_CHECK_INTERVAL_SECS must be > 0"
+        );
+        ensure!(
+            self.db_write_retry_max_attempts >= 1,
+            "DB_WRITE_RETRY_MAX_ATTEMPTS must be >= 1"
+        );
+        ensure!(
+            self.redis_sentinel_monitor_interval_secs > 0,
+            "REDIS_SENTINEL_MONITOR_INTERVAL_SECS must be > 0"
         );
 
         Ok(())
@@ -372,6 +418,12 @@ mod tests {
             redis_url: "redis://127.0.0.1:6379".to_string(),
             redis_read_url: None,
             redis_pool_size: 50,
+            redis_sentinel_nodes: vec![],
+            redis_sentinel_master_name: "peakload-master".to_string(),
+            redis_sentinel_monitor_interval_secs: 5,
+            db_health_check_interval_secs: 5,
+            db_write_retry_max_attempts: 3,
+            db_write_retry_backoff_ms: 50,
             rabbitmq_url: "amqp://user:pass@localhost:5672".to_string(),
             rate_limit_per_second: 10000,
             rate_limit_burst: 20000,

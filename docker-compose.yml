@@ -179,6 +179,19 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file: .env
+    environment:
+      # ── Failover wiring ─────────────────────────────────────────
+      # Sentinel-aware Redis client: when these are set the app
+      # resolves the Redis master via Sentinel and rebuilds its pool
+      # automatically when Sentinel promotes a replica.
+      REDIS_SENTINEL_NODES: "redis://redis-sentinel-1:26379,redis://redis-sentinel-2:26379,redis://redis-sentinel-3:26379"
+      REDIS_SENTINEL_MASTER_NAME: "peakload-master"
+      REDIS_SENTINEL_MONITOR_INTERVAL_SECS: "5"
+      # Per-replica health probe interval for Postgres
+      DB_HEALTH_CHECK_INTERVAL_SECS: "5"
+      # Retry policy for transient write errors (pgBouncer reconnect window)
+      DB_WRITE_RETRY_MAX_ATTEMPTS: "3"
+      DB_WRITE_RETRY_BACKOFF_MS: "50"
     expose:
       - "3000"
     depends_on:
@@ -189,6 +202,8 @@ services:
       pgbouncer-shard2:
         condition: service_healthy
       redis-master:
+        condition: service_healthy
+      redis-sentinel-1:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy

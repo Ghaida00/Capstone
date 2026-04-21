@@ -1,6 +1,7 @@
 use std::hash::{Hash, Hasher};
 
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::error::AppError;
@@ -22,7 +23,10 @@ pub struct ShardRouter {
 
 impl ShardRouter {
     /// Create a new shard router from configuration.
-    pub async fn new(config: &Config) -> Result<Self, AppError> {
+    ///
+    /// Spawns a per-shard background health monitor wired to `cancel` so
+    /// read-replica failover flips automatically when a replica goes down.
+    pub async fn new(config: &Config, cancel: CancellationToken) -> Result<Self, AppError> {
         let mut shards = Vec::with_capacity(NUM_SHARDS);
 
         let shard_configs = vec![
@@ -50,7 +54,9 @@ impl ShardRouter {
             .await
             .map_err(|e| AppError::Internal(format!("Failed to connect to shard {}: {}", i, e)))?;
 
-            tracing::info!(shard = i, "Shard pool initialized");
+            pool.spawn_health_monitor(i, config.db_health_check_interval_secs, cancel.child_token());
+
+            tracing::info!(shard = i, "Shard pool initialized (failover monitor spawned)");
             shards.push(pool);
         }
 
@@ -62,9 +68,6 @@ impl ShardRouter {
     /// Get the shard index for a given account.
     ///
     /// Uses FNV-1a hashing for deterministic, version-stable routing.
-    /// `DefaultHasher` is explicitly NOT guaranteed stable across Rust
-    /// versions, which would silently mis-route data after a toolchain
-    /// upgrade.
     pub fn shard_for(account: &str) -> usize {
         let mut hasher = fnv::FnvHasher::default();
         account.hash(&mut hasher);
@@ -109,6 +112,15 @@ impl ShardRouter {
             shard.close().await;
             tracing::info!(shard = i, "Shard pool closed");
         }
+    }
+
+    /// Snapshot of `(total_replicas, healthy_replicas)` per shard, sourced
+    /// from the background health monitor — no extra queries issued.
+    pub fn replica_health(&self) -> Vec<(usize, usize)> {
+        self.shards
+            .iter()
+            .map(|s| (s.replica_count(), s.healthy_replica_count()))
+            .collect()
     }
 
     /// Health check all shards.

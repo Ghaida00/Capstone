@@ -5,7 +5,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use deadpool_redis::Pool;
 use serde_json::json;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -13,6 +12,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+
+use crate::cache::redis::MasterPoolHandle;
 
 /// Local counter entry: request count + window start time.
 struct CounterEntry {
@@ -28,7 +29,8 @@ struct CounterEntry {
 /// `CancellationToken` instead of running forever.
 #[derive(Clone)]
 pub struct RateLimiter {
-    pool: Arc<Pool>,
+    /// Sentinel-aware handle to the current Redis master.
+    pool: MasterPoolHandle,
     /// Max requests per window
     max_requests: u64,
     /// Window size in seconds
@@ -38,7 +40,12 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    pub fn new(pool: Pool, per_second: u64, burst: u32, cancel: CancellationToken) -> Self {
+    pub fn new(
+        pool: MasterPoolHandle,
+        per_second: u64,
+        burst: u32,
+        cancel: CancellationToken,
+    ) -> Self {
         let window_secs = if per_second > 0 {
             (burst as u64) / per_second
         } else {
@@ -47,7 +54,7 @@ impl RateLimiter {
         .max(1);
 
         let limiter = Self {
-            pool: Arc::new(pool),
+            pool,
             max_requests: burst as u64,
             window_secs,
             local_counters: Arc::new(RwLock::new(HashMap::with_capacity(1024))),
@@ -127,7 +134,8 @@ impl RateLimiter {
             return;
         }
 
-        // Best-effort sync — don't block if Redis is down
+        // Best-effort sync — don't block if Redis is down.
+        // Handle follows Sentinel failover automatically.
         if let Ok(mut conn) = self.pool.get().await {
             let mut pipe = redis::pipe();
             for (ip, entry) in counters.iter() {

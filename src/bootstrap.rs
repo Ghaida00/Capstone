@@ -78,6 +78,23 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics::describe_histogram!("transactions_batch_size", "Batch sizes");
     metrics::describe_counter!("dlq_messages_total", "Dead letter queue messages");
 
+    // Failover metrics
+    metrics::describe_counter!(
+        "db_replica_failover_total",
+        "Replica transitions healthy → unhealthy"
+    );
+    metrics::describe_counter!(
+        "db_replica_recovered_total",
+        "Replica transitions unhealthy → healthy"
+    );
+    metrics::describe_counter!("db_retry_attempt_total", "Transient DB errors retried");
+    metrics::describe_counter!("db_retry_success_total", "DB ops that succeeded after retry");
+    metrics::describe_counter!("db_retry_exhausted_total", "DB ops that exhausted retries");
+    metrics::describe_counter!(
+        "redis_master_failover_total",
+        "Redis master address changes detected via Sentinel"
+    );
+
     // Initialise to zero
     metrics::counter!("transactions_created_total").absolute(0);
     metrics::counter!("transactions_processed_total").absolute(0);
@@ -118,17 +135,16 @@ pub async fn init_infrastructure(
     cancel: CancellationToken,
 ) -> anyhow::Result<Infrastructure> {
     tracing::info!("Connecting to database shards...");
-    let shard_router = ShardRouter::new(config).await?;
+    let shard_router = ShardRouter::new(config, cancel.child_token()).await?;
 
     tracing::info!("Connecting to Redis...");
-    let cache = RedisCache::new(config).await?;
+    let cache = RedisCache::new(config, cancel.child_token()).await?;
 
     tracing::info!("Connecting to RabbitMQ...");
     let queue_producer = QueueProducer::new(config).await?;
 
-    let rate_limit_pool = cache.create_pool(config)?;
     let rate_limiter = RateLimiter::new(
-        rate_limit_pool,
+        cache.master_pool_handle(),
         config.rate_limit_per_second,
         config.rate_limit_burst,
         cancel,

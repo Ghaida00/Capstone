@@ -31,4 +31,14 @@ pub struct HealthServices {
     pub database_read: bool,
     pub redis: bool,
     pub rabbitmq: bool,
+    /// Per-shard read-replica health, from the background failover monitor.
+    pub replicas: Vec<ShardReplicaHealth>,
+}
+
+/// Snapshot of one shard's read-replica health.
+#[derive(Debug, Serialize)]
+pub struct ShardReplicaHealth {
+    pub shard: usize,
+    pub total: usize,
+    pub healthy: usize,
 }

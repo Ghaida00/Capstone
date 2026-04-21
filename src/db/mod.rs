@@ -1,3 +1,4 @@
+pub mod failover;
 pub mod models;
 pub mod pool;
 pub mod shard;

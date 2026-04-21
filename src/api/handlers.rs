@@ -9,11 +9,12 @@ use uuid::Uuid;
 use chrono::Utc;
 use serde_json::json;
 
-use crate::api::responses::{ApiResponse, HealthResponse, HealthServices};
+use crate::api::responses::{ApiResponse, HealthResponse, HealthServices, ShardReplicaHealth};
 use crate::db::models::{
     CreateTransactionRequest, IdempotencyKeyRow, TransactionResponse, TransactionRow,
     TransactionStatusRow, UserRow,
 };
+use crate::db::failover::retry_transient;
 use crate::db::shard::ShardRouter;
 use crate::error::{AppError, AppResult};
 use crate::middleware::request_id::RequestId;
@@ -588,22 +589,31 @@ pub async fn get_balance(
 
     metrics::counter!("cache_misses_total").increment(1);
 
-    // Route to correct shard (read replica)
+    // Route to correct shard. `reader()` is called inside the retry
+    // closure so a transient replica failure on attempt 1 may pick a
+    // different healthy replica on attempt 2.
     let shard = ShardRouter::shard_for(&account_number);
+    let router = &state.shard_router;
 
-    let reader = state.shard_router.reader(shard);
-
-    // Query DB
-    let row: Option<UserRow> = sqlx::query_as(
-        r#"
-        SELECT *
-        FROM users
-        WHERE account_number = $1
-        AND status = 'active'
-        "#,
+    // Reads are idempotent — retry transient connection errors.
+    let row: Option<UserRow> = retry_transient(
+        || async {
+            sqlx::query_as(
+                r#"
+                SELECT *
+                FROM users
+                WHERE account_number = $1
+                AND status = 'active'
+                "#,
+            )
+            .bind(&account_number)
+            .fetch_optional(router.reader(shard))
+            .await
+        },
+        2,
+        20,
+        "get_balance",
     )
-    .bind(&account_number)
-    .fetch_optional(reader)
     .await?;
 
     let row = match row {
@@ -646,6 +656,18 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
     let redis_healthy = state.cache.health_check().await.unwrap_or(false);
     let rabbitmq_healthy = state.queue_producer.health_check();
 
+    let replicas: Vec<ShardReplicaHealth> = state
+        .shard_router
+        .replica_health()
+        .into_iter()
+        .enumerate()
+        .map(|(shard, (total, healthy))| ShardReplicaHealth {
+            shard,
+            total,
+            healthy,
+        })
+        .collect();
+
     let all_healthy = db_write_healthy && db_read_healthy && redis_healthy && rabbitmq_healthy;
 
     Json(HealthResponse {
@@ -659,6 +681,7 @@ pub async fn health_check(State(state): State<AppState>) -> Json<HealthResponse>
             database_read: db_read_healthy,
             redis: redis_healthy,
             rabbitmq: rabbitmq_healthy,
+            replicas,
         },
     })
 }
