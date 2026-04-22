@@ -459,6 +459,22 @@ services:
   # ============================================================
   # Prometheus — Metrics Collection
   # ============================================================
+  # NOTE: No healthcheck is defined on purpose.
+  #
+  # The `*-distroless` image ships ONLY the `prometheus` binary — no
+  # shell, no `wget`, no `curl`, no `busybox`. Any healthcheck that
+  # shells out (e.g. `wget http://localhost:9090/-/healthy`) will exec-
+  # fail every probe → container stuck `(unhealthy)` → every service
+  # with `depends_on: prometheus: condition: service_healthy` (notably
+  # Grafana) will refuse to start with:
+  #     "dependency prometheus failed to start"
+  #
+  # Do NOT re-add a wget/curl healthcheck unless you also drop the
+  # `-distroless` suffix from the image tag. If you need dependency
+  # ordering for Grafana, use `condition: service_started` (already
+  # set on the Grafana service below) — Prometheus start-up is
+  # deterministic and does not need a readiness gate here.
+  # ============================================================
   prometheus:
     image: prom/prometheus:v3.10.0-distroless
     container_name: peakload-prometheus
@@ -471,12 +487,6 @@ services:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
       - "--storage.tsdb.retention.time=7d"
-    healthcheck:
-      test: [ "CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy" ]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 10s
     restart: unless-stopped
     logging: *default-logging
     networks:
@@ -503,9 +513,14 @@ services:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    # Grafana waits for Prometheus to START, not to be HEALTHY, because
+    # the Prometheus service has no healthcheck (see comment above the
+    # prometheus service for why). Prometheus start-up is deterministic
+    # enough that this is safe — Grafana's own datasource provisioning
+    # tolerates a Prometheus that isn't answering scrapes yet.
     depends_on:
       prometheus:
-        condition: service_healthy
+        condition: service_started
     restart: unless-stopped
     logging: *default-logging
     networks:
