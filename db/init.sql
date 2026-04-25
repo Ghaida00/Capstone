@@ -137,7 +137,10 @@ $$ LANGUAGE plpgsql;
 
 
 -- ============================================================
--- Replication user is created in primary-setup.sh using the
--- REPL_PASSWORD environment variable (Fix #6) so the secret is not
--- baked into this checked-in file.
+-- Replication: managed by Patroni via the `replicator` role
+-- declared in db/patroni/templates/patroni.yml.tmpl. This
+-- schema file is therefore independent of the HA orchestrator
+-- — db/bootstrap/bootstrap-schema.sh applies it through
+-- pg-haproxy once a primary exists, regardless of who is
+-- running the HA layer. See db/patroni/README.md.
 -- ============================================================

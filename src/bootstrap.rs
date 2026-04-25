@@ -240,8 +240,49 @@ pub fn build_router(
     // Fix #10: Build CORS layer from configuration
     let cors = build_cors_layer(config);
 
+    // ─── Phase 1 modular-monolith: mount `/api/v2/accounts/*` ───
+    //
+    // See docs/architecture/phase1-accounts-walkthrough.md. The
+    // new module owns its own HTTP surface at `/api/v2/accounts`
+    // and lives PARALLEL to the legacy `/api/v1/users/.../balance`
+    // endpoint — both paths serve identical responses until the
+    // cutover task deletes the legacy handler.
+    //
+    // Intentional gap for Phase 1 partial: the v2 sub-router does
+    // NOT reuse the v1 auth/rate-limit/circuit-breaker/backpressure
+    // stack. Acceptable for a proof-of-shape but MUST be addressed
+    // before v2 replaces v1. Tracking task: migration-plan Phase 1
+    // exit criteria.
+    let accounts_deps = crate::modules::accounts::init(
+        state.shard_router.clone(),
+        state.cache.clone(),
+    );
+    let accounts_router = crate::modules::accounts::router(accounts_deps.clone());
+
+    // Phase 2: transactions module wired with the cross-module
+    // dep injected (transactions → accounts), even though the
+    // current use cases do not yet exercise it. See module-level
+    // comment in `src/modules/transactions/mod.rs`.
+    let transactions_deps = crate::modules::transactions::init(
+        state.shard_router.clone(),
+        state.cache.clone(),
+        state.queue_producer.clone(),
+        accounts_deps.service.clone(),
+    );
+    let transactions_router =
+        crate::modules::transactions::router(transactions_deps);
+
+    // `nest_service` (rather than `nest`) because each module
+    // router is already fully stateful (`.with_state(deps)` was
+    // applied inside `*::router`) and thus its state type is
+    // `()`, whereas the parent router carries `AppState`. The
+    // `nest_service` method accepts any `Service`, bridging the
+    // mismatch without forcing module deps to implement
+    // `FromRef<AppState>`.
     Router::new()
         .nest("/api/v1", api_routes)
+        .nest_service("/api/v2/accounts", accounts_router)
+        .nest_service("/api/v2/transactions", transactions_router)
         .route("/health", get(crate::api::handlers::health_check))
         .route("/metrics", get(crate::api::handlers::prometheus_metrics))
         .with_state(state)

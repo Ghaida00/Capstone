@@ -69,6 +69,24 @@ impl Config {
                 .parse()
                 .expect("APP_PORT must be a number"),
 
+            // ── Shard URL defaults ───────────────────────────────────
+            // Write URLs point at the per-shard pgBouncer, which in
+            // turn points at pg-haproxy. HAProxy forwards to whichever
+            // node is currently primary under Patroni (leader-lock
+            // holder in etcd), so the hostnames here are stable across
+            // failovers.
+            //
+            // Read URLs list BOTH nodes of each shard because roles
+            // flip on promotion. src/db/pool.rs runs health-aware
+            // round-robin across them — reads against a node that has
+            // temporarily become primary still succeed, they just
+            // don't benefit from replica load-splitting until the old
+            // primary rejoins.
+            //
+            // See docs/ha-architecture.md for the full topology and
+            // the Patroni migration path (under which these defaults
+            // stay unchanged because the HA tool sits behind HAProxy).
+
             // Shard 0
             database_shard0_write_url: env_or(
                 "DATABASE_SHARD0_WRITE_URL",
@@ -76,7 +94,7 @@ impl Config {
             ),
             database_shard0_read_urls: parse_csv_env(
                 "DATABASE_SHARD0_READ_URLS",
-                "postgres://peakload_user:peakload_secure_pass@pg-shard0-replica1:5432/peakload_db",
+                "postgres://peakload_user:peakload_secure_pass@pg-shard0-node-a:5432/peakload_db,postgres://peakload_user:peakload_secure_pass@pg-shard0-node-b:5432/peakload_db",
             ),
             // Shard 1
             database_shard1_write_url: env_or(
@@ -85,7 +103,7 @@ impl Config {
             ),
             database_shard1_read_urls: parse_csv_env(
                 "DATABASE_SHARD1_READ_URLS",
-                "postgres://peakload_user:peakload_secure_pass@pg-shard1-replica1:5432/peakload_db",
+                "postgres://peakload_user:peakload_secure_pass@pg-shard1-node-a:5432/peakload_db,postgres://peakload_user:peakload_secure_pass@pg-shard1-node-b:5432/peakload_db",
             ),
             // Shard 2
             database_shard2_write_url: env_or(
@@ -94,7 +112,7 @@ impl Config {
             ),
             database_shard2_read_urls: parse_csv_env(
                 "DATABASE_SHARD2_READ_URLS",
-                "postgres://peakload_user:peakload_secure_pass@pg-shard2-replica1:5432/peakload_db",
+                "postgres://peakload_user:peakload_secure_pass@pg-shard2-node-a:5432/peakload_db,postgres://peakload_user:peakload_secure_pass@pg-shard2-node-b:5432/peakload_db",
             ),
 
             db_write_pool_size: env_or("DB_WRITE_POOL_SIZE", "30")
@@ -135,10 +153,17 @@ impl Config {
             db_health_check_interval_secs: env_or("DB_HEALTH_CHECK_INTERVAL_SECS", "5")
                 .parse()
                 .expect("DB_HEALTH_CHECK_INTERVAL_SECS must be a number"),
-            db_write_retry_max_attempts: env_or("DB_WRITE_RETRY_MAX_ATTEMPTS", "3")
+            // Defaults tuned for the Patroni promotion window
+            // (~5–15s, bounded by the etcd leader-lease TTL; see
+            // docs/ha-architecture.md §2). With the linear backoff in
+            // src/db/failover.rs (sleep = backoff_ms * attempt),
+            // 6 × 200ms adds up to 200+400+600+800+1000+1200 ≈ 4.2s of
+            // retry, which soaks the typical HAProxy-flip window. Requests
+            // outliving the window fail and rely on the HTTP caller to retry.
+            db_write_retry_max_attempts: env_or("DB_WRITE_RETRY_MAX_ATTEMPTS", "6")
                 .parse()
                 .expect("DB_WRITE_RETRY_MAX_ATTEMPTS must be a number"),
-            db_write_retry_backoff_ms: env_or("DB_WRITE_RETRY_BACKOFF_MS", "50")
+            db_write_retry_backoff_ms: env_or("DB_WRITE_RETRY_BACKOFF_MS", "200")
                 .parse()
                 .expect("DB_WRITE_RETRY_BACKOFF_MS must be a number"),
 

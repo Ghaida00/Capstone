@@ -9,6 +9,11 @@ mod config;
 mod db;
 mod error;
 mod middleware;
+// New home for bounded-context business logic. Phase 1 of the
+// modular-monolith migration (see docs/architecture/). Currently
+// pulls in only the `accounts` module; legacy handlers under
+// `src/api/` remain the source of truth for everything else.
+mod modules;
 mod queue;
 
 use crate::cache::redis::RedisCache;

@@ -9,60 +9,109 @@ x-logging: &default-logging
     max-size: "10m"
     max-file: "3"
 
-x-pg-common: &pg-common
-  image: postgres:18.3-alpine3.23
+# ============================================================
+# Patroni anchors
+# ------------------------------------------------------------
+# All six Postgres nodes (3 shards × 2) run the same custom
+# image defined in db/patroni/Dockerfile: PostgreSQL 18.3 on
+# bookworm + Patroni 4.x + python-etcd3 + envsubst. Patroni
+# renders a per-node config from templates/patroni.yml.tmpl
+# at container start and then IS the PG process manager.
+#
+# See docs/ha-architecture.md and db/patroni/README.md for
+# the full rationale — notably why we chose Patroni over
+# pg_auto_failover (to keep PG 18) and why we deferred the
+# watchdog / per-scope etcd clustering.
+# ============================================================
+x-patroni-build: &patroni-build
+  context: ./db/patroni
+  dockerfile: Dockerfile
+
+x-pg-node-common: &pg-node-common
+  build: *patroni-build
+  image: peakload/patroni-pg18:local
   restart: unless-stopped
   logging: *default-logging
   networks:
     - peakload-network
+  # 60s start_period tolerates the first-boot sequence
+  # (initdb on the first primary, pg_basebackup on the
+  # replica). Patroni exits non-zero on config errors, so
+  # the healthcheck plus Docker restart policy is enough to
+  # surface misconfigurations.
+  healthcheck:
+    test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U $$POSTGRES_USER -d $$POSTGRES_DB" ]
+    interval: 10s
+    timeout: 5s
+    retries: 6
+    start_period: 60s
 
-x-pg-primary-env: &pg-primary-env
-  POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+# Shared env for every Patroni node. Per-node variance
+# (scope, name, hostname) is injected at the service level.
+x-pg-node-env: &pg-node-env
+  PGDATA: /var/lib/postgresql/data
   POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-  POSTGRES_INITDB_ARGS: "--data-checksums"
+  POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+  POSTGRES_SUPERUSER_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD in .env}
   REPL_PASSWORD: ${REPL_PASSWORD:?set REPL_PASSWORD in .env}
+  ETCD_HOSTS: "etcd-1:2379,etcd-2:2379,etcd-3:2379"
 
-x-pg-primary-command: &pg-primary-command >
-  postgres
-    -c wal_level=replica
-    -c max_wal_senders=10
-    -c max_replication_slots=10
-    -c hot_standby=on
-    -c shared_buffers=64MB
-    -c effective_cache_size=192MB
-    -c work_mem=4MB
-    -c maintenance_work_mem=32MB
-    -c max_connections=120
-    -c checkpoint_completion_target=0.9
-    -c random_page_cost=1.1
-
-x-pg-healthcheck: &pg-healthcheck
-  test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
-  interval: 5s
-  timeout: 3s
-  retries: 10
-  start_period: 15s
-
-x-pg-replica-healthcheck: &pg-replica-healthcheck
-  test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
-  interval: 5s
-  timeout: 3s
-  retries: 10
-  start_period: 30s
-
-x-pg-primary-deploy: &pg-primary-deploy
+# Per-node resource envelope: sized for PG 18 + Patroni +
+# envsubst renderer (~90 MB RSS idle). 192 MB leaves
+# headroom for WAL + pg_basebackup on replica join.
+x-pg-node-deploy: &pg-node-deploy
   resources:
     limits:
-      memory: 256M
-      cpus: "0.5"
+      memory: 192M
+      cpus: "0.4"
 
-x-pg-replica-deploy: &pg-replica-deploy
-  resources:
-    limits:
-      memory: 256M
-      cpus: "0.25"
+# ============================================================
+# etcd anchors
+# ------------------------------------------------------------
+# Patroni's DCS. Three-node cluster so we tolerate one loss
+# without losing quorum. Bitnami image for its sensible
+# default configuration; CLI (etcdctl) ships with it so the
+# operational cheatsheet in db/patroni/README.md works.
+# ============================================================
+x-etcd-common: &etcd-common
+  image: bitnami/etcd:3.6
+  restart: unless-stopped
+  logging: *default-logging
+  networks:
+    - peakload-network
+  healthcheck:
+    test: [ "CMD", "etcdctl", "endpoint", "health" ]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 20s
+  deploy:
+    resources:
+      limits:
+        memory: 64M
+        cpus: "0.15"
 
+x-etcd-env-common: &etcd-env-common
+  ALLOW_NONE_AUTHENTICATION: "yes"
+  ETCD_INITIAL_CLUSTER: "etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380"
+  ETCD_INITIAL_CLUSTER_STATE: "new"
+  ETCD_INITIAL_CLUSTER_TOKEN: "peakload-etcd-cluster"
+  ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+  ETCD_LISTEN_PEER_URLS: "http://0.0.0.0:2380"
+  # Bitnami image needs this to suppress its auth prompt on
+  # fresh startups; we run a trusted overlay network so no
+  # auth is acceptable for the capstone.
+  ETCD_DISABLE_STORE_MEMBER_ID: "false"
+
+# ============================================================
+# pgBouncer anchors
+# ------------------------------------------------------------
+# pgBouncer now points at pg-haproxy instead of a specific
+# primary host. HAProxy forwards each shard's frontend
+# (:5000/:5001/:5002) to whichever node is currently primary,
+# so pgBouncer's backend URL is stable across failovers.
+# ============================================================
 x-pgbouncer-common: &pgbouncer-common
   image: edoburu/pgbouncer:v1.25.1-p0
   restart: unless-stopped
@@ -81,6 +130,12 @@ x-pgbouncer-env: &pgbouncer-env
   MIN_POOL_SIZE: 15
   RESERVE_POOL_SIZE: 10
   RESERVE_POOL_TIMEOUT: 3
+  # server_lifetime is deliberately short (1h) so that
+  # long-lived pgBouncer→HAProxy conns get recycled, which
+  # bounds the window in which a stale route could persist
+  # after a promotion. `on-marked-down shutdown-sessions` in
+  # haproxy.cfg handles the acute case; this is the belt-
+  # and-suspenders cap.
   SERVER_IDLE_TIMEOUT: 300
   SERVER_LIFETIME: 3600
   LOG_CONNECTIONS: 0
@@ -99,6 +154,9 @@ x-pgbouncer-deploy: &pgbouncer-deploy
       memory: 32M
       cpus: "0.1"
 
+# ============================================================
+# Redis anchors — unchanged from pre-failover revision
+# ============================================================
 x-redis-command: &redis-command >
   redis-server
     --maxmemory 96mb
@@ -173,6 +231,12 @@ services:
 
   # ============================================================
   # Rust Application — 2 replicas
+  # ------------------------------------------------------------
+  # depends_on `db-bootstrap-schema: service_completed_successfully`
+  # guarantees that init.sql has been applied to every shard
+  # primary before the app tries to query. The bootstrap job
+  # is idempotent so restarts don't trigger re-runs on a
+  # populated database.
   # ============================================================
   app:
     build:
@@ -181,17 +245,18 @@ services:
     env_file: .env
     environment:
       # ── Failover wiring ─────────────────────────────────────────
-      # Sentinel-aware Redis client: when these are set the app
-      # resolves the Redis master via Sentinel and rebuilds its pool
-      # automatically when Sentinel promotes a replica.
+      # Sentinel-aware Redis client (unchanged).
       REDIS_SENTINEL_NODES: "redis://redis-sentinel-1:26379,redis://redis-sentinel-2:26379,redis://redis-sentinel-3:26379"
       REDIS_SENTINEL_MASTER_NAME: "peakload-master"
       REDIS_SENTINEL_MONITOR_INTERVAL_SECS: "5"
-      # Per-replica health probe interval for Postgres
+      # Per-replica health probe interval for Postgres reads.
       DB_HEALTH_CHECK_INTERVAL_SECS: "5"
-      # Retry policy for transient write errors (pgBouncer reconnect window)
-      DB_WRITE_RETRY_MAX_ATTEMPTS: "3"
-      DB_WRITE_RETRY_BACKOFF_MS: "50"
+      # Retry policy — must cover the Patroni promotion window
+      # (typically 5–15s, bounded by the etcd leader-lease TTL).
+      # Defaults in src/config.rs are tuned for this; override
+      # here only for experimentation.
+      DB_WRITE_RETRY_MAX_ATTEMPTS: "6"
+      DB_WRITE_RETRY_BACKOFF_MS: "200"
     expose:
       - "3000"
     depends_on:
@@ -201,6 +266,8 @@ services:
         condition: service_healthy
       pgbouncer-shard2:
         condition: service_healthy
+      db-bootstrap-schema:
+        condition: service_completed_successfully
       redis-master:
         condition: service_healthy
       redis-sentinel-1:
@@ -225,142 +292,331 @@ services:
           cpus: "0.5"
 
   # ============================================================
-  # SHARD 0 — PostgreSQL Primary + 1 Replica + pgBouncer
+  # etcd cluster — Patroni's distributed config store
+  # ------------------------------------------------------------
+  # Three nodes so we tolerate one loss without losing quorum.
+  # Patroni talks to this cluster for leader election, cluster
+  # configuration, and member state. A majority MUST be alive
+  # for primaries to stay writable; if quorum is lost, Patroni
+  # demotes all primaries to read-only to prevent split-brain.
+  #
+  # No external port exposure — etcd is only reached from
+  # inside the peakload network.
   # ============================================================
-  pg-shard0-primary:
-    <<: *pg-common
-    container_name: peakload-pg-shard0-primary
-    environment: *pg-primary-env
-    command: *pg-primary-command
-    volumes:
-      - pg_shard0_primary_data:/var/lib/postgresql/data
-      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
-      - ./db/primary-setup.sh:/docker-entrypoint-initdb.d/02-primary-setup.sh:ro
-    healthcheck: *pg-healthcheck
-    deploy: *pg-primary-deploy
-
-  pg-shard0-replica1:
-    <<: *pg-common
-    container_name: peakload-pg-shard0-replica1
+  etcd-1:
+    <<: *etcd-common
+    container_name: peakload-etcd-1
     environment:
-      PGUSER: ${POSTGRES_USER}
-      PGPASSWORD: ${POSTGRES_PASSWORD}
-      PRIMARY_HOST: pg-shard0-primary
-      REPL_PASSWORD: ${REPL_PASSWORD}
+      <<: *etcd-env-common
+      ETCD_NAME: etcd-1
+      ETCD_ADVERTISE_CLIENT_URLS: "http://etcd-1:2379"
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: "http://etcd-1:2380"
     volumes:
-      - pg_shard0_replica1_data:/var/lib/postgresql/data
-      - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
-    entrypoint: [ "/bin/sh", "/replica-entrypoint.sh" ]
+      - etcd_1_data:/bitnami/etcd
+
+  etcd-2:
+    <<: *etcd-common
+    container_name: peakload-etcd-2
+    environment:
+      <<: *etcd-env-common
+      ETCD_NAME: etcd-2
+      ETCD_ADVERTISE_CLIENT_URLS: "http://etcd-2:2379"
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: "http://etcd-2:2380"
+    volumes:
+      - etcd_2_data:/bitnami/etcd
+
+  etcd-3:
+    <<: *etcd-common
+    container_name: peakload-etcd-3
+    environment:
+      <<: *etcd-env-common
+      ETCD_NAME: etcd-3
+      ETCD_ADVERTISE_CLIENT_URLS: "http://etcd-3:2379"
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: "http://etcd-3:2380"
+    volumes:
+      - etcd_3_data:/bitnami/etcd
+
+  # ============================================================
+  # SHARD 0 — two Patroni-managed nodes
+  # ------------------------------------------------------------
+  # Patroni + etcd assign primary/replica roles dynamically.
+  # On first boot, whichever node wins the etcd leader lock
+  # for scope `peakload-shard0` becomes primary; the other
+  # joins as a streaming replica and catches up via
+  # pg_basebackup. After a promotion they flip roles.
+  # Do NOT assume node-a is always the primary.
+  # ============================================================
+  pg-shard0-node-a:
+    <<: *pg-node-common
+    container_name: peakload-pg-shard0-node-a
+    environment:
+      <<: *pg-node-env
+      PATRONI_SCOPE:    peakload-shard0
+      PATRONI_NAME:     shard0-a
+      PATRONI_HOSTNAME: pg-shard0-node-a
+    volumes:
+      - pg_shard0_node_a_data:/var/lib/postgresql/data
     depends_on:
-      pg-shard0-primary:
+      etcd-1:
         condition: service_healthy
-    healthcheck: *pg-replica-healthcheck
-    deploy: *pg-replica-deploy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+    deploy: *pg-node-deploy
+
+  pg-shard0-node-b:
+    <<: *pg-node-common
+    container_name: peakload-pg-shard0-node-b
+    environment:
+      <<: *pg-node-env
+      PATRONI_SCOPE:    peakload-shard0
+      PATRONI_NAME:     shard0-b
+      PATRONI_HOSTNAME: pg-shard0-node-b
+    volumes:
+      - pg_shard0_node_b_data:/var/lib/postgresql/data
+    depends_on:
+      etcd-1:
+        condition: service_healthy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+      # Slight stagger so node-a wins the etcd leader-lock
+      # race on a cold boot. Not a correctness requirement
+      # — Patroni converges either way — just a tidier
+      # first-time log.
+      pg-shard0-node-a:
+        condition: service_started
+    deploy: *pg-node-deploy
 
   pgbouncer-shard0:
     <<: *pgbouncer-common
     container_name: peakload-pgbouncer-shard0
     environment:
       <<: *pgbouncer-env
-      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-shard0-primary:5432/${POSTGRES_DB}
+      # Backend → HAProxy :5000 → whichever node is primary.
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-haproxy:5000/${POSTGRES_DB}
     depends_on:
-      pg-shard0-primary:
+      pg-haproxy:
         condition: service_healthy
     healthcheck: *pgbouncer-healthcheck
     deploy: *pgbouncer-deploy
 
   # ============================================================
-  # SHARD 1 — PostgreSQL Primary + 1 Replica + pgBouncer
+  # SHARD 1 — two Patroni-managed nodes (scope peakload-shard1)
   # ============================================================
-  pg-shard1-primary:
-    <<: *pg-common
-    container_name: peakload-pg-shard1-primary
-    environment: *pg-primary-env
-    command: *pg-primary-command
-    volumes:
-      - pg_shard1_primary_data:/var/lib/postgresql/data
-      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
-      - ./db/primary-setup.sh:/docker-entrypoint-initdb.d/02-primary-setup.sh:ro
-    healthcheck: *pg-healthcheck
-    deploy: *pg-primary-deploy
-
-  pg-shard1-replica1:
-    <<: *pg-common
-    container_name: peakload-pg-shard1-replica1
+  pg-shard1-node-a:
+    <<: *pg-node-common
+    container_name: peakload-pg-shard1-node-a
     environment:
-      PGUSER: ${POSTGRES_USER}
-      PGPASSWORD: ${POSTGRES_PASSWORD}
-      PRIMARY_HOST: pg-shard1-primary
-      REPL_PASSWORD: ${REPL_PASSWORD}
+      <<: *pg-node-env
+      PATRONI_SCOPE:    peakload-shard1
+      PATRONI_NAME:     shard1-a
+      PATRONI_HOSTNAME: pg-shard1-node-a
     volumes:
-      - pg_shard1_replica1_data:/var/lib/postgresql/data
-      - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
-    entrypoint: [ "/bin/sh", "/replica-entrypoint.sh" ]
+      - pg_shard1_node_a_data:/var/lib/postgresql/data
     depends_on:
-      pg-shard1-primary:
+      etcd-1:
         condition: service_healthy
-    healthcheck: *pg-replica-healthcheck
-    deploy: *pg-replica-deploy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+    deploy: *pg-node-deploy
+
+  pg-shard1-node-b:
+    <<: *pg-node-common
+    container_name: peakload-pg-shard1-node-b
+    environment:
+      <<: *pg-node-env
+      PATRONI_SCOPE:    peakload-shard1
+      PATRONI_NAME:     shard1-b
+      PATRONI_HOSTNAME: pg-shard1-node-b
+    volumes:
+      - pg_shard1_node_b_data:/var/lib/postgresql/data
+    depends_on:
+      etcd-1:
+        condition: service_healthy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+      pg-shard1-node-a:
+        condition: service_started
+    deploy: *pg-node-deploy
 
   pgbouncer-shard1:
     <<: *pgbouncer-common
     container_name: peakload-pgbouncer-shard1
     environment:
       <<: *pgbouncer-env
-      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-shard1-primary:5432/${POSTGRES_DB}
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-haproxy:5001/${POSTGRES_DB}
     depends_on:
-      pg-shard1-primary:
+      pg-haproxy:
         condition: service_healthy
     healthcheck: *pgbouncer-healthcheck
     deploy: *pgbouncer-deploy
 
   # ============================================================
-  # SHARD 2 — PostgreSQL Primary + 1 Replica + pgBouncer
+  # SHARD 2 — two Patroni-managed nodes (scope peakload-shard2)
   # ============================================================
-  pg-shard2-primary:
-    <<: *pg-common
-    container_name: peakload-pg-shard2-primary
-    environment: *pg-primary-env
-    command: *pg-primary-command
-    volumes:
-      - pg_shard2_primary_data:/var/lib/postgresql/data
-      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
-      - ./db/primary-setup.sh:/docker-entrypoint-initdb.d/02-primary-setup.sh:ro
-    healthcheck: *pg-healthcheck
-    deploy: *pg-primary-deploy
-
-  pg-shard2-replica1:
-    <<: *pg-common
-    container_name: peakload-pg-shard2-replica1
+  pg-shard2-node-a:
+    <<: *pg-node-common
+    container_name: peakload-pg-shard2-node-a
     environment:
-      PGUSER: ${POSTGRES_USER}
-      PGPASSWORD: ${POSTGRES_PASSWORD}
-      PRIMARY_HOST: pg-shard2-primary
-      REPL_PASSWORD: ${REPL_PASSWORD}
+      <<: *pg-node-env
+      PATRONI_SCOPE:    peakload-shard2
+      PATRONI_NAME:     shard2-a
+      PATRONI_HOSTNAME: pg-shard2-node-a
     volumes:
-      - pg_shard2_replica1_data:/var/lib/postgresql/data
-      - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
-    entrypoint: [ "/bin/sh", "/replica-entrypoint.sh" ]
+      - pg_shard2_node_a_data:/var/lib/postgresql/data
     depends_on:
-      pg-shard2-primary:
+      etcd-1:
         condition: service_healthy
-    healthcheck: *pg-replica-healthcheck
-    deploy: *pg-replica-deploy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+    deploy: *pg-node-deploy
+
+  pg-shard2-node-b:
+    <<: *pg-node-common
+    container_name: peakload-pg-shard2-node-b
+    environment:
+      <<: *pg-node-env
+      PATRONI_SCOPE:    peakload-shard2
+      PATRONI_NAME:     shard2-b
+      PATRONI_HOSTNAME: pg-shard2-node-b
+    volumes:
+      - pg_shard2_node_b_data:/var/lib/postgresql/data
+    depends_on:
+      etcd-1:
+        condition: service_healthy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+      pg-shard2-node-a:
+        condition: service_started
+    deploy: *pg-node-deploy
 
   pgbouncer-shard2:
     <<: *pgbouncer-common
     container_name: peakload-pgbouncer-shard2
     environment:
       <<: *pgbouncer-env
-      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-shard2-primary:5432/${POSTGRES_DB}
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-haproxy:5002/${POSTGRES_DB}
     depends_on:
-      pg-shard2-primary:
+      pg-haproxy:
         condition: service_healthy
     healthcheck: *pgbouncer-healthcheck
     deploy: *pgbouncer-deploy
 
   # ============================================================
-  # Redis HA — Master + Replica + Sentinel
+  # pg-haproxy — role-aware write router
+  # ------------------------------------------------------------
+  # One HAProxy with three TCP frontends, one per shard. Each
+  # backend's health check hits the socat sidecar on port
+  # 8008 of both shard nodes and forwards writes to whichever
+  # answers HTTP 200 on GET /primary. See haproxy/README.md
+  # for the detailed protocol.
+  #
+  # Port 7000 stats dashboard is bound to 127.0.0.1 so it is
+  # visible from the host for debugging but never from the
+  # public internet.
+  # ============================================================
+  pg-haproxy:
+    image: haproxy:3.2-alpine
+    container_name: peakload-pg-haproxy
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "127.0.0.1:7000:7000"
+    expose:
+      - "5000"
+      - "5001"
+      - "5002"
+    depends_on:
+      pg-shard0-node-a:
+        condition: service_healthy
+      pg-shard0-node-b:
+        condition: service_healthy
+      pg-shard1-node-a:
+        condition: service_healthy
+      pg-shard1-node-b:
+        condition: service_healthy
+      pg-shard2-node-a:
+        condition: service_healthy
+      pg-shard2-node-b:
+        condition: service_healthy
+    healthcheck:
+      # Stats page on :7000 is served unconditionally once
+      # HAProxy is up, so this is a cheap liveness probe.
+      # Backend UP/DOWN state is observable there for humans
+      # but we don't assert it in Docker — pgBouncer retries
+      # cover the transient-no-backend window.
+      test: [ "CMD-SHELL", "wget -q -O- http://127.0.0.1:7000/ >/dev/null || exit 1" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - peakload-network
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: "0.15"
+
+  # ============================================================
+  # db-bootstrap-schema — one-shot init.sql applier
+  # ------------------------------------------------------------
+  # Patroni runs PG under its own entrypoint and bypasses the
+  # standard /docker-entrypoint-initdb.d mechanism, so init.sql
+  # never auto-runs. This container uses the stock postgres
+  # image (for `psql`), waits for each shard primary to be up
+  # via pg-haproxy, and applies init.sql iff the canary table
+  # is missing. Idempotent; safe to re-run.
+  #
+  # The script it mounts (db/bootstrap/bootstrap-schema.sh) is
+  # intentionally HA-agnostic — it talks only to pg-haproxy,
+  # so it survived the move from pg_auto_failover to Patroni
+  # with only a header edit.
+  #
+  # restart: "no" + condition: service_completed_successfully
+  # on the `app` service gates app start on schema readiness.
+  # ============================================================
+  db-bootstrap-schema:
+    image: postgres:18.3-alpine3.23
+    container_name: peakload-db-bootstrap-schema
+    entrypoint: [ "/bin/sh", "/opt/bootstrap-schema.sh" ]
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB:       ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      PG_HAPROXY_HOST:   pg-haproxy
+      PG_HAPROXY_PORTS:  "5000 5001 5002"
+    volumes:
+      - ./db/bootstrap/bootstrap-schema.sh:/opt/bootstrap-schema.sh:ro
+      - ./db/init.sql:/sql/init.sql:ro
+    depends_on:
+      pg-haproxy:
+        condition: service_healthy
+    restart: "no"
+    logging: *default-logging
+    networks:
+      - peakload-network
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: "0.1"
+
+  # ============================================================
+  # Redis HA — Master + Replica + Sentinel (unchanged)
   # ============================================================
   redis-master:
     image: redis:8.6.1-alpine3.23
@@ -559,13 +815,23 @@ services:
           memory: 128M
           cpus: "0.2"
 
+# ============================================================
+# Volumes
+# ------------------------------------------------------------
+# One volume per Patroni node (not per role, because roles
+# flip on failover) and one per etcd member. Nothing is
+# shared across containers — all persistence is per-service.
+# ============================================================
 volumes:
-  pg_shard0_primary_data:
-  pg_shard0_replica1_data:
-  pg_shard1_primary_data:
-  pg_shard1_replica1_data:
-  pg_shard2_primary_data:
-  pg_shard2_replica1_data:
+  etcd_1_data:
+  etcd_2_data:
+  etcd_3_data:
+  pg_shard0_node_a_data:
+  pg_shard0_node_b_data:
+  pg_shard1_node_a_data:
+  pg_shard1_node_b_data:
+  pg_shard2_node_a_data:
+  pg_shard2_node_b_data:
   redis_data:
   rabbitmq_data:
   prometheus_data:

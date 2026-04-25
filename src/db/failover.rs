@@ -1,5 +1,13 @@
 //! Retry helpers for transient DB failures (connection reset during
-//! pgBouncer restart, brief primary unavailability during promotion, etc.).
+//! pgBouncer restart, brief primary unavailability during a Patroni
+//! promotion, HAProxy marking a backend DOWN while the shard primary
+//! flips, etc.).
+//!
+//! The retry budget (attempts × backoff) is tuned in `src/config.rs`
+//! to cover the typical promotion window; see
+//! `docs/ha-architecture.md` §2 for the full timeline. If the window
+//! exceeds the budget the error propagates as 5xx and the HTTP caller
+//! retries — that is by design, not a bug.
 //!
 //! Non-transient errors (constraint violations, not-found, syntax) are
 //! returned immediately — we only retry on errors that look like "try
