@@ -1,0 +1,52 @@
+[package]
+name = "shared_kernel"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-cutting infrastructure (DB, cache, queue, errors, events) shared by every business module."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Web (axum::IntoResponse on AppError + ApiResponse types)
+axum = { workspace = true }
+tower = { workspace = true }
+
+# Async runtime — broadcast bus + retry helpers
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+bigdecimal = { workspace = true }
+rust_decimal = { workspace = true }
+
+# Cache
+redis = { workspace = true }
+deadpool-redis = { workspace = true }
+
+# Queue
+amqprs = { workspace = true }
+
+# Serde
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+fnv = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Metrics (failover counters live in db/)
+metrics = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

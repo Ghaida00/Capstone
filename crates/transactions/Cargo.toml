@@ -1,0 +1,38 @@
+[package]
+name = "transactions"
+version = "0.1.0"
+edition = "2021"
+description = "Bounded context: money movement (depends on accounts via ports)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+shared_kernel = { path = "../shared_kernel" }
+accounts = { path = "../accounts" }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+amqprs = { workspace = true }
+
+sqlx = { workspace = true }
+rust_decimal = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+fnv = { workspace = true }
+
+tracing = { workspace = true }
+metrics = { workspace = true }
+
+thiserror = { workspace = true }
+
+[dev-dependencies]
+notifications = { path = "../notifications" }
+axum-test = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }

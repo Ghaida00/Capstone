@@ -69,7 +69,7 @@ Timeline when `pg-shard0-node-a` (current primary) dies:
         (on-marked-down shutdown-sessions), and forwards new conns
         to node-b
  t+4s   pgBouncer-shard0's in-flight transactions fail with a
-        transient error. src/db/failover.rs:21 classifies it as
+        transient error. crates/shared_kernel/src/db/failover.rs:21 classifies it as
         transient and the Rust retry wrapper reconnects against
         the fresh pgBouncer → haproxy path, which now lands on
         node-b
@@ -79,10 +79,10 @@ Timeline when `pg-shard0-node-a` (current primary) dies:
 ```
 
 **Two things the application already gets right:**
-- `src/db/failover.rs` classifies `Io / PoolTimedOut / PoolClosed /
+- `crates/shared_kernel/src/db/failover.rs` classifies `Io / PoolTimedOut / PoolClosed /
   WorkerCrashed` as transient and retries. These are exactly the
   errors raised during the promotion window.
-- `src/db/pool.rs` keeps per-replica `AtomicBool` flags for reads, so
+- `crates/shared_kernel/src/db/pool.rs` keeps per-replica `AtomicBool` flags for reads, so
   a node that is briefly unreachable during its own promotion is
   simply skipped for reads until it comes back.
 

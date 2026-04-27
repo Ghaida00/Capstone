@@ -11,6 +11,13 @@
 > - [module-anatomy.md](./module-anatomy.md) — file-by-file rules.
 > - [dependency-rules.md](./dependency-rules.md) — what imports what.
 > - [migration-plan.md](./migration-plan.md) — where this phase fits.
+>
+> **Post-Phase-4 note**: this walkthrough was written when accounts
+> lived at `src/modules/accounts/`. After Phase 4 the same files
+> live at `crates/accounts/src/`. The internal shape and the
+> walkthrough narrative are unchanged. See
+> [phase4-workspace-walkthrough.md §5](./phase4-workspace-walkthrough.md)
+> for the full path mapping.
 
 ---
 
@@ -321,9 +328,13 @@ Phase 1 **partial** means we took the shortest path that proves
 the shape. These gaps are tracked in
 [migration-plan.md §Phase 1 exit criteria](./migration-plan.md):
 
-1. **No middleware parity.** The v2 route skips auth, rate
-   limiting, circuit breaker, and backpressure middleware. Fine
-   for a proof-of-shape; MUST be fixed before v1 is removed.
+1. ~~**No middleware parity.**~~ ✅ **closed.** The v2 sub-router
+   now reuses the v1 protection stack (auth → rate-limit →
+   circuit-breaker → backpressure) via the shared
+   `apply_protection_stack` helper in
+   [bootstrap.rs](../../src/bootstrap.rs). A v2 client gets the
+   same 401/429/503 semantics as a v1 client. The exit-criteria
+   blocker for the v1 deletion is gone.
 2. **Legacy handler not deleted.** `src/api/handlers::get_balance`
    still exists and still serves `/api/v1/users/.../balance`.
    This is intentional — it lets us diff production behaviour

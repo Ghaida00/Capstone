@@ -1,0 +1,68 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+description = "Peakload Capstone — composition root binary. Wires every module crate."
+
+[[bin]]
+name = "peakload-capstone"
+path = "src/main.rs"
+
+[dependencies]
+shared_kernel = { path = "../shared_kernel" }
+accounts = { path = "../accounts" }
+transactions = { path = "../transactions" }
+notifications = { path = "../notifications" }
+
+# Allocator
+mimalloc = { workspace = true }
+
+# Web
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+
+# DB / cache (still used by middleware + legacy v1 handlers)
+sqlx = { workspace = true }
+rust_decimal = { workspace = true }
+redis = { workspace = true }
+deadpool-redis = { workspace = true }
+
+# Serde
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+fnv = { workspace = true }
+dotenvy = { workspace = true }
+
+# Auth middleware
+jsonwebtoken = { workspace = true }
+once_cell = { workspace = true }
+
+# Logging / tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-stdout = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
+# Metrics
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+
+# Errors
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+axum-test = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }

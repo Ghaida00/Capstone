@@ -1,9 +1,34 @@
 # Modular Monolith — Core Design
 
-> **Status:** Groundwork only. No production code has been moved into
-> this structure yet. This document + the skeleton under `src/modules/`
-> establish the target architecture and the rules for getting there.
-> See [migration-plan.md](./migration-plan.md) for the phased rollout.
+> **Status (post-Phase 4 + Step A):** the design described here is the
+> running shape of the codebase. Phases 1–4 are merged plus the
+> Phase-2 follow-up consumer rewire (Step A in
+> [cutover-readiness.md](./cutover-readiness.md#2-gates-for-step-a-consumer-rewire-done-on-this-branch)).
+> The legacy v1 HTTP surface is the only remaining piece in
+> `crates/app/`; Step B (the v1 cull) clears it. Pre-cull caller
+> catalogue: [`v1-caller-inventory.md`](./v1-caller-inventory.md).
+>
+> **Path mapping**: this document still uses the pre-Phase-4 paths
+> (`src/modules/<name>/`, `src/shared_kernel/`, `src/api/`, etc.)
+> because they are easier to read narratively. After Phase 4 those
+> are now:
+>
+> | Old path                  | New path                                                       |
+> |---------------------------|----------------------------------------------------------------|
+> | `src/modules/<name>/`     | `crates/<name>/src/`                                           |
+> | `src/shared_kernel/`      | `crates/shared_kernel/src/`                                    |
+> | `src/api/`                | `crates/app/src/api/` (legacy v1 only)                         |
+> | `src/db/` (shard, etc.)   | `crates/shared_kernel/src/db/`                                 |
+> | `src/db/models.rs`        | `crates/app/src/db/models.rs` (legacy)                         |
+> | `src/cache/`              | `crates/shared_kernel/src/cache/`                              |
+> | `src/queue/producer.rs`   | `crates/shared_kernel/src/queue/producer.rs`                   |
+> | `src/queue/consumer.rs`   | `crates/transactions/src/infrastructure/consumer.rs` (Step A)  |
+> | `src/middleware/`         | `crates/app/src/middleware/`                                   |
+> | `src/error.rs`            | `crates/shared_kernel/src/error.rs`                            |
+> | `src/api/responses.rs`    | `crates/shared_kernel/src/responses.rs`                        |
+>
+> See [phase4-workspace-walkthrough.md](./phase4-workspace-walkthrough.md)
+> for the file-by-file tour.
 
 ---
 

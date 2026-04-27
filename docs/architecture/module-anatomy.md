@@ -1,12 +1,23 @@
 # Module Anatomy — File-by-File Layout
 
-Every module under `src/modules/` follows the **exact same internal
-structure**. Uniformity is the point — anyone who has read one module
-can navigate another without reorientation, and tooling (grep, rename,
-migrations) works the same way everywhere.
+> **Post-Phase-4 note**: this doc still uses the old
+> `src/modules/<name>/` paths in narrative. Mentally substitute
+> `crates/<name>/src/` everywhere. The internal `domain /
+> application / infrastructure / api / ports.rs / mod.rs` shape is
+> identical — only the directory the module lives in has moved.
+> The `_template/` reference is now
+> [`docs/architecture/module-template/`](./module-template/),
+> not a compiled crate.
 
-Use `src/modules/_template/` as a copy-this starting point for any new
-module.
+Every module under `crates/<name>/src/` follows the **exact same
+internal structure**. Uniformity is the point — anyone who has read
+one module can navigate another without reorientation, and tooling
+(grep, rename, migrations) works the same way everywhere.
+
+Use [`docs/architecture/module-template/`](./module-template/) as a
+copy-this starting point for any new module crate. Adding the new
+crate is one entry in the workspace `[workspace] members` list +
+one per-crate `Cargo.toml`.
 
 ---
 

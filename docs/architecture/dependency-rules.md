@@ -6,6 +6,18 @@ can cite when blocking a PR. It complements
 [module-anatomy.md](./module-anatomy.md) (the per-file shape) by
 spelling out the **directional** rules between layers and modules.
 
+> **Post-Phase-4 note**: every rule below was previously enforced by
+> review + grep + `pub(crate)` visibility. After Phase 4, most are
+> enforced by Cargo: a rule violation is a missing crate in
+> `Cargo.toml`, which is a compile error. The review-only rules that
+> remain are the ones **inside** a single crate (e.g. "domain must
+> not import from infrastructure"). See
+> [phase4-workspace-walkthrough.md §6](./phase4-workspace-walkthrough.md).
+>
+> Path mapping: `src/modules/<name>/` → `crates/<name>/src/`,
+> `src/shared_kernel/` → `crates/shared_kernel/src/`. Substitute
+> mentally throughout.
+
 ---
 
 ## 1. The big rule, once

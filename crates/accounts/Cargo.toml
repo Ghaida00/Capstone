@@ -1,0 +1,29 @@
+[package]
+name = "accounts"
+version = "0.1.0"
+edition = "2021"
+description = "Bounded context: user accounts and balances."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+shared_kernel = { path = "../shared_kernel" }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+sqlx = { workspace = true }
+rust_decimal = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+fnv = { workspace = true }
+
+tracing = { workspace = true }
+metrics = { workspace = true }
+
+thiserror = { workspace = true }

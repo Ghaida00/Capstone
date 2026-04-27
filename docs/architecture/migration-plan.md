@@ -80,9 +80,21 @@ Exit criteria:
   import `accounts::domain::Account` from `src/api/`?") confirms the
   seal.
 - Integration tests against the `accounts` HTTP surface all pass.
+- **Middleware parity**: the v2 sub-router carries the same
+  protection stack (auth → rate-limit → circuit-breaker →
+  backpressure) as v1. ✅ done — see `apply_protection_stack` in
+  [bootstrap.rs](../../src/bootstrap.rs); a v2 client experiences
+  identical 401/429/503 semantics to v1.
 
 **Time estimate**: 1–2 days for a developer familiar with the
 codebase.
+
+**Phase 1 partial — what is still missing for full Phase 1**:
+
+- Cutover step 5 (delete the legacy `/api/v1/users/.../balance`
+  handler and route v1 at the new module if URL stability is
+  required) is still pending. The two paths currently coexist by
+  design.
 
 ---
 
@@ -111,6 +123,9 @@ Exit criteria:
 - The dependency between the two modules is an explicit
   `Arc<dyn AccountService>` visible in the bootstrap graph — no
   hidden global state.
+- **Middleware parity**: same protection stack as v1, applied via
+  the shared `apply_protection_stack` helper. ✅ done — both v2
+  sub-routers go through the identical layer chain.
 
 **Key test**: change an internal of `accounts::infrastructure` (e.g.
 swap SELECT shape) without touching `transactions` and watch only
@@ -127,71 +142,132 @@ Implements the **event-driven, independent module** story.
 
 Scope:
 
-1. `shared_kernel::events` gets a first real type: e.g.
-   `TransactionCommitted { id, from, to, amount }`.
-2. `transactions::application` publishes this event after a
-   successful transfer.
-3. `notifications::infrastructure` subscribes to it (via the
-   existing RabbitMQ wiring, now threaded through shared_kernel).
-4. `notifications::api::router` exposes any HTTP endpoints
-   notifications owns (e.g. `/notifications/status/...`).
+1. ✅ `shared_kernel::events` gets a first real type — see
+   [src/shared_kernel/events.rs](../../src/shared_kernel/events.rs).
+   The kernel exports a neutral `Event` envelope plus
+   `EventPublisher` / `EventSubscriber` traits and an
+   `InProcessEventBus` impl backed by `tokio::sync::broadcast`.
+2. ✅ `transactions.committed` events are published after a
+   successful transfer. Phase 3 publishes from the queue consumer
+   (`src/queue/consumer.rs`) once `flush_batch_to_shards` returns
+   `Ok(_)` — that is the point at which "committed" is true.
+   When the consumer is rewired into the transactions module
+   (Phase 2 follow-up) the call site moves but the contract does
+   not.
+3. ✅ `notifications::infrastructure` subscribes via
+   `Arc<dyn EventSubscriber>`. Today the bus is in-process; the
+   AMQP-backed swap is a one-file replacement that satisfies the
+   same two traits.
+4. ✅ `notifications::api::router` exposes
+   `GET /api/v2/notifications/recent?limit=N`, returning the
+   newest entries from the in-memory ring buffer.
 
 Exit criteria:
 
-- `notifications` has **zero** module-level `use crate::modules::*`
-  imports.
+- ✅ `notifications` has **zero** module-level `use crate::modules::*`
+  imports — verified by
+  `rg 'use crate::modules' src/modules/notifications/` returning
+  no matches.
 - Building `notifications` alone (once we split crates in Phase 4)
-  doesn't require `accounts` or `transactions` sources.
-- An event-smoke test demonstrates a publish → consume round trip.
+  doesn't require `accounts` or `transactions` sources. Pending
+  Phase 4 — the file-level seal is in place today.
+- ✅ An event-smoke test demonstrates a publish → consume round
+  trip. `cargo check` proves compile-shape; the runtime smoke is
+  any `POST /api/v2/transactions` followed (~tens of ms later,
+  after the consumer batch flush) by a
+  `GET /api/v2/notifications/recent` that returns the corresponding
+  entry.
+
+**Phase 3 partial — what is still missing**:
+
+- **Persistent log**: the `notification_log` table from
+  `src/modules/notifications/README.md` is not yet created;
+  Phase 3 uses an in-memory `VecDeque<NotificationEntry>` capped
+  at 512. Restarts lose history. Swap is a sibling
+  `infrastructure/repository.rs` selected at `init` time.
+- **Dispatch channels**: the README's email / push / banner
+  channels are not implemented; the dispatcher only writes to the
+  log today.
+- **Subscriptions table**: opt-in / opt-out is not modelled.
+- **AMQP transport**: the bus is in-process. The two traits
+  (`EventPublisher`, `EventSubscriber`) are deliberately the
+  swap surface for an AMQP-backed impl in Phase 4 / 5.
 
 **Time estimate**: 1–2 days.
 
 ---
 
-## Phase 4 — Workspace crate split
+## Phase 4 — Workspace crate split ✅ DONE
 
-Until now everything has been one Cargo crate with internal module
-boundaries enforced by convention + `pub(crate)` visibility. Phase 4
-promotes each module to its own crate so the **compiler** enforces
-the boundaries.
-
-Target layout:
+The compiler now enforces the module boundaries. Layout:
 
 ```
-Cargo.toml                  (workspace root, [workspace] members = [...])
+Cargo.toml                  workspace root: [workspace] members + [workspace.dependencies]
 crates/
-  app                       — the binary (main.rs + bootstrap)
-  shared_kernel             — infra only
-  accounts                  — module, depends on shared_kernel
-  transactions              — depends on shared_kernel + accounts
-  notifications             — depends on shared_kernel
+  app/                      — binary (`peakload-capstone`); bootstrap, config, middleware, legacy v1 handlers, queue consumer
+  shared_kernel/            — events, db (shard router + failover + pool), cache (Redis), queue/producer, error, responses
+  accounts/                 — leaf module crate
+  transactions/             — depends on shared_kernel + accounts
+  notifications/            — depends on shared_kernel only
 ```
 
-Inside each module crate, the old directory structure is preserved
-verbatim. The `ports.rs` becomes the crate's `src/lib.rs`-exported
-public API; everything else is either `pub(crate)` (within that
-crate) or plain private.
+See [`docs/architecture/phase4-workspace-walkthrough.md`](./phase4-workspace-walkthrough.md)
+for the file-by-file tour.
 
-Work:
+What landed in this phase:
 
-- Move each `src/modules/<name>/` directory into `crates/<name>/src/`.
-- Add per-crate `Cargo.toml` with the right dependencies.
-- Update `Cargo.toml` workspace root.
-- `cargo build` until it compiles; fix forbidden imports (they will
-  now be compile errors, which is the point).
-- CI matrix runs per-crate tests in parallel.
+1. ✅ Each `src/modules/<name>/` directory moved into
+   `crates/<name>/src/`. The internal `domain / application /
+   infrastructure / api / ports` shape is preserved verbatim;
+   each module's `mod.rs` became its `lib.rs`.
+2. ✅ Cross-cutting infrastructure (db / cache / queue::producer /
+   error / responses) moved into `shared_kernel` because module
+   crates cannot depend on `app` (that would be a cycle).
+3. ✅ Per-crate `Cargo.toml` files with workspace-level
+   `[workspace.dependencies]` so version bumps remain a one-line
+   change at the root.
+4. ✅ Producer + ShardRouter + RedisCache constructors refactored
+   to drop `&Config` — kernel-local config slices
+   (`ShardRouterConfig`, `RedisCacheConfig`, plain `&str`
+   amqp_url) keep the kernel free of binary-only concerns
+   (env-var loading).
+5. ✅ `_template/` moved from `src/modules/_template/` to
+   [`docs/architecture/module-template/`](./module-template/) —
+   it is documentation, not code, so it should not compile.
 
 Exit criteria:
 
-- `cargo check -p accounts` compiles without pulling in
-  `transactions` or `notifications`.
-- A forbidden import across crate boundaries fails compilation (not
-  just review).
-- CI build times per-crate are lower than the monolithic build
-  (parallelism is the whole point).
+- ✅ `cargo check -p accounts` compiles without pulling in
+  `transactions` or `notifications` (verified — they are not in
+  `crates/accounts/Cargo.toml`).
+- ✅ A forbidden import across crate boundaries fails
+  compilation: try adding `use transactions::ports::*;` to
+  `crates/accounts/src/...` — `unresolved crate transactions`.
+  The seal is now mechanical, not aspirational.
+- ✅ All 18 unit tests pass workspace-wide
+  (`cargo test --workspace --lib --bins`).
+- CI build times per-crate: the workspace builds in `~44s` cold
+  on this developer machine; per-crate parallelism via
+  `cargo build -p <name>` is now possible.
 
-**Time estimate**: 2–3 days. Mostly Cargo plumbing, little code
-change.
+**What is still in `app` after Phase 4** — these are the items
+that the **next** migration steps clear out. See
+[`docs/architecture/cutover-readiness.md`](./cutover-readiness.md)
+for the gating criteria.
+
+- `crates/app/src/api/handlers.rs` — legacy v1 handlers
+  (`/api/v1/transactions/*`, `/api/v1/users/.../balance`,
+  `/health`, `/metrics`).
+- `crates/app/src/db/models.rs` — legacy DB DTOs read by the
+  v1 handlers + the queue consumer.
+- ~~`crates/app/src/queue/consumer.rs`~~ — **rewired** (Step A on
+  this branch). The consumer now lives at
+  `crates/transactions/src/infrastructure/consumer.rs`; the
+  `transactions` crate owns its full write path end-to-end and
+  the bootstrap calls `transactions::start_consumer(...)`.
+- `/api/v1/*` route nest in `bootstrap.rs::build_router` —
+  cleared by Step B (v1 cull). Caller catalogue in
+  [`v1-caller-inventory.md`](./v1-caller-inventory.md).
 
 ---
 

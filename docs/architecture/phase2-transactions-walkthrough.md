@@ -5,6 +5,13 @@
 > Phase 2 follows the same shape; this doc focuses on what is
 > **different** — the cross-module dependency, the queue port, and
 > the idempotency dance.
+>
+> **Post-Phase-4 note**: this walkthrough was written when
+> transactions lived at `src/modules/transactions/`. After Phase 4
+> the same files live at `crates/transactions/src/`, and the
+> "depends on `accounts::ports`" claim is now a real Cargo edge
+> in `crates/transactions/Cargo.toml`. See
+> [phase4-workspace-walkthrough.md](./phase4-workspace-walkthrough.md).
 
 ## 1. The new pieces vs. accounts
 
@@ -148,32 +155,53 @@ infrastructure layer handles all the SQL + Redis details.
 These are the gaps documented in the module README. They are
 intentional, scoped, and tracked.
 
-### 6.1 Queue consumer rewire
+### 6.1 Queue consumer rewire — **DONE (Step A)**
 
-The consumer in `src/queue/consumer.rs` still:
+The consumer was relocated from `src/queue/consumer.rs` (now
+gone) into
+[`crates/transactions/src/infrastructure/consumer.rs`](../../crates/transactions/src/infrastructure/consumer.rs).
+The `transactions` crate now owns its full write path: HTTP
+handler → application service → producer → consumer → DB
+write. The bootstrap calls a single
+`transactions::start_consumer(amqp_url, shards, events, cancel)`
+from [`crates/app/src/app.rs`](../../crates/app/src/app.rs#L90-L96).
 
-- Reads `QueuePayload` directly from the queue.
-- Writes to the `transactions` and `users` tables itself via
-  raw `sqlx::query(...)` calls.
-- Does the cross-shard debit/credit dance with its own logic.
+What did **not** change in the move:
 
-A clean rewire moves all that DB work into a new use case,
-e.g. `transactions::application::ProcessBatch`, exposed
-through a new port method like
-`TransactionService::process_batch(messages) -> Result<...>`,
-backed by a sqlx implementation in `infrastructure/`. The
-consumer becomes a thin AMQP adapter that calls into the
-service.
+- Queue message wire shape (the `QueuePayload` struct).
+- Idempotency-key shape `txn:{shard}:{reference_id}` — v1
+  in-flight messages still match a v2 reservation byte-for-byte.
+- DLQ NACK behaviour on a malformed payload.
+- The `transactions.committed` event publish on every
+  successful flush.
+- The four metrics: `transactions_processed_total`,
+  `transactions_batch_size`, `dlq_messages_total`,
+  `events_published_total`.
+- Graceful-shutdown buffer-drain in the flush timer.
 
-The reason it was deferred: 446 lines of consumer logic
-including batched cross-shard transactions, error handling,
-DLQ semantics, and graceful shutdown. Doing it justice would
-double the size of this iteration.
+What did change:
 
-The consumer continues to work today because the queue
-**message shape** is unchanged: the new `QueueProducerAdapter`
-serialises the exact JSON the legacy producer sent, which is
-what the consumer expects.
+- Imports come from `shared_kernel::*` only — no
+  `crate::db::models::*`. The legacy
+  `CreateTransactionRequest` was duplicated as a
+  module-private wire DTO inside the consumer.
+- `app::App::new` no longer constructs the consumer
+  directly; the `app` crate's `Cargo.toml` no longer depends
+  on `amqprs`.
+- A regression test landed at
+  [`crates/transactions/tests/event_flow.rs`](../../crates/transactions/tests/event_flow.rs)
+  — Postgres + Redis + RabbitMQ via testcontainers, posts to
+  `/api/v2/transactions`, asserts a `transactions` row plus a
+  `notifications/recent` entry with the same `reference_id`.
+
+What was deferred for later (kept as a Phase-5-readiness
+follow-up): pulling the consumer's batched DB work into a
+proper `transactions::application::ProcessBatch` use case
+exposed through a port method, so the consumer becomes a thin
+AMQP adapter. Today the consumer still issues `sqlx::query`
+calls directly inside `infrastructure/`. Module-internal —
+not a cross-crate boundary issue, so it does not block the
+architecture story.
 
 ### 6.2 Cross-module dep activation — **DONE**
 
@@ -228,9 +256,15 @@ No `accounts::domain`, no `accounts::infrastructure`, no
 
 ### 6.3 Middleware parity
 
-Same gap as Phase 1 — v2 routes skip auth/rate-limit/circuit-
-breaker/backpressure. Will be addressed when a single
-middleware-stack helper lands in `bootstrap.rs`.
+✅ **closed.** Both v2 sub-routers (`accounts`, `transactions`)
+now share the v1 protection stack via the
+`apply_protection_stack` helper in
+[bootstrap.rs](../../src/bootstrap.rs). Order is preserved
+(`request → backpressure → circuit_breaker → rate_limit → auth →
+handler`), so a v2 client sees identical 401/429/503 behaviour
+to a v1 client. The helper is generic over router state so it
+wraps both `Router<AppState>` (v1) and `Router<()>` (v2) without
+duplication.
 
 ### 6.4 Integration tests
 
