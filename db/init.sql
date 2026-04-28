@@ -137,6 +137,44 @@ $$ LANGUAGE plpgsql;
 
 
 -- ============================================================
+-- Seed Data: 1,000,000 Test Accounts
+-- ============================================================
+-- Auto-seeded so no one needs to run extra scripts.
+-- Account format: ACC_0000001 through ACC_1000000
+-- All accounts start with a large balance and 'active' status.
+--
+-- Uses batch inserts (50k per batch) for fast bulk loading.
+-- ON CONFLICT ensures idempotency — safe to re-run.
+-- ============================================================
+
+DO $$
+DECLARE
+    batch_size  INT := 50000;
+    total       INT := 1000000;
+    batch_start INT := 1;
+BEGIN
+    RAISE NOTICE '[seed] Seeding % test accounts...', total;
+
+    WHILE batch_start <= total LOOP
+        INSERT INTO users (account_number, full_name, email, balance, status)
+        SELECT
+            'ACC_' || LPAD(i::text, 7, '0'),
+            'Test User ' || i,
+            'user_' || i || '@loadtest.local',
+            999999999.00,
+            'active'
+        FROM generate_series(batch_start, LEAST(batch_start + batch_size - 1, total)) AS s(i)
+        ON CONFLICT (account_number) DO NOTHING;
+
+        RAISE NOTICE '[seed] Inserted batch % – %', batch_start, LEAST(batch_start + batch_size - 1, total);
+        batch_start := batch_start + batch_size;
+    END LOOP;
+
+    RAISE NOTICE '[seed] Done. % accounts seeded.', total;
+END $$;
+
+
+-- ============================================================
 -- Replication: managed by Patroni via the `replicator` role
 -- declared in db/patroni/templates/patroni.yml.tmpl. This
 -- schema file is therefore independent of the HA orchestrator
