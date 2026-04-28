@@ -8,7 +8,12 @@ use crate::error::AppError;
 use super::pool::DatabasePool;
 
 /// Number of database shards.
-const NUM_SHARDS: usize = 3;
+///
+/// Temporarily reduced from 3 to 2 while shard 2 is commented out
+/// in docker-compose.yml / haproxy.cfg for resource conservation.
+/// Bump back to 3 in lockstep with re-enabling those blocks (see
+/// the "shard 2 disabled" markers across the repo).
+const NUM_SHARDS: usize = 2;
 
 /// Per-shard URL pair.
 #[derive(Debug, Clone)]

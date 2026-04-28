@@ -28,10 +28,9 @@ const MAX_ACCOUNT_LEN: usize = 50;
 
 // ─── Response DTO ──────────────────────────────────────────
 
-/// The shape the legacy `/api/v1/users/.../balance` endpoint
-/// returns. Kept byte-identical so integration tests can hit
-/// the v2 path and diff the JSON — proof that the new module
-/// preserves behaviour.
+/// Wire shape returned by the v2 balance endpoint. The structure
+/// is preserved verbatim from the pre-cull v1 response so cached
+/// entries and downstream clients see no diff across the cull.
 ///
 /// `Deserialize` is required so the Redis cache helper can
 /// decode a previously-cached value via
@@ -71,12 +70,11 @@ impl From<AccountError> for AppError {
 
 /// GET /api/v2/accounts/:account_number/balance
 ///
-/// Behaviour parity with the legacy
-/// `/api/v1/users/:account_number/balance`: same request path
-/// shape, same JSON response, same Redis cache key. The only
-/// difference is that the data path now goes through the
-/// `accounts` module's service trait, making the business
-/// logic swappable without touching the HTTP layer.
+/// Reads through the `accounts` module's service trait so the
+/// business logic stays swappable without touching the HTTP
+/// layer. Same JSON response shape and Redis cache key as the
+/// pre-cull v1 endpoint, so cached entries written before the
+/// v1 cull continue to serve until natural TTL expiry.
 pub(crate) async fn get_balance(
     State(deps): State<AccountsDeps>,
     Path(account_number): Path<String>,

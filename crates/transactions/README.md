@@ -1,100 +1,72 @@
-# `transactions` — money movement (module **A**, depends on `accounts`)
+# `transactions` — money movement
 
-> **Phase 2.** The module is wired and serves all four endpoints
-> under `/api/v2/transactions/*`. The legacy `/api/v1/transactions/*`
-> handlers in [`src/api/handlers.rs`](../../api/handlers.rs) remain
-> live; both paths share idempotency rows, Redis cache keys, and the
-> RabbitMQ queue, so a v2 POST and a v1 GET interoperate seamlessly.
->
-> **Read first:**
-> [../../../docs/architecture/phase2-transactions-walkthrough.md](../../../docs/architecture/phase2-transactions-walkthrough.md)
-> — file-by-file walkthrough mirroring the Phase 1 doc.
+Owns the full write path: HTTP handler → application service →
+RabbitMQ producer → consumer → DB write. Depends on `accounts`
+through `accounts::ports` only.
 
-## 1. What this module is for
+For module shape see [ADR-0003](../../docs/adr/0003-port-adapter-shape.md).
 
-Owns money movement between accounts: submission, lifecycle
-(`pending` → `processing` → `completed` / `failed` / `reversed`),
-the `transactions` table, and `idempotency_keys`. Wraps the
-RabbitMQ `peakload.transactions` exchange behind a domain port so
-the application layer never imports `amqprs`.
+## Tables owned
 
-## 2. Tables owned
+- `transactions` — one row per money-movement request.
+- `idempotency_keys` — request-replay protection. Will move to
+  `shared_kernel::idempotency` when a second module needs it.
 
-- `transactions`        — one row per money-movement request.
-- `idempotency_keys`    — request-replay protection. Lives here
-                          because the create use case is the only
-                          producer; will move to
-                          `shared_kernel::idempotency` once a
-                          second module needs it.
+## Ports exposed ([`ports.rs`](./src/ports.rs))
 
-No other module SELECTs or UPDATEs these tables.
-
-## 3. Ports exposed
-
-[`ports.rs`](./ports.rs) exposes:
-
-- `TransactionService` trait:
-  - `create(input)               -> TransactionAccepted`
-  - `get_by_id(id)               -> TransactionView`
-  - `list(filter)                -> Vec<TransactionView>`
-  - `get_status_by_reference(rid)-> TransactionStatusView`
-- DTOs: `TransactionId`, `CreateTransactionInput`,
-  `TransactionAccepted`, `TransactionView`,
-  `TransactionStatusView`, `ListFilter`.
+- `TransactionService` trait
+  - `create(input)                -> TransactionAccepted`
+  - `get_by_id(id)                -> TransactionView`
+  - `list(filter)                 -> Vec<TransactionView>`
+  - `get_status_by_reference(rid) -> TransactionStatusView`
+- DTOs: `TransactionId`, `CreateTransactionInput`, `TransactionAccepted`,
+  `TransactionView`, `TransactionStatusView`, `ListFilter`
 - Errors: `TransactionError` (`NotFound`, `Validation`,
-  `IdempotencyConflict`, `Infra`).
-- Type alias: `DynTransactionService`.
+  `IdempotencyConflict`, `Infra`)
+- Type alias: `DynTransactionService`
 
-## 4. Ports consumed
+## Ports consumed
 
-- `accounts::ports::DynAccountService` — **injected and
-  exercised**. `TransactionsService::create` calls
-  `accounts.get_balance(...)` to verify `from_account` exists
-  before reserving the idempotency row. First behavioural
-  divergence from v1: v2 fails fast with a 400 if the sender
-  is missing; v1 accepts and lets the consumer surface a
-  `failed` row downstream. See
-  [phase2 walkthrough §6.2](../../../docs/architecture/phase2-transactions-walkthrough.md).
+- `accounts::ports::DynAccountService` — `create` calls `get_balance`
+  to verify `from_account` exists before reserving the idempotency
+  row. Fails fast with 400 for missing accounts.
 
-## 5. Events published
+## Events published
 
-**None in Phase 2.** Planned for Phase 3 (when the event bus
-lands in `shared_kernel`):
+After Step-A consumer rewire, on successful commit:
+- `TransactionCommitted` — published from
+  [`infrastructure/consumer.rs`](./src/infrastructure/consumer.rs)
+  via `shared_kernel::events`
 
-- `TransactionAcceptedEvent`  — emitted on successful `create`.
-- `TransactionCommittedEvent` — emitted by the consumer after
-                                 a successful balance update.
-- `TransactionFailedEvent`    — emitted on terminal failure.
+Planned: `TransactionAcceptedEvent`, `TransactionFailedEvent`.
 
-## 6. Events consumed
+## HTTP surface
 
-**None.** A future iteration may consume
-`accounts::AccountStatusChanged` to fail in-flight transactions
-against newly-blocked accounts.
+```
+POST /api/v2/transactions
+GET  /api/v2/transactions
+GET  /api/v2/transactions/{id}
+GET  /api/v2/transactions/status/{reference_id}
+```
 
-## 7. Operational notes
+## Operational notes
 
-- **Idempotency is keyed by `txn:<shard>:<reference_id>`**; the
-  shard prefix matters because the same `reference_id` against
-  different `from_account`s must NOT collide.
-- **The Redis fast-path** mirrors the legacy handler — same
-  cache key, same 24h TTL — so v1 and v2 see each other's
-  reservations.
-- **Cross-shard reads** (`get_by_id`, `list`,
-  `get_status_by_reference`) fan out N parallel queries (one per
-  shard). The first hit wins for `find_by_id`; `list` merges and
-  resorts.
-- **Debit/credit atomicity** is NOT a property of this module
-  — it now lives in the module at
-  [`infrastructure/consumer.rs`](src/infrastructure/consumer.rs)
-  after the Step-A rewire (Phase 2 follow-up).
+- **Idempotency key**: `txn:<shard>:<reference_id>`. The shard prefix
+  matters because the same `reference_id` against different `from_account`s
+  must NOT collide.
+- **Cross-shard reads** (`get_by_id`, `list`, `get_status_by_reference`)
+  fan out one query per shard. First-hit wins for `get_by_id`; `list`
+  merges and re-sorts.
+- **Debit/credit atomicity** is enforced in
+  [`infrastructure/consumer.rs`](./src/infrastructure/consumer.rs)
+  inside a single transaction.
+- **DLQ**: bad-payload messages NACK to `transactions.dead_letter`.
+- **Metrics**: `transactions_processed_total`, `transactions_batch_size`,
+  `dlq_messages_total`, `events_published_total`.
 
-## 8. Intentional gaps (Phase 2)
+## Tests
 
-| Gap                                                       | Tracked in                                                   |
-|-----------------------------------------------------------|--------------------------------------------------------------|
-| Consumer issues raw `sqlx::query`, not a port method      | walkthrough §6.1 — Step A done; port-extraction deferred     |
-| No middleware parity on `/api/v2/*`                       | Phase 1 README; same gap                                     |
-| Legacy v1 handlers still live                             | Phase 1 README; cleared by Step B (v1 cull)                  |
-| `idempotency_keys` ownership will move to shared_kernel   | migration-plan Phase 3+                                       |
-| Event-flow integration test needs Docker to run           | `tests/event_flow.rs` — green when Docker is up               |
+[`tests/event_flow.rs`](./tests/event_flow.rs) — end-to-end:
+spin up Postgres + Redis + RabbitMQ via `testcontainers`, POST,
+await consumer flush, assert both a `transactions` row and a
+`notifications/recent` entry. Requires Docker.

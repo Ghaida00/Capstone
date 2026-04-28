@@ -89,16 +89,13 @@ bootstrap:
         checkpoint_completion_target: 0.9
         random_page_cost: 1.1
 
-  # Users created AFTER initdb but BEFORE Patroni reports the
-  # cluster as ready. The app database itself is created by
-  # the post_bootstrap hook below because Patroni's users:
-  # block does not create databases.
-  users:
-    ${POSTGRES_USER}:
-      password: ${POSTGRES_PASSWORD}
-      options:
-        - createrole
-        - createdb
+  # NOTE: Patroni 4.0 dropped the declarative `bootstrap.users:`
+  # block — it now logs:
+  #     "User creation is not be supported starting from
+  #      v4.0.0. Please use bootstrap.post_bootstrap script
+  #      to create users."
+  # The app login role is therefore created in
+  # post-bootstrap.sh alongside the app database.
 
   initdb:
     - encoding: UTF8

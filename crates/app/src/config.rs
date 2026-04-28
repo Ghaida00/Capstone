@@ -8,12 +8,22 @@ pub struct Config {
     pub host: String,
     pub port: u16,
 
-    // Database Shards (3 shards × write + reads)
+    // Database Shards (write + reads per shard).
+    // Shard 2 fields are kept populated for forward-compatibility
+    // but are no longer pushed into the ShardRouter — see the
+    // "shard 2 disabled" markers in src/bootstrap.rs and
+    // docker-compose.yml. To restore the 3-shard topology, flip
+    // those markers and bump NUM_SHARDS back to 3 in
+    // shared_kernel/src/db/shard.rs.
     pub database_shard0_write_url: String,
     pub database_shard0_read_urls: Vec<String>,
     pub database_shard1_write_url: String,
     pub database_shard1_read_urls: Vec<String>,
     pub database_shard2_write_url: String,
+    // Loaded from env but not currently wired into ShardRouter
+    // while shard 2 is disabled. Kept so re-enabling shard 2
+    // is a one-line flip in src/bootstrap.rs.
+    #[allow(dead_code)]
     pub database_shard2_read_urls: Vec<String>,
     pub db_write_pool_size: u32,
     pub db_read_pool_size: u32,

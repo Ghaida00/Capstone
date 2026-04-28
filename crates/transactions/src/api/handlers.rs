@@ -22,7 +22,9 @@ use super::super::ports::{
     TransactionStatusView, TransactionView,
 };
 
-// ─── Wire DTOs (parity with legacy /api/v1) ─────────────────
+// ─── Wire DTOs ──────────────────────────────────────────────
+// Shape is preserved from the pre-cull v1 endpoint so clients
+// see no JSON diff across the cull.
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CreateRequest {

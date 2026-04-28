@@ -1,9 +1,10 @@
 //! `accounts` module (B) — user accounts and balances.
 //!
-//! Phase 1 parallel implementation. Lives alongside the original
-//! `src/api/handlers::get_balance` endpoint without deleting it;
-//! the new module is mounted at `/api/v2/accounts/*`, the old path
-//! stays at `/api/v1/users/{account_number}/balance`.
+//! Mounted at `/api/v2/accounts/*` and the canonical surface for
+//! account reads. The original `/api/v1/users/{account_number}/balance`
+//! endpoint was deleted in the post-Phase-4 v1 cull (Step B);
+//! `users` → `accounts` was a resource rename, not just a version
+//! bump.
 //!
 //! See `docs/architecture/phase1-accounts-walkthrough.md` for a
 //! newbie/intern-friendly explanation of every file in this tree

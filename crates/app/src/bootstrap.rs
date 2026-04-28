@@ -5,7 +5,7 @@ use axum::{
     error_handling::HandleErrorLayer,
     http::{HeaderValue, StatusCode},
     middleware as axum_middleware,
-    routing::{get, post},
+    routing::get,
     BoxError, Router,
 };
 use tokio_util::sync::CancellationToken;
@@ -173,10 +173,12 @@ pub async fn init_infrastructure(
                 write_url: config.database_shard1_write_url.clone(),
                 read_urls: config.database_shard1_read_urls.clone(),
             },
-            ShardUrls {
-                write_url: config.database_shard2_write_url.clone(),
-                read_urls: config.database_shard2_read_urls.clone(),
-            },
+            // Shard 2 disabled — see "shard 2 disabled" markers in
+            // docker-compose.yml / haproxy.cfg / shard.rs.
+            // ShardUrls {
+            //     write_url: config.database_shard2_write_url.clone(),
+            //     read_urls: config.database_shard2_read_urls.clone(),
+            // },
         ],
         write_pool_size: config.db_write_pool_size,
         read_pool_size: config.db_read_pool_size,
@@ -254,49 +256,17 @@ pub fn build_router(
         enabled: config.enable_auth,
     };
 
-    let api_routes = apply_protection_stack(
-        Router::new()
-            .route(
-                "/transactions",
-                post(crate::api::handlers::create_transaction),
-            )
-            .route(
-                "/transactions",
-                get(crate::api::handlers::list_transactions),
-            )
-            .route(
-                "/transactions/{id}",
-                get(crate::api::handlers::get_transaction),
-            )
-            .route(
-                "/transactions/status/{reference_id}",
-                get(crate::api::handlers::get_transaction_status),
-            )
-            .route(
-                "/users/{account_number}/balance",
-                get(crate::api::handlers::get_balance),
-            ),
-        auth_state.clone(),
-        rate_limiter.clone(),
-        circuit_breaker.clone(),
-        backpressure.clone(),
-    );
-
     // Fix #10: Build CORS layer from configuration
     let cors = build_cors_layer(config);
 
-    // ─── Phase 1 modular-monolith: mount `/api/v2/accounts/*` ───
+    // ─── Modular-monolith routers ───────────────────────────
     //
-    // See docs/architecture/phase1-accounts-walkthrough.md. The
-    // new module owns its own HTTP surface at `/api/v2/accounts`
-    // and lives PARALLEL to the legacy `/api/v1/users/.../balance`
-    // endpoint — both paths serve identical responses until the
-    // cutover task deletes the legacy handler.
-    //
-    // Phase 1/2 exit-criteria: the v2 sub-routers reuse the SAME
-    // protection stack as v1 (auth → rate-limit → circuit-breaker →
-    // backpressure) via `apply_protection_stack`. A v2 client now
-    // experiences identical 401/429/503 behaviour to a v1 client.
+    // After Step B (the v1 cull) the only HTTP surface is the
+    // three v2 sub-routers + `/health` + `/metrics`. Each
+    // sub-router carries the same protection stack
+    // (auth → rate-limit → circuit-breaker → backpressure) via
+    // `apply_protection_stack`, so a v2 client experiences
+    // identical 401/429/503 semantics across modules.
     let accounts_deps = accounts::init(state.shard_router.clone(), state.cache.clone());
     let accounts_router = apply_protection_stack(
         accounts::router(accounts_deps.clone()),
@@ -353,12 +323,11 @@ pub fn build_router(
     // mismatch without forcing module deps to implement
     // `FromRef<AppState>`.
     Router::new()
-        .nest("/api/v1", api_routes)
         .nest_service("/api/v2/accounts", accounts_router)
         .nest_service("/api/v2/transactions", transactions_router)
         .nest_service("/api/v2/notifications", notifications_router)
-        .route("/health", get(crate::api::handlers::health_check))
-        .route("/metrics", get(crate::api::handlers::prometheus_metrics))
+        .route("/health", get(crate::health::health_check))
+        .route("/metrics", get(crate::health::prometheus_metrics))
         .with_state(state)
         .layer(axum_middleware::from_fn(
             crate::middleware::request_id::request_id_middleware,
@@ -398,13 +367,13 @@ pub fn build_router(
 ///   request → backpressure → circuit_breaker → rate_limit → auth → handler
 /// ```
 ///
-/// This is the SAME stack used by the legacy `/api/v1/*` routes and the
-/// modular `/api/v2/{accounts,transactions}/*` sub-routers, so a v2
-/// client experiences identical 401 / 429 / 503 semantics to a v1
-/// client. The helper is generic over the router state so it works for
-/// `Router<AppState>` (v1, state applied later by the caller) and
-/// `Router<()>` (v2, state already applied inside the module's
-/// `router()` constructor).
+/// Applied to every `/api/v2/{accounts,transactions,notifications}/*`
+/// sub-router so they all share identical 401/429/503 semantics.
+/// (Originally also applied to the legacy `/api/v1/*` routes; those
+/// were removed in the Step-B v1 cull.) Generic over the router
+/// state so each module's `router()` — which already applied its
+/// own deps state and returns `Router<()>` — composes cleanly under
+/// `nest_service`.
 fn apply_protection_stack<S>(
     router: Router<S>,
     auth_state: crate::middleware::auth::AuthState,

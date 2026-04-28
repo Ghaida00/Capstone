@@ -16,8 +16,7 @@ use axum::Router;
 use super::infrastructure::AccountsDeps;
 
 /// Build the module's sub-router. Bootstrap mounts this under
-/// the `/api/v2/accounts` prefix so it coexists with the legacy
-/// `/api/v1/users/{account_number}/balance` endpoint.
+/// the `/api/v2/accounts` prefix.
 pub fn router(deps: AccountsDeps) -> Router {
     Router::new()
         .route("/{account_number}/balance", get(handlers::get_balance))

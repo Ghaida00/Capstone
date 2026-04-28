@@ -12,11 +12,14 @@ x-logging: &default-logging
 # ============================================================
 # Patroni anchors
 # ------------------------------------------------------------
-# All six Postgres nodes (3 shards × 2) run the same custom
-# image defined in db/patroni/Dockerfile: PostgreSQL 18.3 on
-# bookworm + Patroni 4.x + python-etcd3 + envsubst. Patroni
-# renders a per-node config from templates/patroni.yml.tmpl
-# at container start and then IS the PG process manager.
+# All Postgres nodes (currently 2 shards × 2 — shard 2 is
+# commented out below for resource conservation; flip it back
+# on to return to the documented 3×2 topology) run the same
+# custom image defined in db/patroni/Dockerfile: PostgreSQL
+# 18.3 on bookworm + Patroni 4.x + python-etcd3 + envsubst.
+# Patroni renders a per-node config from
+# templates/patroni.yml.tmpl at container start and then IS
+# the PG process manager.
 #
 # See docs/ha-architecture.md and db/patroni/README.md for
 # the full rationale — notably why we chose Patroni over
@@ -70,12 +73,16 @@ x-pg-node-deploy: &pg-node-deploy
 # etcd anchors
 # ------------------------------------------------------------
 # Patroni's DCS. Three-node cluster so we tolerate one loss
-# without losing quorum. Bitnami image for its sensible
-# default configuration; CLI (etcdctl) ships with it so the
-# operational cheatsheet in db/patroni/README.md works.
+# without losing quorum. Upstream `quay.io/coreos/etcd` image
+# (the canonical etcd-io build, also shipped inside Kubernetes)
+# instead of the Bitnami image — Broadcom retired large parts
+# of the free Bitnami catalogue mid-2025 and `bitnami/etcd:*`
+# tags now intermittently return "manifest unknown". Upstream
+# ships `etcdctl` at `/usr/local/bin/etcdctl` so the
+# operational cheatsheet in db/patroni/README.md still works.
 # ============================================================
 x-etcd-common: &etcd-common
-  image: bitnami/etcd:3.6
+  image: quay.io/coreos/etcd:v3.6.5
   restart: unless-stopped
   logging: *default-logging
   networks:
@@ -93,16 +100,16 @@ x-etcd-common: &etcd-common
         cpus: "0.15"
 
 x-etcd-env-common: &etcd-env-common
-  ALLOW_NONE_AUTHENTICATION: "yes"
+  # Upstream etcd has auth disabled by default — no
+  # `ALLOW_NONE_AUTHENTICATION` (Bitnami-only) needed. We run
+  # this on a trusted overlay network so unauthenticated peer
+  # access is acceptable for the capstone.
+  ETCD_DATA_DIR: "/etcd-data"
   ETCD_INITIAL_CLUSTER: "etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380"
   ETCD_INITIAL_CLUSTER_STATE: "new"
   ETCD_INITIAL_CLUSTER_TOKEN: "peakload-etcd-cluster"
   ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
   ETCD_LISTEN_PEER_URLS: "http://0.0.0.0:2380"
-  # Bitnami image needs this to suppress its auth prompt on
-  # fresh startups; we run a trusted overlay network so no
-  # auth is acceptable for the capstone.
-  ETCD_DISABLE_STORE_MEMBER_ID: "false"
 
 # ============================================================
 # pgBouncer anchors
@@ -264,8 +271,9 @@ services:
         condition: service_healthy
       pgbouncer-shard1:
         condition: service_healthy
-      pgbouncer-shard2:
-        condition: service_healthy
+      # Shard 2 disabled — see "SHARD 2" block below.
+      # pgbouncer-shard2:
+      #   condition: service_healthy
       db-bootstrap-schema:
         condition: service_completed_successfully
       redis-master:
@@ -312,7 +320,7 @@ services:
       ETCD_ADVERTISE_CLIENT_URLS: "http://etcd-1:2379"
       ETCD_INITIAL_ADVERTISE_PEER_URLS: "http://etcd-1:2380"
     volumes:
-      - etcd_1_data:/bitnami/etcd
+      - etcd_1_data:/etcd-data
 
   etcd-2:
     <<: *etcd-common
@@ -323,7 +331,7 @@ services:
       ETCD_ADVERTISE_CLIENT_URLS: "http://etcd-2:2379"
       ETCD_INITIAL_ADVERTISE_PEER_URLS: "http://etcd-2:2380"
     volumes:
-      - etcd_2_data:/bitnami/etcd
+      - etcd_2_data:/etcd-data
 
   etcd-3:
     <<: *etcd-common
@@ -334,7 +342,7 @@ services:
       ETCD_ADVERTISE_CLIENT_URLS: "http://etcd-3:2379"
       ETCD_INITIAL_ADVERTISE_PEER_URLS: "http://etcd-3:2380"
     volumes:
-      - etcd_3_data:/bitnami/etcd
+      - etcd_3_data:/etcd-data
 
   # ============================================================
   # SHARD 0 — two Patroni-managed nodes
@@ -459,59 +467,73 @@ services:
     deploy: *pgbouncer-deploy
 
   # ============================================================
-  # SHARD 2 — two Patroni-managed nodes (scope peakload-shard2)
+  # SHARD 2 — DISABLED (resource-conservation mode)
+  # ------------------------------------------------------------
+  # Temporarily commented out to keep host memory/CPU within
+  # capstone-dev limits. The Rust shard router, HAProxy, and
+  # bootstrap script have all been narrowed to two shards in
+  # lockstep — re-enabling shard 2 means flipping all of:
+  #   * this block + the `pg_shard2_*` volumes at the bottom
+  #   * pgbouncer-shard2 dependency on the `app` service above
+  #   * pg-shard2-node-{a,b} entries in pg-haproxy.depends_on
+  #   * PG_HAPROXY_PORTS env on db-bootstrap-schema (add 5002)
+  #   * SHARD 2 frontend/backend in haproxy/haproxy.cfg
+  #   * NUM_SHARDS = 3 in crates/shared_kernel/src/db/shard.rs
+  #   * the third ShardUrls entry in crates/app/src/bootstrap.rs
+  #   * database_shard2_* fields in crates/app/src/config.rs
+  #   * DATABASE_SHARD2_* in .env.example / .env
   # ============================================================
-  pg-shard2-node-a:
-    <<: *pg-node-common
-    container_name: peakload-pg-shard2-node-a
-    environment:
-      <<: *pg-node-env
-      PATRONI_SCOPE:    peakload-shard2
-      PATRONI_NAME:     shard2-a
-      PATRONI_HOSTNAME: pg-shard2-node-a
-    volumes:
-      - pg_shard2_node_a_data:/var/lib/postgresql/data
-    depends_on:
-      etcd-1:
-        condition: service_healthy
-      etcd-2:
-        condition: service_healthy
-      etcd-3:
-        condition: service_healthy
-    deploy: *pg-node-deploy
-
-  pg-shard2-node-b:
-    <<: *pg-node-common
-    container_name: peakload-pg-shard2-node-b
-    environment:
-      <<: *pg-node-env
-      PATRONI_SCOPE:    peakload-shard2
-      PATRONI_NAME:     shard2-b
-      PATRONI_HOSTNAME: pg-shard2-node-b
-    volumes:
-      - pg_shard2_node_b_data:/var/lib/postgresql/data
-    depends_on:
-      etcd-1:
-        condition: service_healthy
-      etcd-2:
-        condition: service_healthy
-      etcd-3:
-        condition: service_healthy
-      pg-shard2-node-a:
-        condition: service_started
-    deploy: *pg-node-deploy
-
-  pgbouncer-shard2:
-    <<: *pgbouncer-common
-    container_name: peakload-pgbouncer-shard2
-    environment:
-      <<: *pgbouncer-env
-      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-haproxy:5002/${POSTGRES_DB}
-    depends_on:
-      pg-haproxy:
-        condition: service_healthy
-    healthcheck: *pgbouncer-healthcheck
-    deploy: *pgbouncer-deploy
+  # pg-shard2-node-a:
+  #   <<: *pg-node-common
+  #   container_name: peakload-pg-shard2-node-a
+  #   environment:
+  #     <<: *pg-node-env
+  #     PATRONI_SCOPE:    peakload-shard2
+  #     PATRONI_NAME:     shard2-a
+  #     PATRONI_HOSTNAME: pg-shard2-node-a
+  #   volumes:
+  #     - pg_shard2_node_a_data:/var/lib/postgresql/data
+  #   depends_on:
+  #     etcd-1:
+  #       condition: service_healthy
+  #     etcd-2:
+  #       condition: service_healthy
+  #     etcd-3:
+  #       condition: service_healthy
+  #   deploy: *pg-node-deploy
+  #
+  # pg-shard2-node-b:
+  #   <<: *pg-node-common
+  #   container_name: peakload-pg-shard2-node-b
+  #   environment:
+  #     <<: *pg-node-env
+  #     PATRONI_SCOPE:    peakload-shard2
+  #     PATRONI_NAME:     shard2-b
+  #     PATRONI_HOSTNAME: pg-shard2-node-b
+  #   volumes:
+  #     - pg_shard2_node_b_data:/var/lib/postgresql/data
+  #   depends_on:
+  #     etcd-1:
+  #       condition: service_healthy
+  #     etcd-2:
+  #       condition: service_healthy
+  #     etcd-3:
+  #       condition: service_healthy
+  #     pg-shard2-node-a:
+  #       condition: service_started
+  #   deploy: *pg-node-deploy
+  #
+  # pgbouncer-shard2:
+  #   <<: *pgbouncer-common
+  #   container_name: peakload-pgbouncer-shard2
+  #   environment:
+  #     <<: *pgbouncer-env
+  #     DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-haproxy:5002/${POSTGRES_DB}
+  #   depends_on:
+  #     pg-haproxy:
+  #       condition: service_healthy
+  #   healthcheck: *pgbouncer-healthcheck
+  #   deploy: *pgbouncer-deploy
 
   # ============================================================
   # pg-haproxy — role-aware write router
@@ -527,7 +549,7 @@ services:
   # public internet.
   # ============================================================
   pg-haproxy:
-    image: haproxy:3.2-alpine
+    image: haproxy:3.3-alpine
     container_name: peakload-pg-haproxy
     volumes:
       - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
@@ -536,7 +558,8 @@ services:
     expose:
       - "5000"
       - "5001"
-      - "5002"
+      # Shard 2 disabled.
+      # - "5002"
     depends_on:
       pg-shard0-node-a:
         condition: service_healthy
@@ -546,10 +569,11 @@ services:
         condition: service_healthy
       pg-shard1-node-b:
         condition: service_healthy
-      pg-shard2-node-a:
-        condition: service_healthy
-      pg-shard2-node-b:
-        condition: service_healthy
+      # Shard 2 disabled.
+      # pg-shard2-node-a:
+      #   condition: service_healthy
+      # pg-shard2-node-b:
+      #   condition: service_healthy
     healthcheck:
       # Stats page on :7000 is served unconditionally once
       # HAProxy is up, so this is a cheap liveness probe.
@@ -598,7 +622,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB:       ${POSTGRES_DB:?set POSTGRES_DB in .env}
       PG_HAPROXY_HOST:   pg-haproxy
-      PG_HAPROXY_PORTS:  "5000 5001 5002"
+      # Shard 2 disabled — was "5000 5001 5002".
+      PG_HAPROXY_PORTS:  "5000 5001"
     volumes:
       - ./db/bootstrap/bootstrap-schema.sh:/opt/bootstrap-schema.sh:ro
       - ./db/init.sql:/sql/init.sql:ro
@@ -830,8 +855,9 @@ volumes:
   pg_shard0_node_b_data:
   pg_shard1_node_a_data:
   pg_shard1_node_b_data:
-  pg_shard2_node_a_data:
-  pg_shard2_node_b_data:
+  # Shard 2 disabled.
+  # pg_shard2_node_a_data:
+  # pg_shard2_node_b_data:
   redis_data:
   rabbitmq_data:
   prometheus_data:

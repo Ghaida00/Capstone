@@ -65,14 +65,15 @@ async fn post_v2_transaction_lands_in_db_and_notifications() {
     // ── 4. Infra ───────────────────────────────────────────
     let cancel = CancellationToken::new();
 
-    // ShardRouter requires exactly NUM_SHARDS (3); point all three
+    // ShardRouter requires exactly NUM_SHARDS (currently 2 —
+    // shard 2 is disabled for resource conservation); point both
     // at the same Postgres so routing is degenerate but valid.
     let single = ShardUrls {
         write_url: pg_url.clone(),
         read_urls: vec![pg_url.clone()],
     };
     let shard_config = ShardRouterConfig {
-        shards: vec![single.clone(), single.clone(), single],
+        shards: vec![single.clone(), single],
         write_pool_size: 4,
         read_pool_size: 4,
         health_check_interval_secs: 60,

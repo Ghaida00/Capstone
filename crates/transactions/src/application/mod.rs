@@ -171,12 +171,10 @@ impl TransactionService for TransactionsService {
         // `users` table directly, even though we technically
         // could from a sqlx-aware module.
         //
-        // BEHAVIOURAL DIVERGENCE FROM v1: the legacy
-        // `/api/v1/transactions` does not validate the sender
-        // exists — it just queues the message and the consumer
-        // discovers the missing account when the debit UPDATE
-        // matches zero rows. v2 fails fast with a 400 instead.
-        // Acceptable divergence: it's a stricter, clearer error.
+        // Originally a divergence from the now-removed v1
+        // endpoint (which queued blindly and let the consumer
+        // surface a `failed` row downstream). After the v1 cull,
+        // fail-fast 400 is the only behaviour.
         match self
             .accounts
             .get_balance(&AccountId(input.from_account.clone()))

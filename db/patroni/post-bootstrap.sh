@@ -34,14 +34,40 @@ set -eu
 
 : "${POSTGRES_DB:?POSTGRES_DB must be set}"
 : "${POSTGRES_USER:?POSTGRES_USER must be set}"
+: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
 
+# ------------------------------------------------------------
+# 1. Create the app login role.
+# ------------------------------------------------------------
+# Patroni 4.0 dropped the declarative `bootstrap.users:` block
+# ("User creation is not be supported starting from v4.0.0.
+# Please use bootstrap.post_bootstrap script to create users.")
+# so we do it here instead. Idempotent: \gexec only fires when
+# the role is missing, and ALTER ROLE … PASSWORD on an existing
+# role is a safe no-op for re-runs.
+#
+# Patroni's post_bootstrap hook is invoked with psql-style args
+# pre-appended ($@ already contains `-h /tmp -d postgres` etc.),
+# so psql only needs `-c` / `<<SQL`.
+# ------------------------------------------------------------
+echo "[post-bootstrap] Ensuring role ${POSTGRES_USER} exists..."
+psql "$@" -v ON_ERROR_STOP=1 <<SQL
+SELECT format(
+    'CREATE ROLE %I LOGIN PASSWORD %L CREATEDB CREATEROLE',
+    '${POSTGRES_USER}', '${POSTGRES_PASSWORD}'
+)
+WHERE NOT EXISTS (
+    SELECT 1 FROM pg_roles WHERE rolname = '${POSTGRES_USER}'
+)\gexec
+
+ALTER ROLE "${POSTGRES_USER}" WITH PASSWORD '${POSTGRES_PASSWORD}';
+SQL
+
+# ------------------------------------------------------------
+# 2. Create the app database owned by that role.
+# ------------------------------------------------------------
 echo "[post-bootstrap] Creating database ${POSTGRES_DB} owned by ${POSTGRES_USER} (if missing)..."
-
-# Patroni's post_bootstrap hook is invoked by calling the
-# script with psql-style args pre-appended. That means $@
-# contains things like `-h /tmp -d postgres` already. We can
-# piggyback on it to talk to the local cluster.
-psql "$@" <<SQL
+psql "$@" -v ON_ERROR_STOP=1 <<SQL
 SELECT 'CREATE DATABASE ${POSTGRES_DB} OWNER ${POSTGRES_USER}'
 WHERE NOT EXISTS (
     SELECT 1 FROM pg_database WHERE datname = '${POSTGRES_DB}'

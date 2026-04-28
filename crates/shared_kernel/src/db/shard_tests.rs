@@ -11,7 +11,7 @@ mod tests {
 
     #[test]
     fn shard_for_returns_valid_index() {
-        // NUM_SHARDS is 3 in the current codebase
+        // NUM_SHARDS is 2 in the current codebase (shard 2 disabled).
         for account in [
             "alice",
             "bob",
@@ -23,7 +23,7 @@ mod tests {
         ] {
             let shard = ShardRouter::shard_for(account);
             assert!(
-                shard < 3,
+                shard < 2,
                 "Shard index {} out of range for account {:?}",
                 shard,
                 account
@@ -34,14 +34,14 @@ mod tests {
     #[test]
     fn shard_for_distributes_across_shards() {
         let mut seen = std::collections::HashSet::new();
-        // With enough unique inputs, both shards should be hit
+        // With enough unique inputs, all shards should be hit.
         for i in 0..100 {
             seen.insert(ShardRouter::shard_for(&format!("account-{}", i)));
         }
         assert_eq!(
             seen.len(),
-            3,
-            "Expected all 3 shards to be used across 100 accounts"
+            2,
+            "Expected all 2 shards to be used across 100 accounts"
         );
     }
 }
@@ -57,7 +57,7 @@ mod proptests {
         #[test]
         fn shard_for_always_in_range(account in ".*") {
             let shard = ShardRouter::shard_for(&account);
-            prop_assert!(shard < 3, "Shard index {} out of range for {:?}", shard, account);
+            prop_assert!(shard < 2, "Shard index {} out of range for {:?}", shard, account);
         }
 
         #[test]

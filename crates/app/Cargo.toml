@@ -25,7 +25,7 @@ tower-http = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
 
-# DB / cache (still used by middleware + legacy v1 handlers)
+# DB / cache (consumed by middleware)
 sqlx = { workspace = true }
 rust_decimal = { workspace = true }
 redis = { workspace = true }

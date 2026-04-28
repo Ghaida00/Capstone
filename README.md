@@ -70,6 +70,13 @@ Untuk kepentingan pengembangan (_development_) serta pengujian aplikasi (_tests_
   k6 run k6/load-test-1m.js
   ```
 
+### 📚 Documentation
+
+- [docs/architecture.md](docs/architecture.md) — single-page system overview (start here)
+- [docs/adr/](docs/adr/) — architecture decision records (the *why*)
+- [docs/apiContract.yaml](docs/apiContract.yaml) — OpenAPI 2.0 contract
+- Per-crate `README.md` under [crates/](crates/) — what each module owns
+
 ### 🛑 Menghentikan Layanan
 Ketika Anda sudah selesai, matikan environment infrastrukturnya dengan perintah:
 ```bash

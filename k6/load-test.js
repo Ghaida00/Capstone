@@ -117,7 +117,7 @@ export default function () {
     };
 
     const res = http.post(
-      `${BASE_URL}/api/v1/transactions`,
+      `${BASE_URL}/api/v2/transactions`,
       payload,
       params
     );
@@ -146,7 +146,7 @@ export default function () {
 
   group("List Transactions", () => {
     const res = http.get(
-      `${BASE_URL}/api/v1/transactions?limit=10&offset=0`
+      `${BASE_URL}/api/v2/transactions?limit=10&offset=0`
     );
 
     check(res, {

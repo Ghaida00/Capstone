@@ -70,5 +70,13 @@ RUN chmod +x /opt/patroni-entrypoint.sh /var/lib/patroni/post-bootstrap.sh \
 # The base image's ENTRYPOINT runs docker-entrypoint.sh which
 # expects to manage PG itself. We bypass it completely —
 # Patroni owns the PG process end-to-end.
-USER postgres
+#
+# Entrypoint runs as root so it can `chown postgres:postgres
+# $PGDATA` before starting Patroni. On Docker Desktop / WSL2
+# a freshly-created named volume mounts with root-owned dir
+# perms regardless of the image's mountpoint owner, which
+# made initdb fail with "could not change permissions of
+# directory ... Operation not permitted". The entrypoint
+# drops to UID 999 via `gosu postgres` before exec'ing
+# Patroni, so the running daemon is unprivileged.
 ENTRYPOINT ["/opt/patroni-entrypoint.sh"]

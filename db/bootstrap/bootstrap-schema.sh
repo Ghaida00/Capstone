@@ -24,7 +24,9 @@
 #   POSTGRES_DB
 #   PG_HAPROXY_HOST    Usually `pg-haproxy`
 #   PG_HAPROXY_PORTS   Space-separated shard primary ports,
-#                      e.g. "5000 5001 5002"
+#                      e.g. "5000 5001" (shard 2 currently
+#                      disabled; restore "5002" when shard 2
+#                      is re-enabled).
 #
 # This script lives under `db/bootstrap/` rather than
 # `db/patroni/` precisely because it is **not** tied to the
@@ -38,7 +40,10 @@ set -eu
 : "${POSTGRES_PASSWORD:?}"
 : "${POSTGRES_DB:?}"
 : "${PG_HAPROXY_HOST:=pg-haproxy}"
-: "${PG_HAPROXY_PORTS:=5000 5001 5002}"
+# Shard 2 disabled — was "5000 5001 5002". The compose file
+# already overrides PG_HAPROXY_PORTS, so this default only
+# matters for ad-hoc invocations.
+: "${PG_HAPROXY_PORTS:=5000 5001}"
 
 export PGPASSWORD="$POSTGRES_PASSWORD"
 

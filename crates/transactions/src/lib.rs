@@ -1,9 +1,10 @@
 //! `transactions` module (A) — money movement.
 //!
-//! Phase 2 parallel implementation. Mounted under
-//! `/api/v2/transactions/*` alongside the legacy
-//! `/api/v1/transactions/*` handlers, both pointing at the same
-//! shards / Redis / RabbitMQ.
+//! Mounted under `/api/v2/transactions/*` and the canonical
+//! surface for the write path. The legacy `/api/v1/transactions/*`
+//! handlers were deleted in the post-Phase-4 v1 cull (Step B);
+//! the consumer they shared the queue with also lives here now
+//! at `infrastructure/consumer.rs` (Step A).
 //!
 //! See `docs/architecture/phase2-transactions-walkthrough.md`
 //! for the file-by-file tour. The module mirrors the shape of

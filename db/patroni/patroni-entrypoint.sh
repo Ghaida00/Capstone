@@ -87,11 +87,29 @@ envsubst '
 ' < /etc/patroni/patroni.yml.tmpl > "$RENDERED"
 
 # ------------------------------------------------------------
-# 2. Hand off to Patroni.
+# 2. Ensure PGDATA is owned by postgres.
 # ------------------------------------------------------------
-# `exec` so Patroni becomes PID 1 in the container and receives
-# SIGTERM directly from Docker on stack shutdown. That in turn
-# lets Patroni do an orderly pg_ctl stop -m fast of Postgres.
+# This script runs as root specifically so we can fix volume
+# ownership here. On Docker Desktop / WSL2 a freshly-created
+# named volume lands as root-owned regardless of the image's
+# mountpoint perms, which makes initdb fail with:
+#     "could not change permissions of directory
+#      /var/lib/postgresql/data: Operation not permitted"
+# Chown is idempotent and cheap on a populated PGDATA.
 # ------------------------------------------------------------
-echo "[patroni-entrypoint] Launching patroni..."
-exec patroni "$RENDERED"
+echo "[patroni-entrypoint] Ensuring $PGDATA owned by postgres"
+mkdir -p "$PGDATA"
+chown -R postgres:postgres "$PGDATA"
+chmod 0700 "$PGDATA"
+
+# ------------------------------------------------------------
+# 3. Hand off to Patroni as the postgres user.
+# ------------------------------------------------------------
+# `exec gosu` so Patroni becomes PID 1 in the container and
+# receives SIGTERM directly from Docker on stack shutdown.
+# That in turn lets Patroni do an orderly pg_ctl stop -m fast
+# of Postgres. gosu drops privileges cleanly without the
+# signal-forwarding pitfalls of su/sudo.
+# ------------------------------------------------------------
+echo "[patroni-entrypoint] Launching patroni as postgres..."
+exec gosu postgres patroni "$RENDERED"

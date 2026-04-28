@@ -11,11 +11,10 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod api;
 mod app;
 mod bootstrap;
 mod config;
-mod db;
+mod health;
 mod middleware;
 
 use shared_kernel::cache::redis::RedisCache;
