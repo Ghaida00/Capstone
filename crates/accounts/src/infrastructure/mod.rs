@@ -44,6 +44,6 @@ pub struct AccountsDeps {
 /// `app::bootstrap::build_router`.
 pub fn init(shards: ShardRouter, cache: RedisCache) -> AccountsDeps {
     let repo: Arc<dyn AccountRepository> = Arc::new(SqlxAccountRepository::new(shards));
-    let service: DynAccountService = Arc::new(GetBalanceService::new(repo));
+    let service: DynAccountService = Arc::new(GetBalanceService::new(repo, cache.clone()));
     AccountsDeps { service, cache }
 }

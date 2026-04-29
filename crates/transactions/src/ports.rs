@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -26,12 +27,17 @@ impl TransactionId {
 /// Input to the create use case. Strings (not typed AccountIds)
 /// because Phase 2 keeps wire-level parity with the legacy
 /// endpoint, which used plain strings.
+///
+/// `amount` is `Decimal` directly — the API layer already
+/// deserialised it; the previous `amount_str: String` round-tripped
+/// it through `to_string` + `Decimal::from_str` for no benefit.
+/// The publisher converts back to a quoted string at the queue
+/// boundary because the consumer wire format expects it that way.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CreateTransactionInput {
     pub from_account: String,
     pub to_account: String,
-    /// Decimal serialised as string at the wire boundary.
-    pub amount_str: String,
+    pub amount: Decimal,
     pub currency: String,
     pub reference_id: Option<String>,
     pub description: Option<String>,

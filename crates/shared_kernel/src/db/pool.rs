@@ -36,12 +36,19 @@ impl DatabasePool {
         write_pool_size: u32,
         read_pool_size: u32,
     ) -> Result<Self, AppError> {
+        // Aggressive acquire timeout (1s) keeps a saturated pool from
+        // gluing thousands of axum tasks to the connection queue —
+        // under load we'd rather shed than queue. min_connections is
+        // pre-warmed close to max so a cold start does not show up
+        // as a latency cliff at the start of a load test.
+        let write_min = (write_pool_size / 2).max(5);
         let write_pool = PgPoolOptions::new()
             .max_connections(write_pool_size)
-            .min_connections(5)
-            .acquire_timeout(Duration::from_secs(5))
+            .min_connections(write_min)
+            .acquire_timeout(Duration::from_secs(1))
             .idle_timeout(Duration::from_secs(300))
             .max_lifetime(Duration::from_secs(1800))
+            .test_before_acquire(false)
             .connect(write_url)
             .await
             .map_err(|e| AppError::Internal(format!("Write pool error: {}", e)))?;
@@ -56,13 +63,15 @@ impl DatabasePool {
             (read_pool_size / read_urls.len() as u32).max(5)
         };
 
+        let read_min = (per_replica_size / 2).max(3);
         for url in read_urls {
             match PgPoolOptions::new()
                 .max_connections(per_replica_size)
-                .min_connections(3)
-                .acquire_timeout(Duration::from_secs(5))
+                .min_connections(read_min)
+                .acquire_timeout(Duration::from_secs(1))
                 .idle_timeout(Duration::from_secs(300))
                 .max_lifetime(Duration::from_secs(1800))
+                .test_before_acquire(false)
                 .connect(url)
                 .await
             {

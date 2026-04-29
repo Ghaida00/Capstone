@@ -208,6 +208,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         // Mirrors legacy behaviour and short-circuits the DB
         // before we touch idempotency_keys.
         if let Ok(Some(cached)) = self.cache.get::<serde_json::Value>(idempotency_key).await {
+            metrics::counter!("idempotency_hits_total").increment(1);
             return Ok(ReserveOutcome::Replay(cached));
         }
 
@@ -268,6 +269,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
                 .response_payload
                 .unwrap_or_else(|| accepted_payload.clone());
             let _ = self.cache.set(idempotency_key, &payload, 86400).await;
+            metrics::counter!("idempotency_hits_total").increment(1);
             return Ok(ReserveOutcome::Replay(payload));
         }
 
@@ -303,6 +305,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
             .cache
             .set(idempotency_key, accepted_payload, 86400)
             .await;
+        metrics::counter!("idempotency_hits_total").increment(1);
         Ok(ReserveOutcome::Replay(accepted_payload.clone()))
     }
 }

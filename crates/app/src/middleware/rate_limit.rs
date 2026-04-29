@@ -7,10 +7,10 @@ use axum::{
 };
 use serde_json::json;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use shared_kernel::cache::redis::MasterPoolHandle;
@@ -20,6 +20,19 @@ struct CounterEntry {
     count: u64,
     window_start: Instant,
 }
+
+/// Number of independent shards. Each request hashes its IP to one
+/// shard, so contention is `1/N` of a single global lock under uniform
+/// load. Power of two so the modulo compiles to an `&`.
+const SHARDS: usize = 64;
+
+/// Sharded local-counter map. The previous implementation used a single
+/// `tokio::sync::RwLock<HashMap>` taken in WRITE mode for every request
+/// — every VU serialised through one async lock, blowing latency past
+/// 1 s under 500–1000 concurrent VUs. With 64 shards of `std::sync::Mutex`
+/// the critical section (hash + insert + cmp + increment) stays inside
+/// the synchronous fast path and almost never contends.
+type Shard = Mutex<HashMap<IpAddr, CounterEntry>>;
 
 /// Redis-based rate limiter with local in-memory cache.
 /// Each replica keeps per-IP counters in memory and syncs to Redis periodically.
@@ -35,8 +48,14 @@ pub struct RateLimiter {
     max_requests: u64,
     /// Window size in seconds
     window_secs: u64,
-    /// Local in-memory counters (IP → count within current window)
-    local_counters: Arc<RwLock<HashMap<IpAddr, CounterEntry>>>,
+    /// Sharded local counters (IP → count within current window)
+    shards: Arc<[Shard; SHARDS]>,
+}
+
+fn shard_for(ip: &IpAddr) -> usize {
+    let mut h = fnv::FnvHasher::default();
+    ip.hash(&mut h);
+    (h.finish() as usize) & (SHARDS - 1)
 }
 
 impl RateLimiter {
@@ -53,11 +72,14 @@ impl RateLimiter {
         }
         .max(1);
 
+        let shards: [Shard; SHARDS] =
+            std::array::from_fn(|_| Mutex::new(HashMap::with_capacity(64)));
+
         let limiter = Self {
             pool,
             max_requests: burst as u64,
             window_secs,
-            local_counters: Arc::new(RwLock::new(HashMap::with_capacity(1024))),
+            shards: Arc::new(shards),
         };
 
         // Fix #16: Spawn background task to sync local counters to Redis every second
@@ -89,10 +111,12 @@ impl RateLimiter {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let mut counters = cleanup_limiter.local_counters.write().await;
                         let now = Instant::now();
                         let window = std::time::Duration::from_secs(cleanup_limiter.window_secs);
-                        counters.retain(|_, entry| now.duration_since(entry.window_start) < window);
+                        for shard in cleanup_limiter.shards.iter() {
+                            let mut map = shard.lock().unwrap();
+                            map.retain(|_, e| now.duration_since(e.window_start) < window);
+                        }
                     }
                     _ = cleanup_cancel.cancelled() => {
                         tracing::info!("Rate limiter cleanup task: shutting down");
@@ -106,18 +130,18 @@ impl RateLimiter {
     }
 
     /// Check if a request from the given IP is allowed.
-    /// Uses fast local memory check — no Redis call per request.
-    async fn check(&self, ip: IpAddr) -> bool {
+    /// Synchronous — short critical section, never holds the lock across `await`.
+    fn check(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
         let window = std::time::Duration::from_secs(self.window_secs);
 
-        let mut counters = self.local_counters.write().await;
-        let entry = counters.entry(ip).or_insert(CounterEntry {
+        let shard = &self.shards[shard_for(&ip)];
+        let mut map = shard.lock().unwrap();
+        let entry = map.entry(ip).or_insert(CounterEntry {
             count: 0,
             window_start: now,
         });
 
-        // Reset window if expired
         if now.duration_since(entry.window_start) >= window {
             entry.count = 0;
             entry.window_start = now;
@@ -129,20 +153,27 @@ impl RateLimiter {
 
     /// Sync local counters to Redis (called periodically by background task).
     async fn sync_to_redis(&self) {
-        let counters = self.local_counters.read().await;
-        if counters.is_empty() {
+        // Snapshot all shards under their own locks, then drop locks before
+        // touching Redis. Redis I/O must never run while a request-path lock
+        // is held.
+        let mut snapshot: Vec<(IpAddr, u64)> = Vec::new();
+        for shard in self.shards.iter() {
+            let map = shard.lock().unwrap();
+            for (ip, entry) in map.iter() {
+                snapshot.push((*ip, entry.count));
+            }
+        }
+        if snapshot.is_empty() {
             return;
         }
 
-        // Best-effort sync — don't block if Redis is down.
-        // Handle follows Sentinel failover automatically.
         if let Ok(mut conn) = self.pool.get().await {
             let mut pipe = redis::pipe();
-            for (ip, entry) in counters.iter() {
+            for (ip, count) in &snapshot {
                 let key = format!("rl:global:{}", ip);
                 pipe.cmd("INCRBY")
                     .arg(&key)
-                    .arg(entry.count as i64)
+                    .arg(*count as i64)
                     .ignore();
                 pipe.cmd("EXPIRE")
                     .arg(&key)
@@ -168,11 +199,10 @@ pub async fn rate_limit_middleware(
         .and_then(|s| s.parse::<IpAddr>().ok())
         .unwrap_or_else(|| "127.0.0.1".parse().unwrap());
 
-    if limiter.check(ip).await {
+    if limiter.check(ip) {
         next.run(req).await
     } else {
         metrics::counter!("rate_limited_total").increment(1);
-        tracing::debug!(client_ip = %ip, "Rate limit exceeded");
         (
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", "1")],

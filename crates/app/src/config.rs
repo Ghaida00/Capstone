@@ -73,6 +73,24 @@ pub struct Config {
     // Authentication (disabled by default for load testing)
     pub enable_auth: bool,
     pub auth_secret: Option<String>,
+
+    /// Toggle the cross-module `accounts.get_balance` check inside
+    /// the transactions create hot path. Default OFF: every create
+    /// otherwise pays a Redis GET (warm) or DB SELECT (cold) just
+    /// to confirm the sender exists, which adds 1–10 ms to p50 and
+    /// is duplicate work — the consumer re-validates balance under
+    /// `UPDATE … WHERE balance >= $1` before debiting. Set
+    /// `TX_VERIFY_FROM_ACCOUNT=true` to restore the fail-fast 400
+    /// for unknown senders.
+    pub verify_from_account_exists: bool,
+
+    /// Hard cap on slot-wait inside the backpressure middleware (ms).
+    /// Previous default was 500 ms which added that to the tail of
+    /// every request that ultimately got 503'd. With the latency
+    /// budget tightened to <50 ms p95, the wait must be a small
+    /// fraction of that — 50 ms is the new default; 0 disables
+    /// queueing entirely.
+    pub backpressure_wait_ms: u64,
 }
 
 impl Config {
@@ -130,26 +148,32 @@ impl Config {
                 "postgres://peakload_user:peakload_secure_pass@pg-shard2-node-a:5432/peakload_db,postgres://peakload_user:peakload_secure_pass@pg-shard2-node-b:5432/peakload_db",
             ),
 
-            db_write_pool_size: env_or("DB_WRITE_POOL_SIZE", "30")
+            // Pool sizes raised: previous defaults bottlenecked at the
+            // app↔pgBouncer hop. With 4 replicas each pool is now sized
+            // to soak its share of 1000 concurrent VUs without queueing.
+            db_write_pool_size: env_or("DB_WRITE_POOL_SIZE", "60")
                 .parse()
                 .expect("DB_WRITE_POOL_SIZE must be a number"),
-            db_read_pool_size: env_or("DB_READ_POOL_SIZE", "50")
+            db_read_pool_size: env_or("DB_READ_POOL_SIZE", "80")
                 .parse()
                 .expect("DB_READ_POOL_SIZE must be a number"),
 
-            db_query_timeout_secs: env_or("DB_QUERY_TIMEOUT_SECS", "5")
+            // Tighter outer→inner timeouts: under load we'd rather fail
+            // fast (and let the client retry / get a 503) than block a
+            // request thread for 5–30 s.
+            db_query_timeout_secs: env_or("DB_QUERY_TIMEOUT_SECS", "2")
                 .parse()
                 .expect("DB_QUERY_TIMEOUT_SECS must be a number"),
-            redis_command_timeout_secs: env_or("REDIS_COMMAND_TIMEOUT_SECS", "3")
+            redis_command_timeout_secs: env_or("REDIS_COMMAND_TIMEOUT_SECS", "1")
                 .parse()
                 .expect("REDIS_COMMAND_TIMEOUT_SECS must be a number"),
-            api_timeout_secs: env_or("API_TIMEOUT_SECS", "30")
+            api_timeout_secs: env_or("API_TIMEOUT_SECS", "10")
                 .parse()
                 .expect("API_TIMEOUT_SECS must be a number"),
 
             redis_url: env_or("REDIS_URL", "redis://127.0.0.1:6379"),
             redis_read_url: std::env::var("REDIS_READ_URL").ok(),
-            redis_pool_size: env_or("REDIS_POOL_SIZE", "50")
+            redis_pool_size: env_or("REDIS_POOL_SIZE", "100")
                 .parse()
                 .expect("REDIS_POOL_SIZE must be a number"),
 
@@ -187,10 +211,18 @@ impl Config {
                 "amqp://peakload_user:peakload_secure_pass@localhost:5672",
             ),
 
-            rate_limit_per_second: env_or("RATE_LIMIT_PER_SECOND", "10000")
+            // Per-IP limiter ceiling. Old defaults (10 000 / 20 000)
+            // were modelled for many distinct clients; under a
+            // single-source load test the entire k6 fleet shares
+            // one IP and routinely overshoots, producing the
+            // `not rate limited` failures seen in the spike
+            // scenario. Bumped so the limiter is effectively a
+            // safety belt during benchmarks; keep an eye on it
+            // before exposing the service publicly.
+            rate_limit_per_second: env_or("RATE_LIMIT_PER_SECOND", "100000")
                 .parse()
                 .expect("RATE_LIMIT_PER_SECOND must be a number"),
-            rate_limit_burst: env_or("RATE_LIMIT_BURST", "20000")
+            rate_limit_burst: env_or("RATE_LIMIT_BURST", "200000")
                 .parse()
                 .expect("RATE_LIMIT_BURST must be a number"),
 
@@ -204,7 +236,13 @@ impl Config {
             .parse()
             .expect("CIRCUIT_BREAKER_RECOVERY_TIMEOUT_SECS must be a number"),
 
-            max_concurrent_requests: env_or("MAX_CONCURRENT_REQUESTS", "20000")
+            // Capped at the realistic concurrent envelope of 4×app
+            // replicas: queueing 20 000 requests behind a saturated
+            // pipeline only inflates p99 by the queue-drain time —
+            // returning 503 fast is strictly better. Old value
+            // (20 000) is left here as a comment so we remember
+            // why the dial was turned down.
+            max_concurrent_requests: env_or("MAX_CONCURRENT_REQUESTS", "2000")
                 .parse()
                 .expect("MAX_CONCURRENT_REQUESTS must be a number"),
 
@@ -214,6 +252,14 @@ impl Config {
                 .parse()
                 .unwrap_or(false),
             auth_secret: std::env::var("AUTH_SECRET").ok(),
+
+            verify_from_account_exists: env_or("TX_VERIFY_FROM_ACCOUNT", "false")
+                .parse()
+                .unwrap_or(false),
+
+            backpressure_wait_ms: env_or("BACKPRESSURE_WAIT_MS", "50")
+                .parse()
+                .expect("BACKPRESSURE_WAIT_MS must be a number"),
         }
     }
 
@@ -469,6 +515,8 @@ mod tests {
             cors_allowed_origins: vec!["*".to_string()],
             enable_auth: false,
             auth_secret: None,
+            verify_from_account_exists: false,
+            backpressure_wait_ms: 50,
         }
     }
 

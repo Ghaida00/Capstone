@@ -38,15 +38,17 @@ pub struct TransactionsDeps {
 /// infrastructure. Called once at startup.
 ///
 /// `accounts` is the cross-module port — the
-/// `TransactionsService` calls
-/// `accounts.get_balance(...)` during create to verify the
-/// sender exists. This is the modular-monolith
-/// dependency-injection seam in active use.
+/// `TransactionsService` calls `accounts.get_balance(...)` during
+/// create to verify the sender exists. The call is gated by
+/// `verify_from_account` so the load-test build can skip the
+/// extra Redis hop while production / fail-fast environments
+/// keep the 400-on-unknown-sender contract.
 pub fn init(
     shards: ShardRouter,
     cache: RedisCache,
     queue_producer: QueueProducer,
     accounts: DynAccountService,
+    verify_from_account: bool,
 ) -> TransactionsDeps {
     let repo: Arc<dyn TransactionRepository> =
         Arc::new(SqlxTransactionRepository::new(shards.clone()));
@@ -60,6 +62,7 @@ pub fn init(
         idempotency,
         publisher,
         accounts,
+        verify_from_account,
     ));
 
     TransactionsDeps { service, cache }

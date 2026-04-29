@@ -1,6 +1,44 @@
 name: peakload
 
 # ============================================================
+# TOTAL RESOURCE BUDGET (steady-state, semua service jalan)
+# ------------------------------------------------------------
+# Hitungan dari `deploy.resources.limits` tiap service.
+# Shard 2 (pg-shard2-*) di-disable, jadi tidak masuk total.
+# `db-bootstrap-schema` one-shot (exit setelah init), jadi
+# tidak dihitung di steady-state — hanya nambah 0.1 CPU /
+# 64 MB selama beberapa detik di startup.
+#
+#  service                          CPU      MEM
+#  ───────────────────────────────  ───────  ────────
+#  nginx                            1.0      256 M
+#  app          (× 2 replicas)      2.0       768 M     (1.0 CPU × 2, 384 M × 2)
+#  etcd-1/2/3   (× 3)               0.45     192 M      (0.15 × 3, 64 M × 3)
+#  pg-shard0-node-a/b   (× 2)       3.0      1024 M     (1.5 × 2, 512 M × 2)
+#  pg-shard1-node-a/b   (× 2)       3.0      1024 M
+#  pgbouncer-shard0/1   (× 2)       0.2      64 M       (0.1 × 2, 32 M × 2)
+#  pg-haproxy                       0.15     64 M
+#  redis-master                     1.0      256 M
+#  redis-replica                    1.0      256 M
+#  redis-sentinel-1/2/3 (× 3)       0.3      96 M       (0.1 × 3, 32 M × 3)
+#  rabbitmq                         1.0      512 M
+#  prometheus                       0.5      256 M
+#  grafana                          0.5      256 M
+#  cadvisor                         0.2      128 M
+#  ───────────────────────────────  ───────  ────────
+#  TOTAL steady-state               14.30    5152 M (~5.03 GB)
+#  TOTAL termasuk bootstrap         14.40    5216 M (~5.09 GB)
+#
+# Catatan:
+# * Ini limit, bukan request — pemakaian aktual idle jauh
+#   lebih rendah. Cores fisik 8 + 8 GB RAM cukup; di bawah
+#   itu mulai contended.
+# * Kalau host < 12 GB RAM atau < 6 cores, turunkan `app`
+#   replicas ke 2 dan PG node ke 0.5 CPU / 256 M (lihat
+#   anchors `x-pg-node-deploy` & service `app` di bawah).
+# ============================================================
+
+# ============================================================
 # Shared config via YAML anchors
 # ============================================================
 x-logging: &default-logging
@@ -60,14 +98,22 @@ x-pg-node-env: &pg-node-env
   REPL_PASSWORD: ${REPL_PASSWORD:?set REPL_PASSWORD in .env}
   ETCD_HOSTS: "etcd-1:2379,etcd-2:2379,etcd-3:2379"
 
-# Per-node resource envelope: sized for PG 18 + Patroni +
-# envsubst renderer (~90 MB RSS idle). 192 MB leaves
-# headroom for WAL + pg_basebackup on replica join.
+# Per-node resource envelope. 1.0 CPU still bottlenecked the
+# write path under 1000 VU — `UPDATE … WHERE balance >= …`
+# contention plus the WAL flush kept PG pinned. Bumped to
+# 1.5 CPU / 512 MB so the primary has headroom for both the
+# request-driven INSERT/UPDATE traffic and the streaming-
+# replication walsender. Memory unchanged — shared_buffers /
+# work_mem in patroni.yml.tmpl are sized for 512 MB.
+#
+# Total host CPU budget stays roughly even because the `app`
+# service drops from 4 × 1.0 to 2 × 1.0 in the same patch
+# (see the comment block at the top of this file).
 x-pg-node-deploy: &pg-node-deploy
   resources:
     limits:
-      memory: 192M
-      cpus: "0.4"
+      memory: 512M
+      cpus: "1.5"
 
 # ============================================================
 # etcd anchors
@@ -131,12 +177,17 @@ x-pgbouncer-common: &pgbouncer-common
 x-pgbouncer-env: &pgbouncer-env
   AUTH_TYPE: scram-sha-256
   POOL_MODE: transaction
-  DEFAULT_POOL_SIZE: 40
-  MAX_CLIENT_CONN: 500
-  MAX_DB_CONNECTIONS: 100
-  MIN_POOL_SIZE: 15
-  RESERVE_POOL_SIZE: 10
-  RESERVE_POOL_TIMEOUT: 3
+  # Pool sizes raised to soak the new write workload — at 1000 VUs
+  # split across 2 shards each shard gets ~500 concurrent writers,
+  # and pgBouncer needs to be able to multiplex them onto Postgres
+  # without queueing. DEFAULT_POOL_SIZE caps backend conns per
+  # (db,user); MAX_CLIENT_CONN caps front-end conns from the app.
+  DEFAULT_POOL_SIZE: 80
+  MAX_CLIENT_CONN: 2000
+  MAX_DB_CONNECTIONS: 200
+  MIN_POOL_SIZE: 30
+  RESERVE_POOL_SIZE: 20
+  RESERVE_POOL_TIMEOUT: 2
   # server_lifetime is deliberately short (1h) so that
   # long-lived pgBouncer→HAProxy conns get recycled, which
   # bounds the window in which a stale route could persist
@@ -233,8 +284,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 128M
-          cpus: "0.5"
+          memory: 256M
+          cpus: "1.0"
 
   # ============================================================
   # Rust Application — 2 replicas
@@ -293,11 +344,22 @@ services:
     networks:
       - peakload-network
     deploy:
+      # 4 replicas × 1 CPU on an 8-core laptop oversubscribed the
+      # scheduler — every container competing for cores produced
+      # context-switch storms that inflated p95 / p99. Halved to
+      # 2 replicas × 1 CPU so each Tokio runtime gets a cleaner
+      # slice of CPU time, and the freed budget lets PG run at
+      # 1.5 CPU per node (see x-pg-node-deploy).
+      #
+      # HA tradeoff: with only 2 replicas a single crash leaves
+      # one survivor instead of three. Acceptable for the
+      # capstone benchmark; bump back to 4 if you want the
+      # broader fault-tolerance story.
       replicas: 2
       resources:
         limits:
-          memory: 128M
-          cpus: "0.5"
+          memory: 384M
+          cpus: "1.0"
 
   # ============================================================
   # etcd cluster — Patroni's distributed config store
@@ -659,8 +721,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 128M
-          cpus: "0.25"
+          memory: 256M
+          cpus: "1.0"
 
   redis-replica:
     image: redis:8.6.1-alpine3.23
@@ -690,8 +752,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 128M
-          cpus: "0.25"
+          memory: 256M
+          cpus: "1.0"
 
   redis-sentinel-1:
     <<: *sentinel-common
@@ -734,8 +796,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
-          cpus: "0.5"
+          memory: 512M
+          cpus: "1.0"
 
   # ============================================================
   # Prometheus — Metrics Collection

@@ -89,6 +89,31 @@ bootstrap:
         checkpoint_completion_target: 0.9
         random_page_cost: 1.1
 
+        # --- Write-path latency knobs ---------------------
+        # Defaults assume durability matters more than commit
+        # latency. The capstone trades the other way: an
+        # idempotency-row write losing the last few ms of
+        # committed transactions on power-loss is acceptable
+        # because Redis still holds the accepted-payload
+        # cache for 24 h and the producer is idempotent on
+        # retry. `synchronous_commit=off` keeps fsync out of
+        # the request path — biggest single p95 win on the
+        # write side. Streaming replication is unaffected;
+        # only the WAL fsync to local disk is skipped.
+        synchronous_commit: "off"
+        # Group nearby commits into the same WAL flush so
+        # batches of inserts ride one fsync. Tiny because we
+        # care about latency, not throughput-at-cost-of-tail.
+        commit_delay: 100
+        commit_siblings: 5
+        # Tell PG the underlying disk can handle some
+        # parallel I/O. Default (1) underestimates the
+        # NVMe / overlay-fs combo Docker runs on.
+        effective_io_concurrency: 200
+        # WAL writer naps less, flushes earlier — pairs with
+        # the reduced commit_delay above.
+        wal_writer_delay: 200ms
+
   # NOTE: Patroni 4.0 dropped the declarative `bootstrap.users:`
   # block — it now logs:
   #     "User creation is not be supported starting from

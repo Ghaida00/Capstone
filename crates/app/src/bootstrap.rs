@@ -26,30 +26,37 @@ use shared_kernel::queue::producer::QueueProducer;
 
 // ─── Tracing ────────────────────────────────────────────────────
 
-/// Initialise the global `tracing` subscriber with three layers:
-/// 1. `EnvFilter` — controls verbosity via `RUST_LOG`
-/// 2. `fmt::Layer` — structured JSON logs to stdout
-/// 3. `OpenTelemetryLayer` — exports traces for context propagation
+/// Initialise the global `tracing` subscriber.
 ///
-/// The OTel exporter defaults to `stdout`. To send traces to an
-/// OTLP collector (Jaeger, Grafana Tempo), swap `opentelemetry_stdout`
-/// for `opentelemetry-otlp` and configure the endpoint.
+/// Default: EnvFilter (RUST_LOG, default `warn`) + compact line format
+/// to stdout. The previous build wired an OpenTelemetry `SimpleExporter`
+/// which calls `write!(stdout)` synchronously on every span exit — under
+/// 500–1000 VU load that pegged the hot path with blocking I/O. JSON
+/// fmt also serialises every event; compact is ~3× cheaper.
+///
+/// To re-enable structured / OTel output, set `LOG_FORMAT=json` or
+/// `OTEL_ENABLED=1` (OTel uses the batch exporter, not simple).
 pub fn init_tracing() {
-    use opentelemetry::trace::TracerProvider;
-    use opentelemetry_sdk::trace::SdkTracerProvider;
-    use tracing_opentelemetry::OpenTelemetryLayer;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
 
-    let exporter = opentelemetry_stdout::SpanExporter::default();
-    let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exporter)
-        .build();
-    let tracer = provider.tracer("peakload-capstone");
+    let json = std::env::var("LOG_FORMAT").ok().as_deref() == Some("json");
+    let registry = tracing_subscriber::registry().with(filter);
 
-    tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env())
-        .with(tracing_subscriber::fmt::layer().json())
-        .with(OpenTelemetryLayer::new(tracer))
-        .init();
+    if json {
+        registry
+            .with(tracing_subscriber::fmt::layer().json())
+            .init();
+    } else {
+        registry
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .compact()
+                    .with_target(false)
+                    .with_thread_ids(false)
+                    .with_thread_names(false),
+            )
+            .init();
+    }
 }
 
 // ─── Metrics ────────────────────────────────────────────────────
@@ -76,6 +83,10 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics::describe_counter!("rabbitmq_reconnections_total", "RabbitMQ reconnections");
     metrics::describe_histogram!("transactions_batch_size", "Batch sizes");
     metrics::describe_counter!("dlq_messages_total", "Dead letter queue messages");
+    metrics::describe_counter!(
+        "cross_shard_credit_failures_total",
+        "Cross-shard credit UPDATEs that failed AFTER the sender's tx committed — needs reconciliation"
+    );
 
     // Failover metrics
     metrics::describe_counter!(
@@ -135,7 +146,8 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics::counter!("dlq_messages_total").absolute(0);
     metrics::gauge!("backpressure_in_flight").set(0.0);
     metrics::gauge!("circuit_breaker_state").set(0.0);
-    metrics::histogram!("transactions_batch_size").record(0.0);
+    // Histogram intentionally not zero-initialised: a synthetic 0
+    // sample skews p50 toward 0 until enough real data lands.
 
     handle
 }
@@ -210,7 +222,8 @@ pub async fn init_infrastructure(
         config.circuit_breaker_failure_threshold,
         config.circuit_breaker_recovery_timeout_secs,
     );
-    let backpressure = BackpressureController::new(config.max_concurrent_requests);
+    let backpressure =
+        BackpressureController::new(config.max_concurrent_requests, config.backpressure_wait_ms);
 
     Ok(Infrastructure {
         shard_router,
@@ -285,6 +298,7 @@ pub fn build_router(
         state.cache.clone(),
         state.queue_producer.clone(),
         accounts_deps.service.clone(),
+        config.verify_from_account_exists,
     );
     let transactions_router = apply_protection_stack(
         transactions::router(transactions_deps),

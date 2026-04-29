@@ -140,7 +140,7 @@ pub(crate) async fn create(
     let input = CreateTransactionInput {
         from_account: req.from_account,
         to_account: req.to_account,
-        amount_str: req.amount.to_string(),
+        amount: req.amount,
         currency: req.currency,
         reference_id: req.reference_id,
         description: req.description,
@@ -205,7 +205,11 @@ pub(crate) async fn list(
         })
         .await?;
     let resp: Vec<TransactionResponseV2> = views.into_iter().map(Into::into).collect();
-    let _ = deps.cache.set(&cache_key, &resp, 1).await;
+    // 1 s was effectively no caching at our request rate. 10 s
+    // bounded staleness is acceptable for a list endpoint —
+    // each VU's cursor still pages through the same window
+    // because the cache key embeds the cursor.
+    let _ = deps.cache.set(&cache_key, &resp, 10).await;
     Ok(Json(ApiResponse::success(resp)))
 }
 

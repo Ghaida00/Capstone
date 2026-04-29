@@ -20,8 +20,8 @@
             "collapsed": false
         },
         {
-            "title": "CPU Usage % (all containers)",
-            "description": "CPU utilization per container — shows which containers consume the most CPU",
+            "title": "CPU Usage % of 1 core (all containers)",
+            "description": "Per-container CPU as percentage of ONE core. PG nodes have 1.5 CPU limit (max ~150%), app + redis 1.0 CPU (max ~100%). Threshold yellow=80% (near 1-core), red=130% (above 1-core, multi-core territory).",
             "type": "timeseries",
             "gridPos": {
                 "h": 10,
@@ -57,11 +57,11 @@
                             },
                             {
                                 "color": "yellow",
-                                "value": 50
+                                "value": 80
                             },
                             {
                                 "color": "red",
-                                "value": 80
+                                "value": 130
                             }
                         ]
                     }
@@ -70,7 +70,7 @@
         },
         {
             "title": "CPU — Top 5 Consumers (current)",
-            "description": "Containers consuming the most CPU right now",
+            "description": "Top 5 containers by CPU. Values are % of 1 core — PG node max 150%, others 100%.",
             "type": "bargauge",
             "gridPos": {
                 "h": 8,
@@ -89,6 +89,7 @@
             "fieldConfig": {
                 "defaults": {
                     "unit": "percent",
+                    "max": 150,
                     "thresholds": {
                         "steps": [
                             {
@@ -97,11 +98,11 @@
                             },
                             {
                                 "color": "yellow",
-                                "value": 30
+                                "value": 80
                             },
                             {
                                 "color": "red",
-                                "value": 60
+                                "value": 130
                             }
                         ]
                     }
@@ -183,7 +184,7 @@
         },
         {
             "title": "Memory — Top 5 Consumers (current)",
-            "description": "Containers using the most memory right now",
+            "description": "Top 5 containers by working-set memory. Per-container compose limits vary (PG=512 MiB, redis=256 MiB, app=384 MiB, nginx=256 MiB) — thresholds calibrated to the largest single limit (PG 512 MiB).",
             "type": "bargauge",
             "gridPos": {
                 "h": 8,
@@ -202,6 +203,7 @@
             "fieldConfig": {
                 "defaults": {
                     "unit": "bytes",
+                    "max": 536870912,
                     "thresholds": {
                         "steps": [
                             {
@@ -210,11 +212,11 @@
                             },
                             {
                                 "color": "yellow",
-                                "value": 268435456
+                                "value": 402653184
                             },
                             {
                                 "color": "red",
-                                "value": 536870912
+                                "value": 482344960
                             }
                         ]
                     }
@@ -237,7 +239,7 @@
             },
             "targets": [
                 {
-                    "expr": "container_memory_working_set_bytes{name=~\"peakload-pg.*|peakload-pgbouncer.*\"}",
+                    "expr": "container_memory_working_set_bytes{name=~\"peakload-pg.*\"}",
                     "legendFormat": "{{name}}",
                     "refId": "A"
                 }
@@ -366,6 +368,7 @@
         },
         {
             "title": "Total CPU Usage",
+            "description": "Sum of CPU across all peakload containers, in % of 1 core. Total compose CPU budget = ~1430% (14.3 cores). Yellow=700% (~50% of budget), red=1100% (~77% of budget).",
             "type": "stat",
             "gridPos": {
                 "h": 5,
@@ -390,11 +393,11 @@
                             },
                             {
                                 "color": "yellow",
-                                "value": 200
+                                "value": 700
                             },
                             {
                                 "color": "red",
-                                "value": 500
+                                "value": 1100
                             }
                         ]
                     }
@@ -403,6 +406,7 @@
         },
         {
             "title": "Total Memory",
+            "description": "Sum of working-set memory across all peakload containers. Total compose budget = ~5.15 GiB. Yellow=3.6 GiB (~70% of budget), red=4.6 GiB (~90%).",
             "type": "stat",
             "gridPos": {
                 "h": 5,
@@ -427,11 +431,11 @@
                             },
                             {
                                 "color": "yellow",
-                                "value": 4294967296
+                                "value": 3865470566
                             },
                             {
                                 "color": "red",
-                                "value": 8589934592
+                                "value": 4939212390
                             }
                         ]
                     }
@@ -600,5 +604,5 @@
     "timezone": "browser",
     "title": "Peakload Infrastructure — Container Resources",
     "uid": "peakload-infra-containers",
-    "version": 2
+    "version": 3
 }

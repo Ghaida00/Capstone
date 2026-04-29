@@ -109,6 +109,12 @@ async fn post_v2_transaction_lands_in_db_and_notifications() {
         cache.clone(),
         producer,
         accounts_deps.service.clone(),
+        // Keep the cross-module verify ON for the integration
+        // test — this is the only place the wiring is exercised
+        // end-to-end, and we want the modular-monolith DI seam
+        // covered. Production / load-test paths still bypass it
+        // by leaving `TX_VERIFY_FROM_ACCOUNT` at its default.
+        true,
     );
     let (notif_deps, _notif_handle) = notifications::init(subscriber, cancel.child_token());
 

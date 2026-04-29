@@ -7,8 +7,9 @@ use amqprs::{
     BasicProperties,
 };
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use crate::error::AppError;
 
@@ -18,15 +19,34 @@ const ROUTING_KEY: &str = "transaction.created";
 const DLX_EXCHANGE: &str = "peakload.transactions.dlx";
 const DLX_QUEUE: &str = "transactions.dead_letter";
 
+/// Number of AMQP channels in the publish pool. Each channel inside
+/// amqprs serialises its own writes; previously a single shared
+/// channel under a `Mutex` meant every concurrent publish queued
+/// behind the prior one. Eight channels lets eight publishes proceed
+/// in parallel — enough for our 500–1000 VU envelope without forcing
+/// RabbitMQ to manage a huge channel set.
+const CHANNEL_POOL_SIZE: usize = 8;
+
+/// One AMQP connection plus a pool of channels for parallel publishes.
+struct ConnState {
+    _connection: Connection,
+    channels: Vec<Arc<amqprs::channel::Channel>>,
+}
+
 /// RabbitMQ message producer with automatic reconnection.
+///
+/// Hot path is lock-free: each `publish` clones an `Arc<ConnState>` out
+/// of an `RwLock` (read side, never contends), picks a channel via
+/// round-robin, and calls `basic_publish` directly. Reconnect rebuilds
+/// the whole `ConnState` under the write side of the lock.
 #[derive(Clone)]
 pub struct QueueProducer {
-    channel: Arc<Mutex<Option<amqprs::channel::Channel>>>,
-    connected: Arc<std::sync::atomic::AtomicBool>,
+    state: Arc<RwLock<Arc<ConnState>>>,
+    rr: Arc<AtomicUsize>,
+    connected: Arc<AtomicBool>,
     config: Arc<ProducerConfig>,
 }
 
-/// Stored config for reconnection.
 struct ProducerConfig {
     host: String,
     port: u16,
@@ -35,12 +55,6 @@ struct ProducerConfig {
 }
 
 impl QueueProducer {
-    /// Connect to RabbitMQ and set up exchanges and queues.
-    ///
-    /// Phase 4 dropped the `&Config` parameter so the producer lives
-    /// in `shared_kernel` without dragging the binary's env-var
-    /// loader along. The `app` crate's bootstrap parses the AMQP
-    /// URL and passes it directly.
     pub async fn new(amqp_url: &str) -> Result<Self, AppError> {
         let (host, port, username, password) = parse_amqp_url(amqp_url)?;
 
@@ -51,28 +65,29 @@ impl QueueProducer {
             password: password.clone(),
         });
 
-        let channel = Self::connect_and_setup(&host, port, &username, &password).await?;
+        let state = Self::connect_and_setup(&host, port, &username, &password).await?;
 
         tracing::info!(
             exchange = EXCHANGE_NAME,
             queue = QUEUE_NAME,
-            "RabbitMQ producer initialized (amqprs)"
+            channels = CHANNEL_POOL_SIZE,
+            "RabbitMQ producer initialized (amqprs, channel pool)"
         );
 
         Ok(Self {
-            channel: Arc::new(Mutex::new(Some(channel))),
-            connected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            state: Arc::new(RwLock::new(Arc::new(state))),
+            rr: Arc::new(AtomicUsize::new(0)),
+            connected: Arc::new(AtomicBool::new(true)),
             config: producer_config,
         })
     }
 
-    /// Internal: establish connection and declare topology.
     async fn connect_and_setup(
         host: &str,
         port: u16,
         username: &str,
         password: &str,
-    ) -> Result<amqprs::channel::Channel, AppError> {
+    ) -> Result<ConnState, AppError> {
         let args = OpenConnectionArguments::new(host, port, username, password);
 
         let connection = Connection::open(&args)
@@ -84,44 +99,41 @@ impl QueueProducer {
             .await
             .map_err(|e| AppError::Internal(format!("RabbitMQ callback error: {}", e)))?;
 
-        let channel = connection
+        // Declare topology exactly once on the first channel; every
+        // other channel just publishes to the same exchange.
+        let setup_channel = connection
             .open_channel(None)
             .await
             .map_err(|e| AppError::Internal(format!("RabbitMQ channel error: {}", e)))?;
-
-        channel
+        setup_channel
             .register_callback(DefaultChannelCallback)
             .await
             .map_err(|e| AppError::Internal(format!("RabbitMQ channel callback error: {}", e)))?;
 
-        // Declare Dead Letter Exchange
         let dlx_args = ExchangeDeclareArguments::new(DLX_EXCHANGE, "direct");
-        channel
+        setup_channel
             .exchange_declare(dlx_args)
             .await
             .map_err(|e| AppError::Internal(format!("DLX exchange declare error: {}", e)))?;
 
-        // Declare Dead Letter Queue
         let dlq_args = QueueDeclareArguments::durable_client_named(DLX_QUEUE);
-        channel
+        setup_channel
             .queue_declare(dlq_args)
             .await
             .map_err(|e| AppError::Internal(format!("DLX queue declare error: {}", e)))?;
 
         let dlq_bind_args = QueueBindArguments::new(DLX_QUEUE, DLX_EXCHANGE, "dead_letter");
-        channel
+        setup_channel
             .queue_bind(dlq_bind_args)
             .await
             .map_err(|e| AppError::Internal(format!("DLX queue bind error: {}", e)))?;
 
-        // Declare main exchange
         let ex_args = ExchangeDeclareArguments::new(EXCHANGE_NAME, "direct");
-        channel
+        setup_channel
             .exchange_declare(ex_args)
             .await
             .map_err(|e| AppError::Internal(format!("Exchange declare error: {}", e)))?;
 
-        // Declare main queue with DLX arguments
         let mut queue_field_table = amqprs::FieldTable::new();
         queue_field_table.insert(
             "x-dead-letter-exchange".try_into().unwrap(),
@@ -134,91 +146,97 @@ impl QueueProducer {
 
         let mut main_queue_args = QueueDeclareArguments::durable_client_named(QUEUE_NAME);
         main_queue_args.arguments(queue_field_table);
-        channel
+        setup_channel
             .queue_declare(main_queue_args)
             .await
             .map_err(|e| AppError::Internal(format!("Queue declare error: {}", e)))?;
 
-        // Bind queue to exchange
         let bind_args = QueueBindArguments::new(QUEUE_NAME, EXCHANGE_NAME, ROUTING_KEY);
-        channel
+        setup_channel
             .queue_bind(bind_args)
             .await
             .map_err(|e| AppError::Internal(format!("Queue bind error: {}", e)))?;
 
-        Ok(channel)
+        let mut channels: Vec<Arc<amqprs::channel::Channel>> =
+            Vec::with_capacity(CHANNEL_POOL_SIZE);
+        channels.push(Arc::new(setup_channel));
+        for _ in 1..CHANNEL_POOL_SIZE {
+            let ch = connection
+                .open_channel(None)
+                .await
+                .map_err(|e| AppError::Internal(format!("RabbitMQ channel error: {}", e)))?;
+            ch.register_callback(DefaultChannelCallback)
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("RabbitMQ channel callback error: {}", e))
+                })?;
+            channels.push(Arc::new(ch));
+        }
+
+        Ok(ConnState {
+            _connection: connection,
+            channels,
+        })
     }
 
-    /// Publish a message to the transaction queue.
-    /// Automatically attempts reconnection on failure.
-    ///
-    /// Fix #27: Uses a single lock scope covering check-reconnect-retry
-    /// to prevent thundering herd of concurrent reconnections.
+    /// Publish a message to the transaction queue. Hot path is
+    /// lock-free under steady state; only reconnect takes the
+    /// `RwLock` write side.
     pub async fn publish<T: Serialize>(&self, message: &T) -> Result<(), AppError> {
         let payload = serde_json::to_vec(message)?;
 
         let properties = BasicProperties::default()
             .with_content_type("application/json")
-            .with_delivery_mode(2) // persistent
+            .with_delivery_mode(2)
             .finish();
 
         let args = BasicPublishArguments::new(EXCHANGE_NAME, ROUTING_KEY);
 
-        // Single lock scope: attempt → reconnect → retry
-        // This prevents multiple tasks from triggering concurrent reconnections.
-        let mut channel_guard = self.channel.lock().await;
+        let snapshot = self.state.read().await.clone();
+        let idx = self.rr.fetch_add(1, Ordering::Relaxed) % snapshot.channels.len();
+        let channel = snapshot.channels[idx].clone();
 
-        // First attempt
-        if let Some(ref channel) = *channel_guard {
-            match channel
-                .basic_publish(properties.clone(), payload.clone(), args.clone())
-                .await
-            {
-                Ok(_) => {
-                    tracing::trace!("Message published");
-                    return Ok(());
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "RabbitMQ publish failed, reconnecting...");
-                    self.connected
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                }
+        match channel
+            .basic_publish(properties.clone(), payload.clone(), args.clone())
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(error = %e, "RabbitMQ publish failed, reconnecting...");
+                self.connected.store(false, Ordering::SeqCst);
             }
         }
 
-        // Reconnect within the same lock scope
-        tracing::warn!("RabbitMQ: attempting reconnection...");
-        let new_channel = Self::connect_and_setup(
-            &self.config.host,
-            self.config.port,
-            &self.config.username,
-            &self.config.password,
-        )
-        .await?;
-
-        *channel_guard = Some(new_channel);
-        self.connected
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        tracing::info!("RabbitMQ: reconnected successfully");
-        metrics::counter!("rabbitmq_reconnections_total").increment(1);
-
-        // Retry with new channel
-        if let Some(ref channel) = *channel_guard {
-            channel
-                .basic_publish(properties, payload, args)
-                .await
-                .map_err(|e| AppError::Internal(format!("Publish error after reconnect: {}", e)))?;
-        } else {
-            return Err(AppError::Internal("No RabbitMQ channel available".into()));
+        // Reconnect — only one task does the actual rebuild; others
+        // race onto the new state once it lands.
+        let mut guard = self.state.write().await;
+        if !self.connected.load(Ordering::SeqCst) {
+            tracing::warn!("RabbitMQ: rebuilding channel pool...");
+            let new_state = Self::connect_and_setup(
+                &self.config.host,
+                self.config.port,
+                &self.config.username,
+                &self.config.password,
+            )
+            .await?;
+            *guard = Arc::new(new_state);
+            self.connected.store(true, Ordering::SeqCst);
+            metrics::counter!("rabbitmq_reconnections_total").increment(1);
         }
+        let snapshot = guard.clone();
+        drop(guard);
 
-        tracing::trace!("Message published (after reconnect)");
+        let idx = self.rr.fetch_add(1, Ordering::Relaxed) % snapshot.channels.len();
+        let channel = snapshot.channels[idx].clone();
+        channel
+            .basic_publish(properties, payload, args)
+            .await
+            .map_err(|e| AppError::Internal(format!("Publish error after reconnect: {}", e)))?;
         Ok(())
     }
 
-    /// Check if RabbitMQ connection is healthy.
     pub fn health_check(&self) -> bool {
-        self.connected.load(std::sync::atomic::Ordering::Relaxed)
+        self.connected.load(Ordering::Relaxed)
     }
 }
 

@@ -320,8 +320,14 @@ impl AsyncConsumer for BatchTransactionConsumer {
 
 /// Flush a batch to the correct shards using bulk INSERT per shard.
 ///
-/// Handles cross-shard transactions by routing debit and credit
-/// to their respective shard pools independently.
+/// Groups by sender shard and runs each group via `process_shard_batch`
+/// in parallel. The whole sender-shard write path (debit + same-shard
+/// credit + transactions row) is one DB transaction so a partial
+/// failure cannot leak money. Cross-shard credits run AFTER commit
+/// best-effort — the only remaining money-mid-air window is a hard
+/// failure on the receiver shard between the sender's commit and the
+/// credit, which is logged and counted via
+/// `cross_shard_credit_failures_total` for reconciliation.
 async fn flush_batch_to_shards(
     batch: &[PendingMessage],
     router: &ShardRouter,
@@ -339,63 +345,13 @@ async fn flush_batch_to_shards(
     let total = batch.len();
 
     let mut handles = Vec::new();
-    for (shard_idx, messages) in shard_groups {
+    for (sender_shard, messages) in shard_groups {
         let router = router.clone();
-        let pool = router.writer(shard_idx).clone();
-
-        let owned_messages: Vec<PendingMessage> = messages.into_iter().cloned().collect();
+        let pool = router.writer(sender_shard).clone();
+        let owned: Vec<PendingMessage> = messages.into_iter().cloned().collect();
 
         handles.push(tokio::spawn(async move {
-            apply_balance_updates(&pool, &owned_messages, &router).await?;
-
-            let count = owned_messages.len();
-            let mut ids: Vec<Uuid> = Vec::with_capacity(count);
-            let mut from_accounts: Vec<String> = Vec::with_capacity(count);
-            let mut to_accounts: Vec<String> = Vec::with_capacity(count);
-            let mut amounts: Vec<Decimal> = Vec::with_capacity(count);
-            let mut currencies: Vec<String> = Vec::with_capacity(count);
-            let mut reference_ids: Vec<Option<String>> = Vec::with_capacity(count);
-
-            for msg in &owned_messages {
-                ids.push(Uuid::new_v4());
-                from_accounts.push(msg.request.from_account.clone());
-                to_accounts.push(msg.request.to_account.clone());
-                amounts.push(msg.request.amount);
-                currencies.push(msg.request.currency.clone());
-                reference_ids.push(msg.request.reference_id.clone());
-            }
-
-            sqlx::query(
-                r#"
-                INSERT INTO transactions (
-                    id, from_account, to_account, amount,
-                    currency, status, reference_id, processed_at
-                )
-                SELECT * FROM UNNEST(
-                    $1::uuid[],
-                    $2::text[],
-                    $3::text[],
-                    $4::numeric[],
-                    $5::text[],
-                    ARRAY_FILL('completed'::text, ARRAY[$7::int]),
-                    $6::text[],
-                    ARRAY_FILL(NOW()::timestamptz, ARRAY[$7::int])
-                )
-                ON CONFLICT (reference_id) DO NOTHING
-                "#,
-            )
-            .bind(&ids)
-            .bind(&from_accounts)
-            .bind(&to_accounts)
-            .bind(&amounts)
-            .bind(&currencies)
-            .bind(&reference_ids)
-            .bind(count as i32)
-            .execute(&pool)
-            .await
-            .map_err(AppError::Database)?;
-
-            Ok::<(), AppError>(())
+            process_shard_batch(&pool, sender_shard, &owned, &router).await
         }));
     }
 
@@ -408,26 +364,77 @@ async fn flush_batch_to_shards(
     Ok(total)
 }
 
-/// Apply balance updates for a batch of transactions.
+/// Process all messages whose sender lives on `sender_shard`.
 ///
-/// Cross-shard aware — debits happen on the sender's shard,
-/// credits happen on the receiver's shard (which may be different).
-/// Failed transaction INSERTs run inside the same DB transaction so
-/// they are atomic with the balance check.
-async fn apply_balance_updates(
+/// Atomicity model:
+///   * Inside ONE tx on `pool`: idempotency check (SELECT existing
+///     reference_ids), debit (UPDATE … WHERE balance >= …),
+///     same-shard credit (when receiver lives on `sender_shard`),
+///     and the bulk INSERT of completed/failed transaction rows.
+///   * Cross-shard credit runs AFTER tx.commit. If it fails the row
+///     is already durably committed and the sender already debited;
+///     the incident is logged and counted but NOT re-driven via
+///     queue NACK (a NACK would re-debit on redelivery — see the
+///     idempotency note below — but it would also re-emit the
+///     `transactions.committed` event, complicating downstream).
+///
+/// Idempotency on redelivery:
+///   * The SELECT-then-skip path drops messages whose `reference_id`
+///     already has a row. Because the SELECT runs INSIDE the same
+///     tx as the UPDATE, the only race window is concurrent
+///     processing of the *same* delivery on two replicas, which
+///     RabbitMQ does not do (a message is delivered to one consumer
+///     at a time). NACK+requeue → next delivery sees the existing
+///     transactions row → skipped.
+async fn process_shard_batch(
     pool: &sqlx::PgPool,
+    sender_shard: usize,
     messages: &[PendingMessage],
     router: &ShardRouter,
 ) -> Result<(), AppError> {
     let mut tx = pool.begin().await?;
 
+    // ─── Idempotency: drop already-processed reference_ids ──
+    let ref_ids: Vec<String> = messages
+        .iter()
+        .filter_map(|m| m.request.reference_id.clone())
+        .collect();
+    let already_processed: std::collections::HashSet<String> = if ref_ids.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT reference_id FROM transactions WHERE reference_id = ANY($1)",
+        )
+        .bind(&ref_ids)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect()
+    };
+
+    let mut completed_rows: Vec<&PendingMessage> = Vec::with_capacity(messages.len());
+    let mut failed_rows: Vec<&PendingMessage> = Vec::new();
+    let mut cross_shard_credits: Vec<(String, Decimal)> = Vec::new();
+
     for msg in messages {
+        if let Some(ref_id) = msg.request.reference_id.as_deref() {
+            if already_processed.contains(ref_id) {
+                tracing::debug!(
+                    reference_id = ref_id,
+                    "Skipping already-processed message (idempotent redelivery)"
+                );
+                continue;
+            }
+        }
+
+        // Debit (in tx)
         let updated = sqlx::query(
             r#"
             UPDATE users
             SET balance = balance - $1
             WHERE account_number = $2
-            AND balance >= $1
+              AND balance >= $1
             "#,
         )
         .bind(msg.request.amount)
@@ -439,53 +446,171 @@ async fn apply_balance_updates(
             tracing::warn!(
                 from_account = %msg.request.from_account,
                 amount = %msg.request.amount,
-                "Insufficient balance — marking transaction as failed"
+                "Insufficient balance — recording as failed"
             );
-
-            sqlx::query(
-                r#"
-                INSERT INTO transactions (
-                    from_account,
-                    to_account,
-                    amount,
-                    currency,
-                    status,
-                    reference_id,
-                    description
-                )
-                VALUES ($1,$2,$3,$4,'failed',$5,$6)
-                ON CONFLICT (reference_id) DO NOTHING
-                "#,
-            )
-            .bind(&msg.request.from_account)
-            .bind(&msg.request.to_account)
-            .bind(msg.request.amount)
-            .bind(&msg.request.currency)
-            .bind(&msg.request.reference_id)
-            .bind(&msg.request.description)
-            .execute(&mut *tx)
-            .await?;
-
+            failed_rows.push(msg);
             continue;
         }
 
+        // Same-shard credit lives in the same tx as the debit so the
+        // pair is atomic. Cross-shard credit is queued for after the
+        // commit because it talks to a different DB.
         let receiver_shard = ShardRouter::shard_for(&msg.request.to_account);
-        let receiver_pool = router.writer(receiver_shard);
+        if receiver_shard == sender_shard {
+            sqlx::query(
+                r#"
+                UPDATE users
+                SET balance = balance + $1
+                WHERE account_number = $2
+                "#,
+            )
+            .bind(msg.request.amount)
+            .bind(&msg.request.to_account)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            cross_shard_credits
+                .push((msg.request.to_account.clone(), msg.request.amount));
+        }
+
+        completed_rows.push(msg);
+    }
+
+    // ─── Bulk INSERT completed (in tx) ──────────────────────
+    if !completed_rows.is_empty() {
+        let count = completed_rows.len();
+        let mut ids: Vec<Uuid> = Vec::with_capacity(count);
+        let mut from_accounts: Vec<String> = Vec::with_capacity(count);
+        let mut to_accounts: Vec<String> = Vec::with_capacity(count);
+        let mut amounts: Vec<Decimal> = Vec::with_capacity(count);
+        let mut currencies: Vec<String> = Vec::with_capacity(count);
+        let mut reference_ids: Vec<Option<String>> = Vec::with_capacity(count);
+
+        for msg in &completed_rows {
+            ids.push(Uuid::new_v4());
+            from_accounts.push(msg.request.from_account.clone());
+            to_accounts.push(msg.request.to_account.clone());
+            amounts.push(msg.request.amount);
+            currencies.push(msg.request.currency.clone());
+            reference_ids.push(msg.request.reference_id.clone());
+        }
 
         sqlx::query(
+            r#"
+            INSERT INTO transactions (
+                id, from_account, to_account, amount,
+                currency, status, reference_id, processed_at
+            )
+            SELECT * FROM UNNEST(
+                $1::uuid[],
+                $2::text[],
+                $3::text[],
+                $4::numeric[],
+                $5::text[],
+                ARRAY_FILL('completed'::text, ARRAY[$7::int]),
+                $6::text[],
+                ARRAY_FILL(NOW()::timestamptz, ARRAY[$7::int])
+            )
+            ON CONFLICT (reference_id) DO NOTHING
+            "#,
+        )
+        .bind(&ids)
+        .bind(&from_accounts)
+        .bind(&to_accounts)
+        .bind(&amounts)
+        .bind(&currencies)
+        .bind(&reference_ids)
+        .bind(count as i32)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // ─── Bulk INSERT failed (in tx) ─────────────────────────
+    if !failed_rows.is_empty() {
+        let count = failed_rows.len();
+        let mut ids: Vec<Uuid> = Vec::with_capacity(count);
+        let mut from_accounts: Vec<String> = Vec::with_capacity(count);
+        let mut to_accounts: Vec<String> = Vec::with_capacity(count);
+        let mut amounts: Vec<Decimal> = Vec::with_capacity(count);
+        let mut currencies: Vec<String> = Vec::with_capacity(count);
+        let mut reference_ids: Vec<Option<String>> = Vec::with_capacity(count);
+        let mut descriptions: Vec<Option<String>> = Vec::with_capacity(count);
+
+        for msg in &failed_rows {
+            ids.push(Uuid::new_v4());
+            from_accounts.push(msg.request.from_account.clone());
+            to_accounts.push(msg.request.to_account.clone());
+            amounts.push(msg.request.amount);
+            currencies.push(msg.request.currency.clone());
+            reference_ids.push(msg.request.reference_id.clone());
+            descriptions.push(msg.request.description.clone());
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO transactions (
+                id, from_account, to_account, amount,
+                currency, status, reference_id, description
+            )
+            SELECT * FROM UNNEST(
+                $1::uuid[],
+                $2::text[],
+                $3::text[],
+                $4::numeric[],
+                $5::text[],
+                ARRAY_FILL('failed'::text, ARRAY[$8::int]),
+                $6::text[],
+                $7::text[]
+            )
+            ON CONFLICT (reference_id) DO NOTHING
+            "#,
+        )
+        .bind(&ids)
+        .bind(&from_accounts)
+        .bind(&to_accounts)
+        .bind(&amounts)
+        .bind(&currencies)
+        .bind(&reference_ids)
+        .bind(&descriptions)
+        .bind(count as i32)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Atomic: debits + same-shard credits + transaction rows.
+    tx.commit().await?;
+
+    // ─── Cross-shard credits (post-commit, best-effort) ─────
+    // Sender side is durably committed at this point. If a
+    // receiver-shard write fails we surface it via metric +
+    // log for reconciliation; we deliberately do NOT return Err
+    // because that would NACK+requeue, and the next delivery
+    // would skip via the idempotency check above — so the credit
+    // would never run at all.
+    for (to_acc, amount) in cross_shard_credits {
+        let receiver_shard = ShardRouter::shard_for(&to_acc);
+        let receiver_pool = router.writer(receiver_shard);
+        if let Err(e) = sqlx::query(
             r#"
             UPDATE users
             SET balance = balance + $1
             WHERE account_number = $2
             "#,
         )
-        .bind(msg.request.amount)
-        .bind(&msg.request.to_account)
+        .bind(amount)
+        .bind(&to_acc)
         .execute(receiver_pool)
-        .await?;
+        .await
+        {
+            tracing::error!(
+                error = %e,
+                account = %to_acc,
+                amount = %amount,
+                "CROSS-SHARD CREDIT FAILED post-commit — manual reconciliation required"
+            );
+            metrics::counter!("cross_shard_credit_failures_total").increment(1);
+        }
     }
-
-    tx.commit().await?;
 
     Ok(())
 }
