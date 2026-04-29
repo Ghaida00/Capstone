@@ -36,11 +36,9 @@ impl NotificationStore for InMemoryNotificationStore {
         let mut guard = self.entries.write().await;
         if guard.len() == self.capacity {
             guard.pop_front();
+            metrics::counter!("notifications_evicted_total").increment(1);
         }
         guard.push_back(entry);
-        // Surface basic visibility: total notifications appended
-        // since process start. Useful as a "is the bridge alive?"
-        // signal in Grafana.
         metrics::counter!("notifications_appended_total").increment(1);
         Ok(())
     }

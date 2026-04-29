@@ -3109,6 +3109,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -3928,6 +3929,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "sha2",
  "shared_kernel",
  "sqlx",
  "testcontainers",

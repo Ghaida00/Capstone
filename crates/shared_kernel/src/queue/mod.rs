@@ -6,4 +6,5 @@
 //! the Phase 2 follow-up rewire moves it into
 //! `transactions::infrastructure::consumer`.
 
+pub mod callback;
 pub mod producer;

@@ -112,7 +112,11 @@ impl From<TransactionStatusView> for StatusResponseV2 {
 pub(crate) struct ListParams {
     pub limit: Option<u32>,
     pub before: Option<String>,
-    #[allow(dead_code)]
+    /// Accepted on the wire only so we can return a clear error
+    /// when present. The endpoint is cursor-paginated (`before`)
+    /// and never honoured `offset` correctly across shards —
+    /// silently ignoring it would have clients page over the same
+    /// rows forever.
     pub offset: Option<u32>,
 }
 
@@ -159,7 +163,11 @@ pub(crate) async fn get_by_id(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ApiResponse<TransactionResponseV2>>> {
     // Cache parity with legacy: same key, same TTL.
-    let cache_key = format!("txn:{}", id);
+    let cache_key = format!(
+        "{}:txn:{}",
+        shared_kernel::cache::redis::CACHE_KEY_VERSION,
+        id
+    );
     if let Some(cached) = deps.cache.get::<TransactionResponseV2>(&cache_key).await? {
         metrics::counter!("cache_hits_total").increment(1);
         return Ok(Json(ApiResponse::success(cached)));
@@ -168,7 +176,11 @@ pub(crate) async fn get_by_id(
 
     let view = deps.service.get_by_id(TransactionId(id)).await?;
     let resp: TransactionResponseV2 = view.into();
-    let _ = deps.cache.set(&cache_key, &resp, 300).await;
+    // Short TTL so a status flip (e.g. 'completed' → future
+    // 'reversed' under the outbox bundle) is not masked for long.
+    // Until the cache invalidator subscriber lands the bound is
+    // simply this timeout.
+    let _ = deps.cache.set(&cache_key, &resp, 30).await;
     Ok(Json(ApiResponse::success(resp)))
 }
 
@@ -176,6 +188,11 @@ pub(crate) async fn list(
     State(deps): State<TransactionsDeps>,
     Query(params): Query<ListParams>,
 ) -> AppResult<Json<ApiResponse<Vec<TransactionResponseV2>>>> {
+    if params.offset.is_some() {
+        return Err(AppError::BadRequest(
+            "offset is not supported; use the `before` cursor for pagination".into(),
+        ));
+    }
     let limit = params.limit.unwrap_or(20).min(100);
     let cursor: Option<DateTime<Utc>> = params.before.as_deref().and_then(|s| {
         DateTime::parse_from_rfc3339(s)
@@ -184,9 +201,10 @@ pub(crate) async fn list(
     });
 
     let cache_key = format!(
-        "txn_list:{}:{}",
+        "{}:txn_list:{}:{}",
+        shared_kernel::cache::redis::CACHE_KEY_VERSION,
         limit,
-        cursor.map_or("latest".to_string(), |c| c.timestamp_millis().to_string())
+        cursor.map_or("latest".to_string(), |c| c.timestamp_micros().to_string())
     );
     if let Ok(Some(cached)) = deps
         .cache
@@ -217,7 +235,11 @@ pub(crate) async fn get_status(
     State(deps): State<TransactionsDeps>,
     Path(reference_id): Path<String>,
 ) -> AppResult<Json<ApiResponse<StatusResponseV2>>> {
-    let cache_key = format!("tx_status:{}", reference_id);
+    let cache_key = format!(
+        "{}:tx_status:{}",
+        shared_kernel::cache::redis::CACHE_KEY_VERSION,
+        reference_id
+    );
     if let Some(cached) = deps.cache.get::<StatusResponseV2>(&cache_key).await? {
         metrics::counter!("cache_hits_total").increment(1);
         return Ok(Json(ApiResponse::success(cached)));
@@ -226,6 +248,9 @@ pub(crate) async fn get_status(
 
     let view = deps.service.get_status_by_reference(&reference_id).await?;
     let resp: StatusResponseV2 = view.into();
-    let _ = deps.cache.set(&cache_key, &resp, 60).await;
+    // Status transitions in ~100ms once the consumer flushes;
+    // a 5s TTL keeps poll-driven UIs responsive while still
+    // amortising cache hits across burst traffic.
+    let _ = deps.cache.set(&cache_key, &resp, 5).await;
     Ok(Json(ApiResponse::success(resp)))
 }

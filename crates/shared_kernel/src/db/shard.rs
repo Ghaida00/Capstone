@@ -1,4 +1,5 @@
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
@@ -7,13 +8,10 @@ use crate::error::AppError;
 
 use super::pool::DatabasePool;
 
-/// Number of database shards.
-///
-/// Temporarily reduced from 3 to 2 while shard 2 is commented out
-/// in docker-compose.yml / haproxy.cfg for resource conservation.
-/// Bump back to 3 in lockstep with re-enabling those blocks (see
-/// the "shard 2 disabled" markers across the repo).
-const NUM_SHARDS: usize = 2;
+/// Runtime shard count, set on `ShardRouter::new` from config.
+/// Default 2 mirrors the historical const so single-binary tests
+/// that bypass `ShardRouter::new` still hash correctly.
+static NUM_SHARDS: AtomicUsize = AtomicUsize::new(2);
 
 /// Per-shard URL pair.
 #[derive(Debug, Clone)]
@@ -54,15 +52,15 @@ impl ShardRouter {
         config: &ShardRouterConfig,
         cancel: CancellationToken,
     ) -> Result<Self, AppError> {
-        if config.shards.len() != NUM_SHARDS {
-            return Err(AppError::Internal(format!(
-                "ShardRouterConfig must contain exactly {} shards, got {}",
-                NUM_SHARDS,
-                config.shards.len()
-            )));
+        if config.shards.is_empty() {
+            return Err(AppError::Internal(
+                "ShardRouterConfig must contain at least one shard".into(),
+            ));
         }
+        // Publish runtime shard count for the static `shard_for`.
+        NUM_SHARDS.store(config.shards.len(), Ordering::Relaxed);
 
-        let mut shards = Vec::with_capacity(NUM_SHARDS);
+        let mut shards = Vec::with_capacity(config.shards.len());
 
         for (i, shard_urls) in config.shards.iter().enumerate() {
             let pool = DatabasePool::new_shard(
@@ -83,18 +81,18 @@ impl ShardRouter {
             shards.push(pool);
         }
 
-        tracing::info!(num_shards = NUM_SHARDS, "ShardRouter initialized");
+        tracing::info!(num_shards = shards.len(), "ShardRouter initialized");
 
         Ok(Self { shards })
     }
 
-    /// Get the shard index for a given account.
-    ///
-    /// Uses FNV-1a hashing for deterministic, version-stable routing.
+    /// Get the shard index for a given account. FNV-1a → modulo
+    /// over the runtime-configured shard count.
     pub fn shard_for(account: &str) -> usize {
         let mut hasher = fnv::FnvHasher::default();
         account.hash(&mut hasher);
-        (hasher.finish() as usize) % NUM_SHARDS
+        let n = NUM_SHARDS.load(Ordering::Relaxed).max(1);
+        (hasher.finish() as usize) % n
     }
 
     /// Get the writer pool for a specific shard.

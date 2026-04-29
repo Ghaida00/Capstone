@@ -51,7 +51,11 @@ impl AccountService for GetBalanceService {
             ));
         }
 
-        let cache_key = format!("acc:{}", id.as_str());
+        let cache_key = format!(
+            "{}:acc:{}",
+            shared_kernel::cache::redis::CACHE_KEY_VERSION,
+            id.as_str()
+        );
         if let Ok(Some(cached)) = self.cache.get::<Balance>(&cache_key).await {
             return Ok(cached);
         }

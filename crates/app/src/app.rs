@@ -98,6 +98,28 @@ impl App {
         )
         .await?;
 
+        // Cache invalidator subscribes to commit events and DELs
+        // stale tx_status / acc cache keys. Bounds staleness at
+        // commit-time rather than cache TTL.
+        let _cache_inv_handle = transactions::spawn_cache_invalidator(
+            self.event_subscriber.clone(),
+            self.state.cache.clone(),
+            self.cancel.child_token(),
+        );
+
+        // Periodic sweep of expired idempotency rows. Without this
+        // the table grows unbounded.
+        let _idem_cleanup_handle = transactions::spawn_idempotency_cleanup(
+            self.state.shard_router.clone(),
+            self.cancel.child_token(),
+        );
+
+        // Cross-shard credit outbox drainer.
+        let _outbox_handle = transactions::spawn_cross_shard_processor(
+            self.state.shard_router.clone(),
+            self.cancel.child_token(),
+        );
+
         // Build the router. The subscriber half of the bus goes
         // into the notifications module so its dispatch loop can
         // drain events into the in-memory log.

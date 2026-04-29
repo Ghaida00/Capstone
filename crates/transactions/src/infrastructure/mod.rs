@@ -4,11 +4,17 @@
 //! Everything else in the module sees these capabilities only
 //! through trait objects declared in `domain/`.
 
+pub(crate) mod cache_invalidator;
+pub(crate) mod cleanup;
 pub(crate) mod consumer;
+pub(crate) mod cross_shard_processor;
 pub(crate) mod publisher;
 pub(crate) mod repository;
 
+pub use cache_invalidator::spawn_cache_invalidator;
+pub use cleanup::spawn_idempotency_cleanup;
 pub use consumer::start_consumer;
+pub use cross_shard_processor::spawn_cross_shard_processor;
 
 use std::sync::Arc;
 

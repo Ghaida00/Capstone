@@ -4,19 +4,18 @@
 //! trait objects from `domain/` or as `Arc<dyn ...>` ports from
 //! sibling modules. No I/O imports here.
 
-use std::hash::Hasher;
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
+
 use async_trait::async_trait;
-use chrono::Utc;
-use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use accounts::ports::{AccountError, AccountId, DynAccountService};
 use shared_kernel::db::shard::ShardRouter;
 
 use super::domain::{
-    DomainError, IdempotencyAwareWriter, PublishedTransaction, ReserveOutcome, Transaction,
+    IdempotencyAwareWriter, PublishedTransaction, ReserveOutcome, Transaction,
     TransactionPublisher, TransactionRepository,
 };
 use super::ports::{
@@ -28,6 +27,16 @@ use super::ports::{
 
 const MAX_ACCOUNT_LEN: usize = 50;
 const MAX_REFERENCE_ID_LEN: usize = 100;
+/// `description` is `TEXT` in DB. Cap at app layer to prevent
+/// per-message DoS / cost amplification.
+const MAX_DESCRIPTION_LEN: usize = 500;
+/// DB column is `VARCHAR(3) NOT NULL DEFAULT 'IDR'`. Reject anything
+/// else early — the consumer would otherwise abort the whole batch
+/// when the INSERT trips the column-length error.
+const CURRENCY_LEN: usize = 3;
+/// DB column is `DECIMAL(18, 2)`. Reject scales > 2 (would silently
+/// round, losing/creating money) and values that would overflow.
+const MAX_AMOUNT_SCALE: u32 = 2;
 
 fn validate_account(s: &str, field: &str) -> Result<(), TransactionError> {
     if s.is_empty() {
@@ -42,9 +51,28 @@ fn validate_account(s: &str, field: &str) -> Result<(), TransactionError> {
             field, MAX_ACCOUNT_LEN
         )));
     }
+    // First/last char must be alphanumeric to forbid pathological
+    // shapes like `"..."`, `"---"`, `"_"`, `".acc"`. The middle
+    // characters allow `- _ .` for common account-number formats.
+    let first_ok = s
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_alphanumeric())
+        .unwrap_or(false);
+    let last_ok = s
+        .chars()
+        .next_back()
+        .map(|c| c.is_ascii_alphanumeric())
+        .unwrap_or(false);
+    if !first_ok || !last_ok {
+        return Err(TransactionError::Validation(format!(
+            "{} must start and end with an alphanumeric character",
+            field
+        )));
+    }
     if !s
         .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
     {
         return Err(TransactionError::Validation(format!(
             "{} contains invalid characters",
@@ -55,6 +83,11 @@ fn validate_account(s: &str, field: &str) -> Result<(), TransactionError> {
 }
 
 fn validate_reference_id(s: &str) -> Result<(), TransactionError> {
+    if s.is_empty() {
+        return Err(TransactionError::Validation(
+            "reference_id must not be empty".into(),
+        ));
+    }
     if s.len() > MAX_REFERENCE_ID_LEN {
         return Err(TransactionError::Validation(format!(
             "reference_id must be at most {} characters",
@@ -67,6 +100,71 @@ fn validate_reference_id(s: &str) -> Result<(), TransactionError> {
     {
         return Err(TransactionError::Validation(
             "reference_id contains invalid characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `Decimal::scale()` returns the number of digits to the right of
+/// the decimal point. The DB column is `DECIMAL(18, 2)`, so any
+/// scale > 2 would silently round on INSERT/UPDATE — creating or
+/// destroying money rounding-class amounts. Reject up-front.
+fn validate_amount(amount: rust_decimal::Decimal) -> Result<(), TransactionError> {
+    if amount <= rust_decimal::Decimal::ZERO {
+        return Err(TransactionError::Validation(
+            "amount must be positive".into(),
+        ));
+    }
+    if amount.scale() > MAX_AMOUNT_SCALE {
+        return Err(TransactionError::Validation(format!(
+            "amount must have at most {} decimal places",
+            MAX_AMOUNT_SCALE
+        )));
+    }
+    // DECIMAL(18, 2) max = 9_999_999_999_999_999.99 (16 digits before
+    // the decimal point, 2 after). Reject amounts that would overflow
+    // before the consumer hits a DB CHECK violation that aborts the
+    // whole batch.
+    let max_amount = rust_decimal::Decimal::new(9_999_999_999_999_999_99i64, 2);
+    if amount > max_amount {
+        return Err(TransactionError::Validation(
+            "amount exceeds maximum DECIMAL(18, 2) value".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_currency(s: &str) -> Result<(), TransactionError> {
+    if s.len() != CURRENCY_LEN {
+        return Err(TransactionError::Validation(format!(
+            "currency must be exactly {} characters",
+            CURRENCY_LEN
+        )));
+    }
+    if !s.chars().all(|c| c.is_ascii_uppercase()) {
+        return Err(TransactionError::Validation(
+            "currency must be uppercase ASCII (e.g. IDR, USD)".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_description(s: &str) -> Result<(), TransactionError> {
+    if s.len() > MAX_DESCRIPTION_LEN {
+        return Err(TransactionError::Validation(format!(
+            "description must be at most {} characters",
+            MAX_DESCRIPTION_LEN
+        )));
+    }
+    // Newlines and control chars break CSV exports / log lines /
+    // simple UI rendering downstream. Restrict to printable ASCII +
+    // common Latin-1 punctuation; clients with multi-byte needs
+    // can update this rule deliberately.
+    if s.chars()
+        .any(|c| c.is_control() && c != '\t')
+    {
+        return Err(TransactionError::Validation(
+            "description must not contain control characters".into(),
         ));
     }
     Ok(())
@@ -144,19 +242,20 @@ impl TransactionService for TransactionsService {
     ) -> Result<TransactionAccepted, TransactionError> {
         // Validation. Parsing now happens once at the API layer
         // — `Decimal` arrives already-typed via serde, so the
-        // service only needs to check the domain invariant
-        // (positive). The previous implementation re-parsed via
-        // `Decimal::from_str` after the handler had already done
-        // a `to_string`, which is pure round-trip cost on every
-        // create.
-        if input.amount <= Decimal::ZERO {
-            return Err(TransactionError::Validation(
-                "amount must be positive".into(),
-            ));
-        }
+        // service only needs to check domain invariants here.
+        validate_amount(input.amount)?;
         validate_account(&input.from_account, "from_account")?;
         validate_account(&input.to_account, "to_account")?;
-        if input.from_account == input.to_account {
+        // Case-insensitive identity check — `"acc1"` vs `"ACC1"`
+        // would otherwise pass and the consumer would debit one
+        // row and credit a non-existent one. The case-fold also
+        // closes a hash-bypass: the idempotency key embeds
+        // `from_account`, so distinct casings would otherwise
+        // produce distinct keys for the same logical account.
+        if input
+            .from_account
+            .eq_ignore_ascii_case(&input.to_account)
+        {
             return Err(TransactionError::Validation(
                 "from_account and to_account must differ".into(),
             ));
@@ -164,10 +263,9 @@ impl TransactionService for TransactionsService {
         if let Some(rid) = input.reference_id.as_deref() {
             validate_reference_id(rid)?;
         }
-        if input.currency.trim().is_empty() {
-            return Err(TransactionError::Validation(
-                "currency must not be empty".into(),
-            ));
+        validate_currency(&input.currency)?;
+        if let Some(desc) = input.description.as_deref() {
+            validate_description(desc)?;
         }
 
         // Cross-module sender existence check — gated behind
@@ -214,22 +312,20 @@ impl TransactionService for TransactionsService {
         // string, so this is the single conversion point.
         let amount_str = input.amount.to_string();
 
-        // Stable hash for duplicate detection. The previous
-        // implementation built a `serde_json::Value`, allocated a
-        // BTreeMap of fields, then `.to_string()`'d it — a few
-        // µs of pure overhead per create that showed up under
-        // load. fnv-1a over the canonical field bytes (with a
-        // 0xff separator so adjacent fields can't be confused)
-        // is allocation-free and good enough for collision-class
-        // dedupe inside an idempotency_key namespace that is
-        // already disambiguated by `reference_id`.
+        // SHA-256 over the canonical field bytes with a 0xff
+        // separator so adjacent fields cannot be confused. The
+        // 64-bit fnv-1a previously here was vulnerable to
+        // birthday-class collisions (~2^32 keys per namespace) —
+        // a hash collision here lets a different request replay
+        // the original "accepted" response, masking a payload-
+        // tamper attack. SHA-256 closes that bypass.
         //
         // Hash format change is incompatible with rows produced
         // by the old code path; the load-test fixture wipes the
         // table between runs, but a real cutover would need a
         // migration of existing `idempotency_keys.request_hash`.
         let request_hash = {
-            let mut h = fnv::FnvHasher::default();
+            let mut h = Sha256::new();
             for part in [
                 input.from_account.as_bytes(),
                 input.to_account.as_bytes(),
@@ -238,10 +334,10 @@ impl TransactionService for TransactionsService {
                 reference_id.as_bytes(),
                 input.description.as_deref().unwrap_or("").as_bytes(),
             ] {
-                h.write(part);
-                h.write_u8(0xff);
+                h.update(part);
+                h.update([0xff]);
             }
-            format!("{:016x}", h.finish())
+            format!("{:x}", h.finalize())
         };
 
         let accepted = TransactionAccepted {
@@ -275,12 +371,14 @@ impl TransactionService for TransactionsService {
             ReserveOutcome::Reserved => { /* fall through to publish */ }
         }
 
-        // Publish to the queue. Failures here are infrastructure
-        // — the caller has already committed an idempotency row,
-        // and the consumer is responsible for re-driving via the
-        // status API.
+        // Publish to the queue. On failure roll back the
+        // idempotency reservation so the caller can retry — and so
+        // a stuck `processing` row + cached "accepted" payload
+        // does not lie to subsequent retries about a transaction
+        // that never reached the consumer.
         let request_id = input.request_id.clone().unwrap_or_default();
-        self.publisher
+        let publish_result = self
+            .publisher
             .publish_created(PublishedTransaction {
                 from_account: input.from_account.clone(),
                 to_account: input.to_account.clone(),
@@ -293,8 +391,35 @@ impl TransactionService for TransactionsService {
                 idempotency_key: idempotency_key.clone(),
                 request_hash: request_hash.clone(),
             })
-            .await
-            .map_err(TransactionError::Infra)?;
+            .await;
+
+        if let Err(publish_err) = publish_result {
+            // Best-effort cleanup. If the cleanup itself fails the
+            // row will sit in `processing` until natural expiry —
+            // bad, but no worse than the no-cleanup status quo.
+            // Surface both errors in the log for triage.
+            if let Err(release_err) = self
+                .idempotency
+                .release(shard, &idempotency_key)
+                .await
+            {
+                tracing::error!(
+                    publish_err = %publish_err,
+                    release_err = %release_err,
+                    idempotency_key = %idempotency_key,
+                    "publish failed AND idempotency release failed — row stuck until expiry"
+                );
+                metrics::counter!("idempotency_release_failures_total").increment(1);
+            } else {
+                tracing::warn!(
+                    error = %publish_err,
+                    idempotency_key = %idempotency_key,
+                    "publish failed, idempotency reservation rolled back"
+                );
+                metrics::counter!("idempotency_releases_total").increment(1);
+            }
+            return Err(TransactionError::Infra(publish_err));
+        }
 
         Ok(accepted)
     }
@@ -339,18 +464,3 @@ impl TransactionService for TransactionsService {
     }
 }
 
-impl From<DomainError> for TransactionError {
-    fn from(err: DomainError) -> Self {
-        match err {
-            DomainError::NotFound(m) => TransactionError::NotFound(m),
-            DomainError::Validation(m) => TransactionError::Validation(m),
-        }
-    }
-}
-
-// silence unused-import warning when chrono::Utc is only used
-// transitively via the trait return types.
-#[allow(dead_code)]
-fn _chrono_anchor() -> Utc {
-    Utc
-}

@@ -87,7 +87,11 @@ pub(crate) async fn get_balance(
     // Reuse the existing Redis cache key so both v1 and v2 see
     // each other's cached entries — smooth cutover when the
     // legacy endpoint is retired.
-    let cache_key = format!("balance:{}", account_number);
+    let cache_key = format!(
+        "{}:balance:{}",
+        shared_kernel::cache::redis::CACHE_KEY_VERSION,
+        account_number
+    );
 
     if let Some(cached) = deps.cache.get::<BalanceResponse>(&cache_key).await? {
         metrics::counter!("cache_hits_total").increment(1);

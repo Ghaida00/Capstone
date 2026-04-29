@@ -8,6 +8,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
 
+/// Cache-key version prefix. Bump on incompatible struct shape
+/// changes so old cached entries miss instead of mis-deserialising.
+pub const CACHE_KEY_VERSION: &str = "v1";
+
 /// Kernel-local config slice for [`RedisCache::new`].
 ///
 /// Phase 4 dropped the direct dependency on the binary's `Config`
@@ -231,15 +235,29 @@ impl RedisCache {
     }
 
     /// Get a cached value by key (reads from replica).
+    ///
+    /// A deserialize failure (stale schema, corrupted value) is
+    /// treated as a cache miss — the caller refetches and writes
+    /// fresh data over the bad entry. Surfacing the error as 5xx
+    /// would punish clients for an internal data hygiene problem
+    /// they cannot influence.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, AppError> {
         let mut conn = self.read_conn().await?;
         let value: Option<String> = conn.get(key).await.map_err(AppError::Redis)?;
 
         match value {
-            Some(json) => {
-                let parsed = serde_json::from_str(&json)?;
-                Ok(Some(parsed))
-            }
+            Some(json) => match serde_json::from_str(&json) {
+                Ok(parsed) => Ok(Some(parsed)),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        key = %key,
+                        "cache deserialize failed, treating as miss"
+                    );
+                    metrics::counter!("cache_deserialize_errors_total").increment(1);
+                    Ok(None)
+                }
+            },
             None => Ok(None),
         }
     }

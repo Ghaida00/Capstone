@@ -40,11 +40,15 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 /// Default channel capacity for the in-process broadcast bus.
-///
-/// Sized for "many bursts of a few hundred events" rather than
-/// "sustained millions" — at sustained rates above this we want
-/// real AMQP, not a tokio channel.
-const DEFAULT_BUS_CAPACITY: usize = 1024;
+/// Sized for sustained ~1k events/sec across multiple subscribers
+/// with a few seconds of head-room before lag drops kick in.
+const DEFAULT_BUS_CAPACITY: usize = 8192;
+
+/// Canonical name for the `transactions.committed` event. Both
+/// the publisher (queue consumer) and subscriber (notifications
+/// dispatcher, cache invalidator) reference this constant so a
+/// rename can never silently break the wire.
+pub const EVENT_TRANSACTIONS_COMMITTED: &str = "transactions.committed";
 
 /// Neutral event envelope.
 ///

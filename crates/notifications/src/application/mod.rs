@@ -74,9 +74,24 @@ impl EventDispatcher {
 
     /// Spawn the dispatch loop. Returns the `JoinHandle` so the
     /// bootstrap can await graceful exit.
+    ///
+    /// A small bounded set of recently-seen `event.id`s deduplicates
+    /// the bus — re-published events (consumer redelivery, replay,
+    /// etc.) would otherwise produce duplicate notification entries
+    /// for the same transaction. The set is capped via FIFO eviction
+    /// so memory is bounded regardless of throughput.
     pub(crate) fn spawn(self, cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
         let mut rx = self.subscriber.subscribe();
         let store = self.store;
+        // Bound chosen to cover the practical redelivery window —
+        // a few seconds of throughput at peak. Larger means more
+        // memory, smaller means duplicate entries leak past the
+        // dedupe under sustained re-publish.
+        const DEDUPE_WINDOW: usize = 4096;
+        let mut seen: std::collections::VecDeque<Uuid> =
+            std::collections::VecDeque::with_capacity(DEDUPE_WINDOW);
+        let mut seen_set: std::collections::HashSet<Uuid> =
+            std::collections::HashSet::with_capacity(DEDUPE_WINDOW);
 
         tokio::spawn(async move {
             tracing::info!("notifications: event dispatcher started");
@@ -85,6 +100,19 @@ impl EventDispatcher {
                     msg = rx.recv() => {
                         match msg {
                             Ok(event) => {
+                                if seen_set.contains(&event.id) {
+                                    metrics::counter!("notifications_dedup_hits_total")
+                                        .increment(1);
+                                    continue;
+                                }
+                                seen_set.insert(event.id);
+                                seen.push_back(event.id);
+                                if seen.len() > DEDUPE_WINDOW {
+                                    if let Some(old) = seen.pop_front() {
+                                        seen_set.remove(&old);
+                                    }
+                                }
+
                                 if let Some(entry) = map_event_to_entry(&event) {
                                     if let Err(e) = store.append(entry).await {
                                         tracing::error!(
@@ -133,7 +161,7 @@ impl EventDispatcher {
 /// new kind is one match arm + one DTO.
 fn map_event_to_entry(event: &Event) -> Option<NotificationEntry> {
     match event.name.as_str() {
-        "transactions.committed" => {
+        shared_kernel::events::EVENT_TRANSACTIONS_COMMITTED => {
             let payload: TransactionCommittedDomainEvent = match event.decode_payload() {
                 Ok(p) => p,
                 Err(e) => {

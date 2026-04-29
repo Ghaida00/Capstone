@@ -37,6 +37,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 fnv = { workspace = true }
+url = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

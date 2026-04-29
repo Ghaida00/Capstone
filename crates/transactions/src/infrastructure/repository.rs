@@ -76,10 +76,12 @@ impl SqlxTransactionRepository {
 #[async_trait]
 impl TransactionRepository for SqlxTransactionRepository {
     async fn find_by_id(&self, id: TransactionId) -> Result<Option<Transaction>, String> {
-        // Cross-shard fan-out. Same pattern as the legacy
-        // handler: spawn one query per shard, return the first
-        // hit. Misses are silent so a query timeout on one shard
-        // does not prevent another from answering.
+        // Cross-shard fan-out: spawn one query per shard, await
+        // ALL of them. Surfacing infra errors (one shard down) is
+        // important — silently swallowing them would return 404
+        // for rows that genuinely live on the unavailable shard.
+        // Awaiting all handles also avoids the leak the
+        // first-hit-wins variant produced.
         let mut handles = Vec::with_capacity(self.shards.num_shards());
         for shard_idx in 0..self.shards.num_shards() {
             let pool = self.shards.reader(shard_idx).clone();
@@ -93,16 +95,42 @@ impl TransactionRepository for SqlxTransactionRepository {
                 .await
             }));
         }
+        let mut found: Option<Transaction> = None;
+        let mut last_err: Option<String> = None;
         for h in handles {
-            if let Ok(Ok(Some(row))) = h.await {
-                return Ok(Some(row.into()));
+            match h.await {
+                Ok(Ok(Some(row))) => {
+                    if found.is_none() {
+                        found = Some(row.into());
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => last_err = Some(e.to_string()),
+                Err(e) => last_err = Some(format!("join: {}", e)),
             }
+        }
+        if found.is_some() {
+            // At least one shard answered with the row. A partial
+            // failure on another shard is logged but doesn't mask
+            // the hit.
+            if let Some(err) = last_err {
+                tracing::warn!(err = %err, "find_by_id: partial shard failure");
+            }
+            return Ok(found);
+        }
+        if let Some(err) = last_err {
+            return Err(err);
         }
         Ok(None)
     }
 
     async fn list(&self, filter: &ListFilter) -> Result<Vec<Transaction>, String> {
         let limit = filter.limit.min(100) as i64;
+        // Over-fetch per-shard to reduce the chance of merge-truncate
+        // dropping rows from one shard that happen to be older than
+        // another shard's tail. Per-shard cursor would close it
+        // entirely; this mitigation is the practical compromise.
+        let per_shard_limit = limit.saturating_mul(self.shards.num_shards() as i64).max(limit);
         let cursor = filter.before;
 
         let mut handles = Vec::with_capacity(self.shards.num_shards());
@@ -112,18 +140,18 @@ impl TransactionRepository for SqlxTransactionRepository {
                 match cursor {
                     Some(before) => {
                         sqlx::query_as::<_, TransactionRowSlim>(
-                            "SELECT id, from_account, to_account, amount, currency, status, reference_id, description, created_at, updated_at, processed_at FROM transactions WHERE created_at < $1 ORDER BY created_at DESC LIMIT $2",
+                            "SELECT id, from_account, to_account, amount, currency, status, reference_id, description, created_at, updated_at, processed_at FROM transactions WHERE created_at < $1 ORDER BY created_at DESC, id DESC LIMIT $2",
                         )
                         .bind(before)
-                        .bind(limit)
+                        .bind(per_shard_limit)
                         .fetch_all(&pool)
                         .await
                     }
                     None => {
                         sqlx::query_as::<_, TransactionRowSlim>(
-                            "SELECT id, from_account, to_account, amount, currency, status, reference_id, description, created_at, updated_at, processed_at FROM transactions ORDER BY created_at DESC LIMIT $1",
+                            "SELECT id, from_account, to_account, amount, currency, status, reference_id, description, created_at, updated_at, processed_at FROM transactions ORDER BY created_at DESC, id DESC LIMIT $1",
                         )
-                        .bind(limit)
+                        .bind(per_shard_limit)
                         .fetch_all(&pool)
                         .await
                     }
@@ -132,12 +160,26 @@ impl TransactionRepository for SqlxTransactionRepository {
         }
 
         let mut rows: Vec<Transaction> = Vec::new();
+        let mut last_err: Option<String> = None;
         for h in handles {
-            if let Ok(Ok(rs)) = h.await {
-                rows.extend(rs.into_iter().map(Into::into));
+            match h.await {
+                Ok(Ok(rs)) => rows.extend(rs.into_iter().map(Into::into)),
+                Ok(Err(e)) => last_err = Some(e.to_string()),
+                Err(e) => last_err = Some(format!("join: {}", e)),
             }
         }
-        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        // Surface infra errors only when zero shards answered —
+        // a partial result is still useful and the error is logged.
+        if rows.is_empty() {
+            if let Some(err) = last_err {
+                return Err(err);
+            }
+        } else if let Some(err) = last_err {
+            tracing::warn!(err = %err, "list: partial shard failure");
+        }
+        // Stable order: created_at DESC, id DESC (matches per-shard
+        // ORDER BY so merging is consistent).
+        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
         rows.truncate(limit as usize);
         Ok(rows)
     }
@@ -159,14 +201,32 @@ impl TransactionRepository for SqlxTransactionRepository {
                 .await
             }));
         }
+        let mut found: Option<TransactionStatus> = None;
+        let mut last_err: Option<String> = None;
         for h in handles {
-            if let Ok(Ok(Some(row))) = h.await {
-                return Ok(Some(TransactionStatus {
-                    reference_id: row.reference_id.unwrap_or_default(),
-                    status: row.status,
-                    processed_at: row.processed_at,
-                }));
+            match h.await {
+                Ok(Ok(Some(row))) => {
+                    if found.is_none() {
+                        found = Some(TransactionStatus {
+                            reference_id: row.reference_id.unwrap_or_default(),
+                            status: row.status,
+                            processed_at: row.processed_at,
+                        });
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => last_err = Some(e.to_string()),
+                Err(e) => last_err = Some(format!("join: {}", e)),
             }
+        }
+        if found.is_some() {
+            if let Some(err) = last_err {
+                tracing::warn!(err = %err, "find_status_by_reference: partial shard failure");
+            }
+            return Ok(found);
+        }
+        if let Some(err) = last_err {
+            return Err(err);
         }
         Ok(None)
     }
@@ -179,7 +239,15 @@ struct IdempotencyRowSlim {
     request_hash: String,
     status: String,
     response_payload: Option<serde_json::Value>,
+    /// `NOW() < expires_at` is computed SQL-side via the `expired`
+    /// projection below; the timestamp is kept in the row for
+    /// observability only. Comparing `expires_at` against
+    /// `Utc::now()` in the application would risk app-vs-DB clock
+    /// skew producing premature/late revives.
+    #[allow(dead_code)]
     expires_at: chrono::DateTime<Utc>,
+    /// SQL-side `NOW() >= expires_at` — sidesteps app/DB clock drift.
+    expired: bool,
 }
 
 pub(crate) struct SqlxIdempotencyWriter {
@@ -192,6 +260,8 @@ impl SqlxIdempotencyWriter {
         Self { shards, cache }
     }
 }
+
+const IDEMPOTENCY_TTL_SECS: u64 = 86_400;
 
 #[async_trait]
 impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
@@ -230,19 +300,29 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         .map_err(|e| e.to_string())?;
 
         if inserted.rows_affected() > 0 {
-            // First-mover. Cache the accepted payload at the
-            // legacy 24h TTL so duplicate v1/v2 replays hit
-            // Redis directly.
+            // First-mover. Cache the accepted payload so duplicate
+            // v1/v2 replays hit Redis directly. Cache write is
+            // best-effort — a Redis hiccup just means subsequent
+            // duplicates fall through to the DB row.
             let _ = self
                 .cache
-                .set(idempotency_key, accepted_payload, 86400)
+                .set(idempotency_key, accepted_payload, IDEMPOTENCY_TTL_SECS)
                 .await;
             return Ok(ReserveOutcome::Reserved);
         }
 
-        // Row already exists — examine it.
+        // Row already exists — examine it. SQL-side `expired`
+        // projection so we never compare app vs DB clocks.
         let existing: Option<IdempotencyRowSlim> = sqlx::query_as(
-            "SELECT request_hash, status, response_payload, expires_at FROM idempotency_keys WHERE idempotency_key = $1",
+            r#"
+            SELECT request_hash,
+                   status,
+                   response_payload,
+                   expires_at,
+                   (NOW() >= expires_at) AS expired
+            FROM idempotency_keys
+            WHERE idempotency_key = $1
+            "#,
         )
         .bind(idempotency_key)
         .fetch_optional(writer)
@@ -250,10 +330,13 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         .map_err(|e| e.to_string())?;
 
         let Some(existing) = existing else {
-            // Race: row vanished between INSERT and SELECT.
-            // Treat as a fresh reservation; legacy code did the
-            // same.
-            return Ok(ReserveOutcome::Reserved);
+            // Race: row vanished between INSERT and SELECT (e.g.
+            // the cleanup worker swept an expired row mid-flight).
+            // Surface as Infra so the caller can retry — silently
+            // treating this as a fresh reservation would let two
+            // concurrent callers both publish the same logical
+            // transaction.
+            return Err("idempotency row vanished after INSERT conflict".to_string());
         };
 
         if existing.request_hash != request_hash {
@@ -264,20 +347,34 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         if matches!(
             existing.status.as_str(),
             "processing" | "completed" | "pending"
-        ) {
+        ) && !existing.expired
+        {
+            // Replay path — the stored response_payload reflects
+            // whatever the first-mover sent (which is still the
+            // best wire-form approximation of the duplicate's
+            // accepted/queued state). If the payload column is
+            // somehow NULL (legacy rows), fall through to the
+            // current caller's payload.
             let payload = existing
                 .response_payload
                 .unwrap_or_else(|| accepted_payload.clone());
-            let _ = self.cache.set(idempotency_key, &payload, 86400).await;
+            // Re-warm the cache so subsequent duplicates skip the
+            // DB roundtrip. Same payload as we just returned.
+            let _ = self
+                .cache
+                .set(idempotency_key, &payload, IDEMPOTENCY_TTL_SECS)
+                .await;
             metrics::counter!("idempotency_hits_total").increment(1);
             return Ok(ReserveOutcome::Replay(payload));
         }
 
-        if existing.status == "failed" || existing.expires_at <= Utc::now() {
-            // Revive failed or expired reservation. Best-effort:
-            // if the UPDATE matches no rows another worker won
-            // the race; fall through to replay anyway.
-            let _ = sqlx::query(
+        if existing.status == "failed" || existing.expired {
+            // Revive failed or expired reservation. Atomic:
+            // condition the UPDATE on the same `failed/expired`
+            // predicate so a concurrent winner can't be stomped.
+            // If the UPDATE matched zero rows the winner has
+            // already moved the row to processing — replay theirs.
+            let revived = sqlx::query(
                 r#"
                 UPDATE idempotency_keys
                 SET status = 'processing',
@@ -285,27 +382,75 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
                     expires_at = NOW() + INTERVAL '24 hours',
                     updated_at = NOW()
                 WHERE idempotency_key = $1
-                  AND (status = 'failed' OR expires_at <= NOW())
+                  AND (status = 'failed' OR NOW() >= expires_at)
                 "#,
             )
             .bind(idempotency_key)
             .bind(accepted_payload)
             .execute(writer)
-            .await;
+            .await
+            .map_err(|e| e.to_string())?;
 
-            let _ = self
-                .cache
-                .set(idempotency_key, accepted_payload, 86400)
-                .await;
-            return Ok(ReserveOutcome::Reserved);
+            if revived.rows_affected() > 0 {
+                // We won the revive race — proceed to publish.
+                let _ = self
+                    .cache
+                    .set(idempotency_key, accepted_payload, IDEMPOTENCY_TTL_SECS)
+                    .await;
+                return Ok(ReserveOutcome::Reserved);
+            }
+
+            // Lost the revive race. Re-fetch and replay the winner's
+            // payload rather than caching ours over theirs.
+            let winner: Option<IdempotencyRowSlim> = sqlx::query_as(
+                r#"
+                SELECT request_hash,
+                       status,
+                       response_payload,
+                       expires_at,
+                       (NOW() >= expires_at) AS expired
+                FROM idempotency_keys
+                WHERE idempotency_key = $1
+                "#,
+            )
+            .bind(idempotency_key)
+            .fetch_optional(writer)
+            .await
+            .map_err(|e| e.to_string())?;
+            let payload = winner
+                .and_then(|w| w.response_payload)
+                .unwrap_or_else(|| accepted_payload.clone());
+            metrics::counter!("idempotency_hits_total").increment(1);
+            return Ok(ReserveOutcome::Replay(payload));
         }
 
-        // Unknown state — treat as replay (safest).
-        let _ = self
-            .cache
-            .set(idempotency_key, accepted_payload, 86400)
-            .await;
-        metrics::counter!("idempotency_hits_total").increment(1);
-        Ok(ReserveOutcome::Replay(accepted_payload.clone()))
+        // Unknown state. Don't cache OUR payload over a row whose
+        // semantics we don't understand — surface as Infra so the
+        // operator can investigate. Caching would silently lock
+        // duplicate replies to a payload that may not match reality.
+        Err(format!(
+            "idempotency row in unexpected state: {}",
+            existing.status
+        ))
+    }
+
+    async fn release(&self, shard: usize, idempotency_key: &str) -> Result<(), String> {
+        let writer = self.shards.writer(shard);
+        // DELETE rather than mark 'failed' — the caller never
+        // reached the queue, so there's no "thing to retry"
+        // associated with this key. A subsequent retry should be
+        // able to claim the same key fresh.
+        sqlx::query("DELETE FROM idempotency_keys WHERE idempotency_key = $1 AND status = 'processing'")
+            .bind(idempotency_key)
+            .execute(writer)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Best-effort cache invalidation. If this fails the cache
+        // entry will outlive the DB row (24h) and replay a stale
+        // "accepted" — log but don't propagate.
+        if let Err(e) = self.cache.delete(idempotency_key).await {
+            tracing::warn!(error = %e, key = %idempotency_key, "idempotency cache delete failed");
+        }
+        Ok(())
     }
 }

@@ -12,6 +12,12 @@ use uuid::Uuid;
 use super::ports::{ListFilter, TransactionId};
 
 // ─── Entities ────────────────────────────────────────────────
+//
+// `DomainError` lived here through Phase 4 but never had a
+// constructor — every error path goes through `TransactionError`
+// at the port boundary. It was removed to keep the surface
+// honest; reintroduce when a real domain-layer rule needs to
+// signal failure independently of infrastructure.
 
 #[derive(Debug, Clone)]
 pub(crate) struct Transaction {
@@ -33,18 +39,6 @@ pub(crate) struct TransactionStatus {
     pub reference_id: String,
     pub status: String,
     pub processed_at: Option<DateTime<Utc>>,
-}
-
-// ─── Domain errors ──────────────────────────────────────────
-
-#[allow(dead_code)]
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum DomainError {
-    #[error("not found: {0}")]
-    NotFound(String),
-
-    #[error("validation: {0}")]
-    Validation(String),
 }
 
 // ─── Repository trait (declared in domain, impl'd in infra) ─
@@ -83,6 +77,15 @@ pub(crate) trait IdempotencyAwareWriter: Send + Sync + 'static {
         request_hash: &str,
         accepted_payload: &serde_json::Value,
     ) -> Result<ReserveOutcome, String>;
+
+    /// Roll back a freshly-claimed reservation when the caller
+    /// failed to publish to the queue. Without this hook a publish
+    /// failure leaves a `processing` row in `idempotency_keys`
+    /// and a cached "accepted" payload in Redis — every subsequent
+    /// retry replays the cached success even though no message
+    /// reached the consumer. Implementations DELETE the row on the
+    /// reservation shard and DEL the Redis key.
+    async fn release(&self, shard: usize, idempotency_key: &str) -> Result<(), String>;
 }
 
 #[derive(Debug)]

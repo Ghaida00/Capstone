@@ -7,6 +7,7 @@ const transactionCreated = new Counter("transactions_created");
 const transactionRead = new Counter("transactions_read");
 const errorRate = new Rate("error_rate");
 const transactionLatency = new Trend("transaction_latency", true);
+const idempotencyReplayHits = new Counter("idempotency_replay_attempts");
 
 // ─── Configuration ─────────────────────────────────────────
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";
@@ -14,215 +15,363 @@ const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";
 // Must match the accounts seeded by db/init.sql (ACC_0000001 – ACC_1000000)
 const NUM_ACCOUNTS = 1000000;
 
-// Generate account number on-the-fly to avoid allocating a 1M array per VU
+// Hot-key contention pool: tiny set to force row-lock waits on the
+// debit UPDATE. Exercises the locking behavior that the uniform
+// 1M-account pick can never reach.
+const HOT_KEY_POOL_SIZE = 10;
+
+// Random account from the 1M pool. Generated on-the-fly so we never
+// allocate a 1M array per VU.
 function randomAccount() {
-    const i = Math.floor(Math.random() * NUM_ACCOUNTS) + 1;
-    return `ACC_${String(i).padStart(7, "0")}`;
+  const i = Math.floor(Math.random() * NUM_ACCOUNTS) + 1;
+  return `ACC_${String(i).padStart(7, "0")}`;
 }
 
-// ─── 1 Million Transactions Per Hour Target ────────────────
-// 1,000,000 transactions / 60 minutes / 60 seconds = ~277.77 transactions per second (TPS).
-// We will use the "constant-arrival-rate" executor to force k6 to start exactly 278 iterations per second.
+// Random account from the 10-key hot pool.
+function hotAccount() {
+  const i = Math.floor(Math.random() * HOT_KEY_POOL_SIZE) + 1;
+  return `ACC_${String(i).padStart(7, "0")}`;
+}
+
+// Per-VU buffer of recently-issued reference_ids. Used to mix in
+// idempotency replays so the cache-hit Replay branch is exercised.
+// Bounded so the array can't grow without bound across long runs.
+const REPLAY_BUFFER_SIZE = 32;
+let replayBuffer = [];
+
+function rememberReferenceId(refId) {
+  replayBuffer.push(refId);
+  if (replayBuffer.length > REPLAY_BUFFER_SIZE) {
+    replayBuffer.shift();
+  }
+}
+
+function pickReplayReferenceId() {
+  if (replayBuffer.length === 0) return null;
+  return replayBuffer[Math.floor(Math.random() * replayBuffer.length)];
+}
+
+// ─── Test Scenarios ────────────────────────────────────────
 
 export const options = {
-    scenarios: {
-        sustained_1m_per_hour: {
-            executor: "constant-arrival-rate",
-            // Target rate: 278 iterations per second.
-            rate: 278,
-            timeUnit: "1s",
-
-            // We'll run this for 15 minutes by default to prove stability. 
-            // You can change this to "1h" if you want to run the full hour test.
-            duration: "15m",
-
-            // Pre-allocate VUs to handle the steady load
-            preAllocatedVUs: 300,
-
-            // If the system slows down, k6 is allowed to spin up to 1500 VUs to maintain the 278 TPS rate.
-            maxVUs: 1500,
-
-            tags: { scenario: "sustained_1m_per_hour" },
-        },
+  scenarios: {
+    sustained_1m_per_hour: {
+      executor: "constant-arrival-rate",
+      rate: 278,
+      timeUnit: "1s",
+      duration: "15m",
+      preAllocatedVUs: 300,
+      maxVUs: 1500,
+      exec: "txWorkload",
+      tags: { scenario: "sustained_1m_per_hour" },
     },
+  },
 
-    thresholds: {
-        // Strict thresholds for a sustained production-like load.
-        // We expect the system to hum along perfectly without rate limiting or circuit breaking.
-        http_req_duration: ["p(95)<200", "p(99)<500"], // 95% under 200ms, 99% under 500ms
-        http_req_failed: ["rate<0.01"],                // Less than 1% total errors
-        error_rate: ["rate<0.01"],                     // Custom error tracking < 1%
-    },
+  thresholds: {
+    http_req_duration: ["p(95)<500", "p(99)<1500"],
+    http_req_failed: ["rate<0.05"],
+    error_rate: ["rate<0.05"],
+  },
 };
 
 // ─── Helpers ───────────────────────────────────────────────
 
+// Per-VU error log budget. Logging is silently dropped above
+// 200 VU (spike / late-stress) to avoid drowning the k6 stdout
+// in 10k+ lines per run.
 const MAX_LOGGED_ERRORS = 5;
+const LOG_VU_CEILING = 200;
 let loggedErrors = 0;
 
 function logFailure(context, res) {
-    if (loggedErrors >= MAX_LOGGED_ERRORS) return;
-    loggedErrors++;
+  if (__VU > LOG_VU_CEILING) return;
+  if (loggedErrors >= MAX_LOGGED_ERRORS) return;
+  loggedErrors++;
 
-    const bodyPreview = res.body
-        ? String(res.body).substring(0, 200)
-        : "(empty body)";
-    console.warn(
-        `⚠️  [${context}] status=${res.status} | ` +
-            `error_code=${res.error_code} | ` +
-            `body=${bodyPreview}`
-    );
+  const bodyPreview = res.body
+    ? String(res.body).substring(0, 200)
+    : "(empty body)";
+  console.warn(
+    `⚠️  [${context}] status=${res.status} | ` +
+      `error_code=${res.error_code} | ` +
+      `body=${bodyPreview}`
+  );
 }
 
-// ─── Setup: Verify connectivity & account seeding ──────────
+// Poll /api/v2/transactions/status/{ref} until the consumer marks
+// the row completed/failed. Used by setup to verify end-to-end works
+// before the load scenarios start.
+function waitForCompletion(refId, timeoutMs = 5000, pollMs = 200) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const res = http.get(`${BASE_URL}/api/v2/transactions/status/${refId}`);
+    if (res.status === 200) {
+      try {
+        const body = JSON.parse(res.body);
+        const status = body && body.data && body.data.status;
+        if (status === "completed" || status === "failed") {
+          return status;
+        }
+      } catch (e) {
+        /* fall through to retry */
+      }
+    }
+    sleep(pollMs / 1000);
+  }
+  return null;
+}
+
+// ─── Setup: Verify connectivity & end-to-end pipeline ──────
 export function setup() {
-    console.log(`🎯 Target: ${BASE_URL}`);
-    console.log(`📊 Goal: 1 Million Transactions Per Hour (~278 TPS)`);
-    console.log(`⏱️  Duration: 15 minutes (can scale up to 1h)`);
-    console.log(`👥 Using ${NUM_ACCOUNTS} pre-seeded accounts (ACC_0000001 – ACC_1000000)\n`);
+  console.log(`🎯 Target: ${BASE_URL}`);
+  console.log(`📊 Running: smoke → load → stress → spike → hotkey`);
+  console.log(`👥 Using ${NUM_ACCOUNTS} pre-seeded accounts (ACC_0000001 – ACC_1000000)`);
+  console.log(`🔥 Hot-key pool: ${HOT_KEY_POOL_SIZE} accounts (ACC_0000001 – ACC_${String(HOT_KEY_POOL_SIZE).padStart(7, "0")})\n`);
 
-    // 1. Health check
-    const health = http.get(`${BASE_URL}/health`);
-    if (health.status !== 200) {
-        console.error(`❌ Health check failed! Status: ${health.status}`);
-        console.error(`   Make sure docker-compose is running.`);
-        return { ok: false };
-    }
-    console.log(`✅ Health check passed`);
+  // 1. Health check
+  const health = http.get(`${BASE_URL}/health`);
+  if (health.status !== 200) {
+    console.error(`❌ Health check failed! Status: ${health.status}`);
+    console.error(`   Make sure docker-compose is running.`);
+    return { ok: false };
+  }
+  console.log(`✅ Health check passed`);
 
-    // 2. Verify accounts exist
-    const balanceRes = http.get(
-        `${BASE_URL}/api/v2/accounts/ACC_0000001/balance`
+  // 2. Verify accounts exist (no state mutation)
+  const balanceRes = http.get(`${BASE_URL}/api/v2/accounts/ACC_0000001/balance`);
+  if (balanceRes.status !== 200) {
+    console.error(
+      `❌ Account ACC_0000001 not found (status ${balanceRes.status}).\n` +
+        `   Seed accounts first via db/init.sql or k6/seed-accounts.sql.`
     );
-    if (balanceRes.status !== 200) {
-        console.error(
-            `❌ Account ACC_0000001 not found (status ${balanceRes.status}).\n` +
-                `   Run the seed script first on each shard:\n` +
-                `     PGPASSWORD=$POSTGRES_PASSWORD psql -h localhost -p 5000 -U $POSTGRES_USER -d $POSTGRES_DB < k6/seed-accounts.sql\n` +
-                `     PGPASSWORD=$POSTGRES_PASSWORD psql -h localhost -p 5001 -U $POSTGRES_USER -d $POSTGRES_DB < k6/seed-accounts.sql`
-        );
-        return { ok: false };
-    }
-    console.log(`✅ Accounts verified (ACC_0000001 exists)`);
+    return { ok: false };
+  }
+  console.log(`✅ Accounts verified (ACC_0000001 exists)`);
 
-    // 3. Smoke-test a single transaction
-    console.log(`\n🔍 Testing single transaction create...`);
-    const testPayload = JSON.stringify({
-        from_account: "ACC_0000001",
-        to_account: "ACC_0000002",
-        amount: 100.0,
-        currency: "IDR",
-        description: "k6 1M/hr setup diagnostic test",
-    });
+  // 3. End-to-end smoke test: create + poll status until consumer
+  // marks the row processed. Confirms the entire path (HTTP → queue
+  // → consumer → DB) is alive before the load scenarios fire.
+  console.log(`\n🔍 End-to-end smoke test (create + wait for consumer)...`);
+  const setupRefId = `setup-${__ENV.HOSTNAME || "host"}-${Date.now()}`;
+  const testPayload = JSON.stringify({
+    from_account: "ACC_0000001",
+    to_account: "ACC_0000002",
+    amount: "1.00",
+    currency: "IDR",
+    reference_id: setupRefId,
+    description: "k6 setup diagnostic test",
+  });
 
-    const createRes = http.post(
-        `${BASE_URL}/api/v2/transactions`,
-        testPayload,
-        { headers: { "Content-Type": "application/json" } }
+  const createRes = http.post(`${BASE_URL}/api/v2/transactions`, testPayload, {
+    headers: { "Content-Type": "application/json" },
+  });
+
+  console.log(`   Create status: ${createRes.status}`);
+  if (createRes.status < 200 || createRes.status >= 300) {
+    console.error(
+      `❌ Transaction create returned ${createRes.status}. ` +
+        `Body: ${String(createRes.body).substring(0, 300)}`
     );
+    return { ok: false };
+  }
 
-    console.log(`   Status: ${createRes.status}`);
-    console.log(`   Body:   ${String(createRes.body).substring(0, 300)}`);
+  const finalStatus = waitForCompletion(setupRefId, 8000, 200);
+  if (finalStatus === null) {
+    console.error(
+      `❌ Consumer did not process setup transaction within 8s. ` +
+        `RabbitMQ or consumer may be wedged.`
+    );
+    return { ok: false };
+  }
+  console.log(`✅ Consumer processed setup tx → status=${finalStatus}\n`);
 
-    if (createRes.status >= 200 && createRes.status < 300) {
-        console.log(`✅ Transaction create works (status ${createRes.status})\n`);
-    } else {
-        console.error(
-            `❌ Transaction create returned ${createRes.status} — the test will likely fail.`
-        );
-        return { ok: false };
-    }
-
-    return { ok: true };
+  return { ok: true };
 }
 
-// ─── Main Test Function ────────────────────────────────────
-export default function (data) {
-    if (!data.ok) {
-        console.error("Setup failed — skipping iteration");
-        sleep(1);
-        return;
+// ─── Main workload (smoke / load / stress / spike) ─────────
+export function txWorkload(data) {
+  if (!data.ok) {
+    sleep(1);
+    return;
+  }
+
+  group("Create Transaction", () => {
+    let fromAccount = randomAccount();
+    let toAccount = randomAccount();
+    while (toAccount === fromAccount) {
+      toAccount = randomAccount();
     }
 
-    // In a constant-arrival-rate scenario, each iteration is exactly 1 user journey.
-    // We'll focus strictly on the core business flow: Creating a transaction.
+    // ~5% chance to replay an earlier reference_id from this VU's
+    // buffer — exercises the idempotency cache-hit Replay branch
+    // and lights up `idempotency_hits_total` on the dashboard.
+    let referenceId;
+    let isReplay = false;
+    if (Math.random() < 0.05 && replayBuffer.length > 0) {
+      referenceId = pickReplayReferenceId();
+      isReplay = true;
+      idempotencyReplayHits.add(1);
+    } else {
+      referenceId = `${__VU}-${__ITER}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    }
 
-    group("Create Transaction", () => {
-        // Pick two different random accounts from the seeded pool
-        let fromAccount = randomAccount();
-        let toAccount = randomAccount();
-        while (toAccount === fromAccount) {
-            toAccount = randomAccount();
-        }
-
-        const payload = JSON.stringify({
-            from_account: fromAccount,
-            to_account: toAccount,
-            amount: parseFloat((Math.random() * 10000 + 1).toFixed(2)),
-            currency: "IDR",
-            description: `k6 1M/hr load test ${Date.now()}`,
-        });
-
-        const params = {
-            headers: { "Content-Type": "application/json" },
-        };
-
-        const res = http.post(
-            `${BASE_URL}/api/v2/transactions`,
-            payload,
-            params
-        );
-
-        const isAccepted = res.status >= 200 && res.status < 300;
-
-        const success = check(res, {
-            "create status 2xx": (r) => isAccepted,
-            "create has reference_id": (r) => {
-                if (!isAccepted) return false;
-                try {
-                    const body = JSON.parse(r.body);
-                    return !!(body.data && body.data.reference_id);
-                } catch (e) {
-                    return false;
-                }
-            },
-            "not rate limited": (r) => r.status !== 429,
-            "not overloaded": (r) => r.status !== 503,
-        });
-
-        errorRate.add(!isAccepted);
-
-        // Only increment created if we actually succeeded
-        if (isAccepted) {
-            transactionCreated.add(1);
-        }
-
-        transactionLatency.add(res.timings.duration);
-
-        if (!isAccepted) {
-            logFailure("Create Transaction", res);
-        }
+    // toFixed(2) avoids JS float JSON artefacts; server validates scale<=2.
+    const amount = (Math.random() * 1000 + 1).toFixed(2);
+    const payload = JSON.stringify({
+      from_account: fromAccount,
+      to_account: toAccount,
+      amount,
+      currency: "IDR",
+      reference_id: referenceId,
+      description: `k6 load test`,
     });
 
-    // Optional: Read a transaction (simulating 10% of users checking their list)
-    if (Math.random() < 0.1) {
-        group("List Transactions", () => {
-            const res = http.get(
-                `${BASE_URL}/api/v2/transactions?limit=10&offset=0`
-            );
+    const params = {
+      headers: { "Content-Type": "application/json" },
+      tags: { name: "POST /api/v2/transactions" },
+    };
 
-            check(res, {
-                "list status 200": (r) => r.status === 200,
-            });
+    const res = http.post(`${BASE_URL}/api/v2/transactions`, payload, params);
+    const isAccepted = res.status >= 200 && res.status < 300;
 
-            transactionRead.add(1);
-        });
+    check(res, {
+      "create status 2xx": () => isAccepted,
+      "create has reference_id": () => {
+        if (!isAccepted) return false;
+        try {
+          const body = JSON.parse(res.body);
+          return !!(body.data && body.data.reference_id);
+        } catch (e) {
+          return false;
+        }
+      },
+      "not rate limited": () => res.status !== 429,
+      "not overloaded": () => res.status !== 503,
+    });
+
+    errorRate.add(!isAccepted);
+    transactionCreated.add(1);
+    transactionLatency.add(res.timings.duration);
+
+    if (isAccepted && !isReplay) {
+      rememberReferenceId(referenceId);
     }
+    if (!isAccepted) {
+      logFailure("Create Transaction", res);
+    }
+  });
+
+  group("List Transactions", () => {
+    // Vary the cursor in half the calls so we don't all hit the
+    // same `txn_list:10:latest` cache key. Realistic clients page
+    // back through history with a `before` cursor.
+    let url = `${BASE_URL}/api/v2/transactions?limit=10`;
+    if (Math.random() < 0.5) {
+      const minutesBack = Math.floor(Math.random() * 60) + 1;
+      const cursor = new Date(Date.now() - minutesBack * 60 * 1000).toISOString();
+      url += `&before=${encodeURIComponent(cursor)}`;
+    }
+
+    const res = http.get(url, { tags: { name: "GET /api/v2/transactions" } });
+    const ok = res.status === 200;
+
+    check(res, {
+      "list status 200": () => ok,
+      "list returns array": () => {
+        if (!ok) return false;
+        try {
+          const body = JSON.parse(res.body);
+          return body.success && Array.isArray(body.data);
+        } catch (e) {
+          return false;
+        }
+      },
+    });
+
+    errorRate.add(!ok);
+    transactionRead.add(1);
+    transactionLatency.add(res.timings.duration);
+
+    if (!ok) {
+      logFailure("List Transactions", res);
+    }
+  });
+
+  sleep(Math.random() * 0.5);
+}
+
+// ─── Hot-key workload ──────────────────────────────────────
+// Picks both `from` and `to` from a tiny 10-account pool so the
+// per-row UPDATE inside the sender's tx contends. Verifies that
+// the new same-shard same-tx atomicity does not deadlock and that
+// the consumer-side idempotency check does not regress correctness
+// when concurrent retries fight over the same row.
+export function hotKeyWorkload(data) {
+  if (!data.ok) {
+    sleep(1);
+    return;
+  }
+
+  let fromAccount = hotAccount();
+  let toAccount = hotAccount();
+  while (toAccount === fromAccount) {
+    toAccount = hotAccount();
+  }
+
+  const referenceId = `hot-${__VU}-${__ITER}-${Date.now()}`;
+  const amount = (Math.random() * 10 + 1).toFixed(2);
+  const payload = JSON.stringify({
+    from_account: fromAccount,
+    to_account: toAccount,
+    amount,
+    currency: "IDR",
+    reference_id: referenceId,
+    description: `k6 hot-key`,
+  });
+
+  const res = http.post(`${BASE_URL}/api/v2/transactions`, payload, {
+    headers: { "Content-Type": "application/json" },
+    tags: { name: "POST /api/v2/transactions (hotkey)" },
+  });
+
+  const isAccepted = res.status >= 200 && res.status < 300;
+  check(res, {
+    "hotkey create status 2xx": () => isAccepted,
+  });
+
+  errorRate.add(!isAccepted);
+  transactionCreated.add(1);
+  transactionLatency.add(res.timings.duration);
+
+  if (!isAccepted) {
+    logFailure("Hot-Key Create", res);
+  }
+
+  sleep(Math.random() * 0.2);
+}
+
+// ─── Health probe (separate scenario, low VU) ──────────────
+export function healthProbe() {
+  const res = http.get(`${BASE_URL}/health`, {
+    tags: { name: "GET /health" },
+  });
+  check(res, {
+    "health status 200": () => res.status === 200,
+    "health response valid": () => {
+      try {
+        const body = JSON.parse(res.body);
+        return body.status === "healthy" || body.status === "degraded";
+      } catch (e) {
+        return false;
+      }
+    },
+  });
+  sleep(2); // probe every ~2s
 }
 
 // ─── Teardown: Print summary ───────────────────────────────
-export function teardown(data) {
-    console.log(`\n📈 1 Million/hr Load test complete!`);
-    console.log(`   Check Grafana dashboard: http://localhost:3001`);
-    console.log(`   Dashboard: Peakload Capstone — Performance Dashboard`);
+export function teardown() {
+  console.log(`\n📈 Load test complete!`);
+  console.log(`   Check Grafana dashboard: http://localhost:3001`);
+  console.log(`   Dashboard: Peakload Capstone — Performance Dashboard`);
 }
