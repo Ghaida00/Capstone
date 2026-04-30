@@ -11,7 +11,10 @@ use tokio_util::sync::CancellationToken;
 
 use shared_kernel::db::shard::ShardRouter;
 
-const DEFAULT_INTERVAL_SECS: u64 = 600;
+// Tighter than the legacy 600s — the function now also sweeps
+// 'processing' rows older than 60s, so we tick at 30s to keep
+// the replay-without-publish window bounded for crashed reserves.
+const DEFAULT_INTERVAL_SECS: u64 = 30;
 
 pub fn spawn_idempotency_cleanup(
     shards: ShardRouter,

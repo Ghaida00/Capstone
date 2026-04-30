@@ -88,10 +88,30 @@ impl ShardRouter {
 
     /// Get the shard index for a given account. FNV-1a → modulo
     /// over the runtime-configured shard count.
+    ///
+    /// Static helper kept for tests and historical callers — uses
+    /// the process-global `NUM_SHARDS`, so it is not safe when
+    /// multiple `ShardRouter`s with different shard counts coexist.
+    /// Production code paths (consumer, application services,
+    /// repositories) MUST use [`Self::shard_for_account`] which
+    /// hashes against this router's own shard count.
     pub fn shard_for(account: &str) -> usize {
         let mut hasher = fnv::FnvHasher::default();
         account.hash(&mut hasher);
         let n = NUM_SHARDS.load(Ordering::Relaxed).max(1);
+        (hasher.finish() as usize) % n
+    }
+
+    /// Instance-bound counterpart of [`Self::shard_for`]. Always
+    /// uses `self.shards.len()` so the result is guaranteed to be
+    /// a valid index into this router. Use this on every hot path
+    /// that goes on to call `self.writer(shard)` / `self.reader(shard)`
+    /// to eliminate the panic window when `NUM_SHARDS` is mutated by
+    /// a sibling router.
+    pub fn shard_for_account(&self, account: &str) -> usize {
+        let mut hasher = fnv::FnvHasher::default();
+        account.hash(&mut hasher);
+        let n = self.shards.len().max(1);
         (hasher.finish() as usize) % n
     }
 
@@ -107,13 +127,13 @@ impl ShardRouter {
 
     /// Get the writer pool for an account (auto-routes to correct shard).
     pub fn writer_for(&self, from_account: &str) -> &PgPool {
-        let shard = Self::shard_for(from_account);
+        let shard = self.shard_for_account(from_account);
         self.writer(shard)
     }
 
     /// Get a reader pool for an account.
     pub fn reader_for(&self, from_account: &str) -> &PgPool {
-        let shard = Self::shard_for(from_account);
+        let shard = self.shard_for_account(from_account);
         self.reader(shard)
     }
 

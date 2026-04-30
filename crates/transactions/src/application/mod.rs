@@ -82,6 +82,19 @@ fn validate_account(s: &str, field: &str) -> Result<(), TransactionError> {
     Ok(())
 }
 
+/// Validate the caller-supplied (or UUID-fallback) `reference_id`.
+///
+/// Rules:
+///   * Non-empty.
+///   * At most `MAX_REFERENCE_ID_LEN` bytes. ASCII-only means
+///     bytes == chars, so this maps one-to-one to the DB column
+///     (`VARCHAR(100)`).
+///   * Charset: ASCII alphanumeric, `-`, `_`, `.`. Same charset as
+///     `validate_account` so the two fields cohabit the idempotency
+///     key (`txn:{shard}:{reference_id}`) and the DB UNIQUE on
+///     `(reference_id, from_account)` without unicode-normalisation
+///     surprises (NFC vs NFD producing distinct keys for the same
+///     logical id).
 fn validate_reference_id(s: &str) -> Result<(), TransactionError> {
     if s.is_empty() {
         return Err(TransactionError::Validation(
@@ -96,10 +109,10 @@ fn validate_reference_id(s: &str) -> Result<(), TransactionError> {
     }
     if !s
         .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
     {
         return Err(TransactionError::Validation(
-            "reference_id contains invalid characters".into(),
+            "reference_id must be ASCII alphanumeric, '-', '_' or '.'".into(),
         ));
     }
     Ok(())
@@ -207,6 +220,13 @@ pub(crate) struct TransactionsService {
     /// modular-monolith story is built on — see
     /// docs/architecture/phase2-transactions-walkthrough.md §6.2.
     accounts: DynAccountService,
+    /// Held so shard derivation goes through the instance method
+    /// `shard_for_account`, anchored to this router's actual
+    /// `shards.len()`. Earlier code used the static
+    /// `ShardRouter::shard_for` which read a process-global atomic
+    /// — fine in a single-router process, but a footgun the moment
+    /// a sibling router publishes a different shard count.
+    shards: ShardRouter,
     /// When false (load-test default), `create` skips the
     /// `accounts.get_balance` round-trip — the consumer
     /// re-validates balance under `UPDATE … WHERE balance >= $1`
@@ -222,6 +242,7 @@ impl TransactionsService {
         idempotency: Arc<dyn IdempotencyAwareWriter>,
         publisher: Arc<dyn TransactionPublisher>,
         accounts: DynAccountService,
+        shards: ShardRouter,
         verify_from_account: bool,
     ) -> Self {
         Self {
@@ -229,6 +250,7 @@ impl TransactionsService {
             idempotency,
             publisher,
             accounts,
+            shards,
             verify_from_account,
         }
     }
@@ -303,7 +325,7 @@ impl TransactionService for TransactionsService {
             .reference_id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let shard = ShardRouter::shard_for(&input.from_account);
+        let shard = self.shards.shard_for_account(&input.from_account);
         let idempotency_key = format!("txn:{}:{}", shard, reference_id);
 
         // Canonical wire-form of the amount, computed once. Used

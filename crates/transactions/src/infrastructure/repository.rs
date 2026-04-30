@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
@@ -132,13 +133,32 @@ impl TransactionRepository for SqlxTransactionRepository {
         // entirely; this mitigation is the practical compromise.
         let per_shard_limit = limit.saturating_mul(self.shards.num_shards() as i64).max(limit);
         let cursor = filter.before;
+        let cursor_id = filter.before_id;
 
         let mut handles = Vec::with_capacity(self.shards.num_shards());
         for shard_idx in 0..self.shards.num_shards() {
             let pool = self.shards.reader(shard_idx).clone();
             handles.push(tokio::spawn(async move {
-                match cursor {
-                    Some(before) => {
+                match (cursor, cursor_id) {
+                    // Tuple cursor — stable across rows with equal
+                    // `created_at`. ORDER BY mirrors the cursor
+                    // expression so the merge-and-truncate step in
+                    // the caller produces the same total order each
+                    // page.
+                    (Some(before), Some(before_id)) => {
+                        sqlx::query_as::<_, TransactionRowSlim>(
+                            "SELECT id, from_account, to_account, amount, currency, status, reference_id, description, created_at, updated_at, processed_at \
+                             FROM transactions \
+                             WHERE (created_at, id) < ($1, $2) \
+                             ORDER BY created_at DESC, id DESC LIMIT $3",
+                        )
+                        .bind(before)
+                        .bind(before_id)
+                        .bind(per_shard_limit)
+                        .fetch_all(&pool)
+                        .await
+                    }
+                    (Some(before), None) => {
                         sqlx::query_as::<_, TransactionRowSlim>(
                             "SELECT id, from_account, to_account, amount, currency, status, reference_id, description, created_at, updated_at, processed_at FROM transactions WHERE created_at < $1 ORDER BY created_at DESC, id DESC LIMIT $2",
                         )
@@ -147,7 +167,7 @@ impl TransactionRepository for SqlxTransactionRepository {
                         .fetch_all(&pool)
                         .await
                     }
-                    None => {
+                    (None, _) => {
                         sqlx::query_as::<_, TransactionRowSlim>(
                             "SELECT id, from_account, to_account, amount, currency, status, reference_id, description, created_at, updated_at, processed_at FROM transactions ORDER BY created_at DESC, id DESC LIMIT $1",
                         )
@@ -188,47 +208,75 @@ impl TransactionRepository for SqlxTransactionRepository {
         &self,
         reference_id: &str,
     ) -> Result<Option<TransactionStatus>, String> {
+        // Cross-shard transactions can produce TWO rows for the
+        // same reference_id — one on the sender shard (consumer
+        // bulk-insert) and one on the receiver shard (cross-shard
+        // processor audit row). Status may diverge: e.g. sender
+        // 'reversed' / receiver 'failed' for the recipient-missing
+        // path. Fetch up to one row per shard with `fetch_all`
+        // bounded to 1, collect across shards, then pick the most
+        // recently processed row so the user always sees the
+        // freshest decision. Earlier code used `fetch_optional`
+        // and returned the first shard's response nondeterministically.
         let mut handles = Vec::with_capacity(self.shards.num_shards());
         for shard_idx in 0..self.shards.num_shards() {
             let pool = self.shards.reader(shard_idx).clone();
             let ref_id = reference_id.to_owned();
             handles.push(tokio::spawn(async move {
                 sqlx::query_as::<_, StatusRowSlim>(
-                    "SELECT reference_id, status, processed_at FROM transactions WHERE reference_id = $1",
+                    "SELECT reference_id, status, processed_at FROM transactions WHERE reference_id = $1 ORDER BY processed_at DESC NULLS LAST LIMIT 1",
                 )
                 .bind(ref_id)
                 .fetch_optional(&pool)
                 .await
             }));
         }
-        let mut found: Option<TransactionStatus> = None;
+        let mut candidates: Vec<TransactionStatus> = Vec::new();
         let mut last_err: Option<String> = None;
         for h in handles {
             match h.await {
                 Ok(Ok(Some(row))) => {
-                    if found.is_none() {
-                        found = Some(TransactionStatus {
-                            reference_id: row.reference_id.unwrap_or_default(),
-                            status: row.status,
-                            processed_at: row.processed_at,
-                        });
-                    }
+                    candidates.push(TransactionStatus {
+                        reference_id: row.reference_id.unwrap_or_default(),
+                        status: row.status,
+                        processed_at: row.processed_at,
+                    });
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(e)) => last_err = Some(e.to_string()),
                 Err(e) => last_err = Some(format!("join: {}", e)),
             }
         }
-        if found.is_some() {
-            if let Some(err) = last_err {
+        if !candidates.is_empty() {
+            if let Some(err) = &last_err {
                 tracing::warn!(err = %err, "find_status_by_reference: partial shard failure");
             }
-            return Ok(found);
+            // Prefer the row with the latest processed_at; ties
+            // broken by status priority (reversed > failed >
+            // completed > processing > pending) so the most
+            // informative terminal state wins deterministically.
+            candidates.sort_by(|a, b| {
+                b.processed_at
+                    .cmp(&a.processed_at)
+                    .then_with(|| status_priority(&b.status).cmp(&status_priority(&a.status)))
+            });
+            return Ok(candidates.into_iter().next());
         }
         if let Some(err) = last_err {
             return Err(err);
         }
         Ok(None)
+    }
+}
+
+fn status_priority(s: &str) -> u8 {
+    match s {
+        "reversed" => 5,
+        "failed" => 4,
+        "completed" => 3,
+        "processing" => 2,
+        "pending" => 1,
+        _ => 0,
     }
 }
 
@@ -263,6 +311,19 @@ impl SqlxIdempotencyWriter {
 
 const IDEMPOTENCY_TTL_SECS: u64 = 86_400;
 
+/// Cached idempotency entry. Stores the request_hash alongside the
+/// accepted response so the cache fast-path can verify equality
+/// before replaying — the hash-blind cache GET previously here let
+/// a duplicate idempotency_key with a DIFFERENT payload return the
+/// original "accepted" response without ever reaching the queue,
+/// silently masking a payload-conflict the DB path would have
+/// surfaced as `HashConflict`.
+#[derive(Debug, Serialize, Deserialize)]
+struct IdempotencyCacheEntry {
+    request_hash: String,
+    payload: serde_json::Value,
+}
+
 #[async_trait]
 impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
     async fn reserve(
@@ -275,11 +336,34 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         let writer = self.shards.writer(shard);
 
         // Fast-path: Redis cache for already-accepted responses.
-        // Mirrors legacy behaviour and short-circuits the DB
-        // before we touch idempotency_keys.
-        if let Ok(Some(cached)) = self.cache.get::<serde_json::Value>(idempotency_key).await {
-            metrics::counter!("idempotency_hits_total").increment(1);
-            return Ok(ReserveOutcome::Replay(cached));
+        // The cached value embeds the original request_hash so a
+        // duplicate idempotency_key carrying a DIFFERENT payload
+        // takes the slow path → DB → HashConflict instead of
+        // silently replaying.
+        match self
+            .cache
+            .get::<IdempotencyCacheEntry>(idempotency_key)
+            .await
+        {
+            Ok(Some(cached)) => {
+                if cached.request_hash == request_hash {
+                    metrics::counter!("idempotency_hits_total").increment(1);
+                    return Ok(ReserveOutcome::Replay(cached.payload));
+                }
+                // Hash mismatch — invalidate the cached entry so
+                // we don't keep paying the slow-path cost on every
+                // duplicate, and fall through to the DB which
+                // will surface HashConflict.
+                let _ = self.cache.delete(idempotency_key).await;
+                metrics::counter!("idempotency_cache_hash_mismatch_total").increment(1);
+            }
+            // Treat decode failures as a stale cache entry (the
+            // entry shape changed in this rewrite). Drop the key
+            // and fall through.
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, key = %idempotency_key, "idempotency cache get failed");
+            }
         }
 
         // Try to claim the row.
@@ -300,13 +384,19 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         .map_err(|e| e.to_string())?;
 
         if inserted.rows_affected() > 0 {
-            // First-mover. Cache the accepted payload so duplicate
-            // v1/v2 replays hit Redis directly. Cache write is
-            // best-effort — a Redis hiccup just means subsequent
-            // duplicates fall through to the DB row.
+            // First-mover. Cache the accepted payload + the hash
+            // it was reserved against so duplicate replays hit
+            // Redis directly AND can be verified against the
+            // current caller's hash. Cache write is best-effort —
+            // a Redis hiccup just means subsequent duplicates fall
+            // through to the DB row.
+            let entry = IdempotencyCacheEntry {
+                request_hash: request_hash.to_string(),
+                payload: accepted_payload.clone(),
+            };
             let _ = self
                 .cache
-                .set(idempotency_key, accepted_payload, IDEMPOTENCY_TTL_SECS)
+                .set(idempotency_key, &entry, IDEMPOTENCY_TTL_SECS)
                 .await;
             return Ok(ReserveOutcome::Reserved);
         }
@@ -359,10 +449,16 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
                 .response_payload
                 .unwrap_or_else(|| accepted_payload.clone());
             // Re-warm the cache so subsequent duplicates skip the
-            // DB roundtrip. Same payload as we just returned.
+            // DB roundtrip. Bind the cached entry to the hash we
+            // just verified equal so the hash check on the next
+            // hit is meaningful.
+            let entry = IdempotencyCacheEntry {
+                request_hash: request_hash.to_string(),
+                payload: payload.clone(),
+            };
             let _ = self
                 .cache
-                .set(idempotency_key, &payload, IDEMPOTENCY_TTL_SECS)
+                .set(idempotency_key, &entry, IDEMPOTENCY_TTL_SECS)
                 .await;
             metrics::counter!("idempotency_hits_total").increment(1);
             return Ok(ReserveOutcome::Replay(payload));
@@ -393,9 +489,13 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
 
             if revived.rows_affected() > 0 {
                 // We won the revive race — proceed to publish.
+                let entry = IdempotencyCacheEntry {
+                    request_hash: request_hash.to_string(),
+                    payload: accepted_payload.clone(),
+                };
                 let _ = self
                     .cache
-                    .set(idempotency_key, accepted_payload, IDEMPOTENCY_TTL_SECS)
+                    .set(idempotency_key, &entry, IDEMPOTENCY_TTL_SECS)
                     .await;
                 return Ok(ReserveOutcome::Reserved);
             }

@@ -68,6 +68,7 @@ pub fn init(
         idempotency,
         publisher,
         accounts,
+        shards.clone(),
         verify_from_account,
     ));
 

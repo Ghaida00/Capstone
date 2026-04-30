@@ -45,7 +45,7 @@ impl SqlxAccountRepository {
 #[async_trait]
 impl AccountRepository for SqlxAccountRepository {
     async fn find_active_by_id(&self, id: &AccountId) -> Result<Option<Account>, String> {
-        let shard = ShardRouter::shard_for(id.as_str());
+        let shard = self.shards.shard_for_account(id.as_str());
         let account_number = id.as_str().to_owned();
         let router = &self.shards;
 

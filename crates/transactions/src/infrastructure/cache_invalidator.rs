@@ -13,12 +13,19 @@ use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use shared_kernel::cache::redis::RedisCache;
 use shared_kernel::events::{EventSubscriber, EVENT_TRANSACTIONS_COMMITTED};
 
 #[derive(Deserialize)]
 struct CommittedKeys {
+    /// Transaction id — used to invalidate the per-id cache
+    /// entry populated by the `get_by_id` handler. Optional
+    /// for forwards-compat with subscribers reading older event
+    /// payloads.
+    #[serde(default)]
+    id: Option<Uuid>,
     from_account: String,
     to_account: String,
     reference_id: Option<String>,
@@ -65,6 +72,11 @@ pub fn spawn_cache_invalidator(
 
 async fn invalidate(cache: &RedisCache, keys: &CommittedKeys) {
     let v = shared_kernel::cache::redis::CACHE_KEY_VERSION;
+    if let Some(id) = keys.id {
+        // The `get_by_id` handler caches per-uuid; without this
+        // del the 30s TTL was the only bound on stale status.
+        del(cache, &format!("{}:txn:{}", v, id)).await;
+    }
     if let Some(ref_id) = keys.reference_id.as_deref() {
         del(cache, &format!("{}:tx_status:{}", v, ref_id)).await;
     }

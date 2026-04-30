@@ -33,20 +33,24 @@ function hotAccount() {
   return `ACC_${String(i).padStart(7, "0")}`;
 }
 
-// Per-VU buffer of recently-issued reference_ids. Used to mix in
-// idempotency replays so the cache-hit Replay branch is exercised.
-// Bounded so the array can't grow without bound across long runs.
+// Per-VU buffer of recently-issued requests. Storing the FULL
+// payload (not just the reference_id) is what makes the replay
+// fire the server's Replay branch: idempotency_key embeds
+// `shard_for_account(from_account)` and the cached entry is keyed
+// on `(idempotency_key, request_hash)`. Replaying with a fresh
+// from_account or amount produces a different shard / hash and
+// would land as either a fresh reservation or a HashConflict 400.
 const REPLAY_BUFFER_SIZE = 32;
 let replayBuffer = [];
 
-function rememberReferenceId(refId) {
-  replayBuffer.push(refId);
+function rememberRequest(req) {
+  replayBuffer.push(req);
   if (replayBuffer.length > REPLAY_BUFFER_SIZE) {
     replayBuffer.shift();
   }
 }
 
-function pickReplayReferenceId() {
+function pickReplayRequest() {
   if (replayBuffer.length === 0) return null;
   return replayBuffer[Math.floor(Math.random() * replayBuffer.length)];
 }
@@ -291,39 +295,39 @@ export function txWorkload(data) {
   }
 
   group("Create Transaction", () => {
-    let fromAccount = randomAccount();
-    let toAccount = randomAccount();
-    while (toAccount === fromAccount) {
-      toAccount = randomAccount();
-    }
-
-    // ~5% chance to replay an earlier reference_id from this VU's
-    // buffer — exercises the idempotency cache-hit Replay branch
-    // and lights up `idempotency_hits_total` on the dashboard.
-    let referenceId;
+    // ~5% of iterations replay a full earlier request — simulates
+    // a real client retrying after a network glitch (same payload,
+    // same reference_id). Server takes the Replay branch.
+    // The other 95% are fresh random traffic.
+    let payloadObj;
     let isReplay = false;
     if (Math.random() < 0.05 && replayBuffer.length > 0) {
-      referenceId = pickReplayReferenceId();
+      payloadObj = pickReplayRequest();
       isReplay = true;
       idempotencyReplayHits.add(1);
     } else {
-      referenceId = `${__VU}-${__ITER}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      let fromAccount = randomAccount();
+      let toAccount = randomAccount();
+      while (toAccount === fromAccount) {
+        toAccount = randomAccount();
+      }
+      // Send amount as a string with exactly 2 decimal places to
+      // sidestep JS float→JSON round-trip artefacts (e.g. 567.89
+      // serialising as 567.8899999...). Server validates scale<=2
+      // and would reject anything else.
+      const amount = (Math.random() * 1000 + 1).toFixed(2);
+      const referenceId = `${__VU}-${__ITER}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      payloadObj = {
+        from_account: fromAccount,
+        to_account: toAccount,
+        amount,
+        currency: "IDR",
+        reference_id: referenceId,
+        description: `k6 load test`,
+      };
     }
 
-    // Send amount as a string with exactly 2 decimal places to
-    // sidestep JS float→JSON round-trip artefacts (e.g. 567.89
-    // serialising as 567.8899999...). Server validates scale<=2
-    // and would reject anything else.
-    const amount = (Math.random() * 1000 + 1).toFixed(2);
-    const payload = JSON.stringify({
-      from_account: fromAccount,
-      to_account: toAccount,
-      amount,
-      currency: "IDR",
-      reference_id: referenceId,
-      description: `k6 load test`,
-    });
-
+    const payload = JSON.stringify(payloadObj);
     const params = {
       headers: { "Content-Type": "application/json" },
       tags: { name: "POST /api/v2/transactions" },
@@ -348,13 +352,18 @@ export function txWorkload(data) {
     });
 
     errorRate.add(!isAccepted);
-    transactionCreated.add(1);
     transactionLatency.add(res.timings.duration);
 
-    if (isAccepted && !isReplay) {
-      rememberReferenceId(referenceId);
-    }
-    if (!isAccepted) {
+    if (isAccepted) {
+      // Counter reflects accepted creates only — the dashboard
+      // panel that compares this against the server's
+      // `transactions_processed_total` should match modulo the
+      // queue → consumer delay.
+      transactionCreated.add(1);
+      if (!isReplay) {
+        rememberRequest(payloadObj);
+      }
+    } else {
       logFailure("Create Transaction", res);
     }
   });
@@ -387,10 +396,11 @@ export function txWorkload(data) {
     });
 
     errorRate.add(!ok);
-    transactionRead.add(1);
     transactionLatency.add(res.timings.duration);
 
-    if (!ok) {
+    if (ok) {
+      transactionRead.add(1);
+    } else {
       logFailure("List Transactions", res);
     }
   });

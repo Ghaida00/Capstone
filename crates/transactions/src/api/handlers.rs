@@ -6,7 +6,7 @@
 //! handlers under `src/api/handlers.rs`.
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -112,6 +112,12 @@ impl From<TransactionStatusView> for StatusResponseV2 {
 pub(crate) struct ListParams {
     pub limit: Option<u32>,
     pub before: Option<String>,
+    /// Optional second half of the keyset cursor. Pair with
+    /// `before` to disambiguate rows that share a `created_at`
+    /// timestamp — without it, ties at a page boundary either
+    /// drop or duplicate rows depending on which row was the
+    /// last on the previous page.
+    pub before_id: Option<Uuid>,
     /// Accepted on the wire only so we can return a clear error
     /// when present. The endpoint is cursor-paginated (`before`)
     /// and never honoured `offset` correctly across shards —
@@ -139,8 +145,17 @@ impl From<TransactionError> for AppError {
 
 pub(crate) async fn create(
     State(deps): State<TransactionsDeps>,
+    headers: HeaderMap,
     Json(req): Json<CreateRequest>,
 ) -> AppResult<(StatusCode, Json<ApiResponse<AcceptedResponse>>)> {
+    // Pull the request id from the standard tracing header so the
+    // span on the queue side can be joined with the originating
+    // HTTP request. Earlier versions hard-coded `None` and the
+    // consumer log lines were orphaned from the API log lines.
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     let input = CreateTransactionInput {
         from_account: req.from_account,
         to_account: req.to_account,
@@ -148,7 +163,7 @@ pub(crate) async fn create(
         currency: req.currency,
         reference_id: req.reference_id,
         description: req.description,
-        request_id: None,
+        request_id,
     };
     let accepted = deps.service.create(input).await?;
     metrics::counter!("transactions_created_total").increment(1);
@@ -199,12 +214,17 @@ pub(crate) async fn list(
             .ok()
             .map(|dt| dt.with_timezone(&Utc))
     });
+    let cursor_id = params.before_id;
 
+    // Cache key embeds both halves of the cursor so two clients
+    // paging from the same `before` but different `before_id`
+    // don't collide on a shared cache entry.
     let cache_key = format!(
-        "{}:txn_list:{}:{}",
+        "{}:txn_list:{}:{}:{}",
         shared_kernel::cache::redis::CACHE_KEY_VERSION,
         limit,
-        cursor.map_or("latest".to_string(), |c| c.timestamp_micros().to_string())
+        cursor.map_or("latest".to_string(), |c| c.timestamp_micros().to_string()),
+        cursor_id.map_or("none".to_string(), |id| id.to_string()),
     );
     if let Ok(Some(cached)) = deps
         .cache
@@ -220,6 +240,7 @@ pub(crate) async fn list(
         .list(ListFilter {
             limit,
             before: cursor,
+            before_id: cursor_id,
         })
         .await?;
     let resp: Vec<TransactionResponseV2> = views.into_iter().map(Into::into).collect();

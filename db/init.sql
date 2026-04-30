@@ -142,14 +142,30 @@ CREATE TABLE cross_shard_outbox (
     description     TEXT,
     status          VARCHAR(20) NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'completed', 'failed')),
+    -- When a cross-shard credit lands on a missing/inactive
+    -- recipient, the receiver-side audit row is durably 'failed'
+    -- but the sender's debit must be rolled back. The processor
+    -- flips this flag and skips the credit step on subsequent
+    -- attempts, going straight to a sender-side compensating
+    -- refund (UPDATE balance + transactions row -> 'reversed').
+    refund_required BOOLEAN NOT NULL DEFAULT FALSE,
     attempts        INT NOT NULL DEFAULT 0,
     last_error      TEXT,
+    -- Cooperative lease for HA. While lease_until is in the future
+    -- another processor instance skips the row; expired lease lets
+    -- a sibling re-claim a crashed holder's work.
+    lease_until     TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at    TIMESTAMPTZ
 );
 
 CREATE INDEX idx_cross_shard_outbox_pending ON cross_shard_outbox (created_at)
+    WHERE status = 'pending';
+
+-- Drain query filters on pending+lease_until; this index keeps
+-- the planner off a seqscan when many rows are mid-lease.
+CREATE INDEX idx_cross_shard_outbox_lease ON cross_shard_outbox (lease_until)
     WHERE status = 'pending';
 
 CREATE TRIGGER trigger_update_cross_shard_outbox_updated_at
@@ -183,14 +199,27 @@ CREATE TRIGGER trigger_update_idempotency_keys_updated_at
 --   SELECT cron.schedule('cleanup-idempotency', '0 * * * *',
 --     $$SELECT cleanup_expired_idempotency_keys()$$);
 -- ============================================================
+-- Sweeps any row whose 24h reservation has elapsed plus a 1h
+-- grace window, regardless of status. Earlier versions filtered
+-- on status IN ('completed','failed') — but the consumer never
+-- transitions the row out of 'processing', so the table grew
+-- unbounded. The application layer DELETEs 'processing' rows
+-- explicitly via release() on publish failure; everything else
+-- is the cleanup function's job.
 CREATE OR REPLACE FUNCTION cleanup_expired_idempotency_keys()
 RETURNS INTEGER AS $$
 DECLARE
     deleted_count INTEGER;
 BEGIN
+    -- Two sweeps:
+    --   * past-expiry rows (24h+1h grace).
+    --   * 'processing' rows older than 60s — bounds the
+    --     replay-without-publish window when an app crashed
+    --     between reserve and queue publish.
     DELETE FROM idempotency_keys
     WHERE expires_at < NOW() - INTERVAL '1 hour'
-      AND status IN ('completed', 'failed');
+       OR (status = 'processing'
+           AND created_at < NOW() - INTERVAL '60 seconds');
     GET DIAGNOSTICS deleted_count = ROW_COUNT;
     RETURN deleted_count;
 END;

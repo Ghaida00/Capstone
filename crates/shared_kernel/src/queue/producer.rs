@@ -414,9 +414,17 @@ async fn publish_with_confirm(
     match tokio::time::timeout(Duration::from_secs(CONFIRM_TIMEOUT_SECS), rx).await {
         Ok(Ok(ConfirmResult::Ack)) => Ok(()),
         Ok(Ok(ConfirmResult::Nack)) => {
+            // Tag was already removed from the registry on resolve;
+            // no extra cleanup needed.
             Err(AppError::Internal("publish nacked by broker".into()))
         }
-        Ok(Err(_)) => Err(AppError::Internal("confirm sender dropped".into())),
+        Ok(Err(_)) => {
+            // The oneshot sender side was dropped without ever
+            // resolving — the registry entry would otherwise leak
+            // and slowly grow the BTreeMap until reconnect.
+            cc.registry.drop_tag(tag).await;
+            Err(AppError::Internal("confirm sender dropped".into()))
+        }
         Err(_) => {
             cc.registry.drop_tag(tag).await;
             Err(AppError::Internal("publish confirm timeout".into()))

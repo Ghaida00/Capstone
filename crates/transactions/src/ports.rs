@@ -79,12 +79,17 @@ pub struct TransactionStatusView {
     pub processed_at: Option<DateTime<Utc>>,
 }
 
-/// Filter for the list use case. Cursor-based pagination
-/// matches the legacy endpoint exactly.
+/// Filter for the list use case. Cursor-based pagination —
+/// `(before, before_id)` is a tuple keyset so rows that share a
+/// `created_at` timestamp are not silently dropped or duplicated
+/// across pages. `before_id` is optional for backwards
+/// compatibility; when absent the comparison degrades to
+/// `created_at < before`.
 #[derive(Debug, Clone)]
 pub struct ListFilter {
     pub limit: u32,
     pub before: Option<DateTime<Utc>>,
+    pub before_id: Option<Uuid>,
 }
 
 // ─── Errors ──────────────────────────────────────────────────
