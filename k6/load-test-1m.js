@@ -20,6 +20,10 @@ const NUM_ACCOUNTS = 1000000;
 // 1M-account pick can never reach.
 const HOT_KEY_POOL_SIZE = 10;
 
+// Pool fits inside the `v1:balance:` 30 s Redis TTL so steady-state
+// polls hit warm.
+const BALANCE_POLL_POOL_SIZE = 100;
+
 // Random account from the 1M pool. Generated on-the-fly so we never
 // allocate a 1M array per VU.
 function randomAccount() {
@@ -30,6 +34,12 @@ function randomAccount() {
 // Random account from the 10-key hot pool.
 function hotAccount() {
   const i = Math.floor(Math.random() * HOT_KEY_POOL_SIZE) + 1;
+  return `ACC_${String(i).padStart(7, "0")}`;
+}
+
+// Random account from the balance-poll pool.
+function balancePollAccount() {
+  const i = Math.floor(Math.random() * BALANCE_POLL_POOL_SIZE) + 1;
   return `ACC_${String(i).padStart(7, "0")}`;
 }
 
@@ -69,12 +79,28 @@ export const options = {
       exec: "txWorkload",
       tags: { scenario: "sustained_1m_per_hour" },
     },
+
+    // 5 VUs polling GET /balance for the full 15 m; tag
+    // `name:GET /api/v2/accounts/:id/balance`.
+    balance_poll: {
+      executor: "constant-vus",
+      vus: 5,
+      duration: "15m",
+      startTime: "0s",
+      exec: "balancePollWorkload",
+      tags: { scenario: "balance_poll" },
+    },
   },
 
   thresholds: {
     http_req_duration: ["p(95)<500", "p(99)<1500"],
     http_req_failed: ["rate<0.05"],
     error_rate: ["rate<0.05"],
+
+    // Per-endpoint targets, milliseconds.
+    "http_req_duration{name:GET /api/v2/accounts/:id/balance}": ["p(50)<0.5", "p(95)<1.5"],
+    "http_req_duration{name:POST /api/v2/transactions}": ["p(50)<2", "p(95)<5", "p(99)<15"],
+    "http_req_duration{name:GET /api/v2/transactions}": ["p(95)<50"],
   },
 };
 
@@ -358,6 +384,27 @@ export function hotKeyWorkload(data) {
   }
 
   sleep(Math.random() * 0.2);
+}
+
+// ─── Balance-poll workload (separate scenario, low VU) ─────
+// Polls GET /api/v2/accounts/:id/balance over BALANCE_POLL_POOL_SIZE
+// accounts. Tagged `name:GET /api/v2/accounts/:id/balance` for the
+// per-endpoint threshold.
+export function balancePollWorkload() {
+  const acc = balancePollAccount();
+  const res = http.get(`${BASE_URL}/api/v2/accounts/${acc}/balance`, {
+    tags: { name: "GET /api/v2/accounts/:id/balance" },
+  });
+  check(res, {
+    "balance status 200": () => res.status === 200,
+  });
+  if (res.status !== 200) {
+    errorRate.add(1);
+    logFailure("Balance Poll", res);
+  } else {
+    errorRate.add(0);
+  }
+  sleep(0.1);
 }
 
 // ─── Health probe (separate scenario, low VU) ──────────────

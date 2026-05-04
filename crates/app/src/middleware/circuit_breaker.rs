@@ -209,12 +209,12 @@ impl CircuitBreaker {
         }
     }
 
-    #[allow(dead_code)]
+    
     pub fn current_state(&self) -> CircuitState {
         state_from_u8(self.inner.state.load(Ordering::Acquire))
     }
 
-    #[allow(dead_code)]
+    
     pub fn total_rejected(&self) -> u64 {
         self.inner.total_rejected.load(Ordering::Relaxed)
     }

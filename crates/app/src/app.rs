@@ -120,6 +120,15 @@ impl App {
             self.cancel.child_token(),
         );
 
+        // Publish-outbox drainer: ships `idempotency_keys.outbox_payload`
+        // rows to RabbitMQ so the create handler returns 202 without
+        // waiting for the broker confirm. One worker per shard.
+        let _publish_outbox_handles = transactions::spawn_publish_outbox(
+            self.state.shard_router.clone(),
+            self.state.queue_producer.clone(),
+            self.cancel.child_token(),
+        );
+
         // Build the router. The subscriber half of the bus goes
         // into the notifications module so its dispatch loop can
         // drain events into the in-memory log.

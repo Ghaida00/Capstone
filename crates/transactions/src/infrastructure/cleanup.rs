@@ -2,8 +2,7 @@
 //!
 //! Runs `cleanup_expired_idempotency_keys()` on every shard's
 //! writer pool on a fixed interval. Without this the table grows
-//! unbounded — the schema declared the function but nothing ever
-//! invoked it.
+//! unbounded.
 
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -11,9 +10,11 @@ use tokio_util::sync::CancellationToken;
 
 use shared_kernel::db::shard::ShardRouter;
 
-// Tighter than the legacy 600s — the function now also sweeps
-// 'processing' rows older than 60s, so we tick at 30s to keep
-// the replay-without-publish window bounded for crashed reserves.
+/// Tick cadence for the cleanup sweep. The PG function only
+/// removes rows past `expires_at + 1 hour`, so a longer interval
+/// delays compaction without changing what gets removed; 30 s
+/// keeps the `idempotency_cleanup_deleted_total` metric prompt
+/// without measurable load.
 const DEFAULT_INTERVAL_SECS: u64 = 30;
 
 pub fn spawn_idempotency_cleanup(

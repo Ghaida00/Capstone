@@ -103,7 +103,7 @@ struct QueuePayload {
     reference_id: Option<String>,
     description: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
+    
     shard: usize,
     #[serde(default)]
     request_id: String,

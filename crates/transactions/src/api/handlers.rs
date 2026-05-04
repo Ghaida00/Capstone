@@ -216,14 +216,29 @@ pub(crate) async fn list(
     });
     let cursor_id = params.before_id;
 
-    // Cache key embeds both halves of the cursor so two clients
-    // paging from the same `before` but different `before_id`
-    // don't collide on a shared cache entry.
+    // Cursor timestamp is floored to `CACHE_BUCKET_SECS` before
+    // going into the cache key. All requests whose `before`
+    // cursor falls in the same bucket share a cache entry. This
+    // caps staleness at the bucket size and lets near-simultaneous
+    // pagers reuse one another's results. `cursor_id` is left
+    // un-bucketed: it is already discrete and acts as the
+    // tie-breaker for rows sharing a `created_at`, so two callers
+    // with the same time bucket but different ids legitimately
+    // want different pages.
+    const CACHE_BUCKET_SECS: i64 = 5;
+    let cursor_bucket = cursor.map(|c| {
+        // `div_euclid` floors toward negative infinity so all
+        // cursors in `[bucket, bucket+CACHE_BUCKET_SECS)` map to
+        // the same key, including the pre-epoch case.
+        let ts = c.timestamp();
+        ts.div_euclid(CACHE_BUCKET_SECS) * CACHE_BUCKET_SECS
+    });
+
     let cache_key = format!(
         "{}:txn_list:{}:{}:{}",
         shared_kernel::cache::redis::CACHE_KEY_VERSION,
         limit,
-        cursor.map_or("latest".to_string(), |c| c.timestamp_micros().to_string()),
+        cursor_bucket.map_or("latest".to_string(), |b| b.to_string()),
         cursor_id.map_or("none".to_string(), |id| id.to_string()),
     );
     if let Ok(Some(cached)) = deps
@@ -244,11 +259,12 @@ pub(crate) async fn list(
         })
         .await?;
     let resp: Vec<TransactionResponseV2> = views.into_iter().map(Into::into).collect();
-    // 1 s was effectively no caching at our request rate. 10 s
-    // bounded staleness is acceptable for a list endpoint —
-    // each VU's cursor still pages through the same window
-    // because the cache key embeds the cursor.
-    let _ = deps.cache.set(&cache_key, &resp, 10).await;
+    // 30 s amortises the cross-shard fan-out across the bucket
+    // window. Worst-case staleness for a caller is
+    // `CACHE_BUCKET_SECS + TTL` — the bucket bounds how out-of-date
+    // the cached page can be relative to the caller's cursor, the
+    // TTL bounds how long a single cached entry lives.
+    let _ = deps.cache.set(&cache_key, &resp, 30).await;
     Ok(Json(ApiResponse::success(resp)))
 }
 

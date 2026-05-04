@@ -28,14 +28,12 @@ const MAX_ACCOUNT_LEN: usize = 50;
 
 // ─── Response DTO ──────────────────────────────────────────
 
-/// Wire shape returned by the v2 balance endpoint. The structure
-/// is preserved verbatim from the pre-cull v1 response so cached
-/// entries and downstream clients see no diff across the cull.
+/// Wire shape returned by `GET /api/v2/accounts/:id/balance`.
 ///
-/// `Deserialize` is required so the Redis cache helper can
-/// decode a previously-cached value via
-/// `cache.get::<BalanceResponse>(...)`.
-#[derive(Debug, Serialize, Deserialize)]
+/// `Deserialize` lets the Redis cache helper decode a stored
+/// value via `cache.get::<BalanceResponse>(...)`. `Clone` lets
+/// the moka in-process cache return owned copies on hit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BalanceResponse {
     pub account_number: String,
     pub balance: String,
@@ -84,29 +82,37 @@ pub(crate) async fn get_balance(
     // it is testable without a web framework.
     validate_account_number(&account_number)?;
 
-    // Reuse the existing Redis cache key so both v1 and v2 see
-    // each other's cached entries — smooth cutover when the
-    // legacy endpoint is retired.
+    // L1: in-process moka, zero TCP on hit.
+    if let Some(cached) = deps.moka_balance.get(&account_number).await {
+        metrics::counter!("cache_hits_total", "tier" => "moka").increment(1);
+        return Ok(Json(ApiResponse::success(cached)));
+    }
+
     let cache_key = format!(
         "{}:balance:{}",
         shared_kernel::cache::redis::CACHE_KEY_VERSION,
         account_number
     );
 
+    // L2: Redis. On hit, populate L1 so the next request on this
+    // replica skips the Redis hop.
     if let Some(cached) = deps.cache.get::<BalanceResponse>(&cache_key).await? {
-        metrics::counter!("cache_hits_total").increment(1);
+        metrics::counter!("cache_hits_total", "tier" => "redis").increment(1);
+        deps.moka_balance
+            .insert(account_number.clone(), cached.clone())
+            .await;
         return Ok(Json(ApiResponse::success(cached)));
     }
     metrics::counter!("cache_misses_total").increment(1);
 
-    let id = AccountId(account_number);
+    let id = AccountId(account_number.clone());
     let balance = deps.service.get_balance(&id).await?;
     let response: BalanceResponse = balance.into();
 
-    // 30 s TTL mirrors the legacy handler. Cache-set failures
-    // are swallowed because a missing cache is not a client-
-    // facing error.
     let _ = deps.cache.set(&cache_key, &response, 30).await;
+    deps.moka_balance
+        .insert(account_number, response.clone())
+        .await;
 
     Ok(Json(ApiResponse::success(response)))
 }

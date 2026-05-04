@@ -31,5 +31,5 @@ pub(crate) mod infrastructure;
 pub use api::router;
 pub use infrastructure::{
     init, spawn_cache_invalidator, spawn_cross_shard_processor, spawn_idempotency_cleanup,
-    start_consumer,
+    spawn_publish_outbox, start_consumer,
 };

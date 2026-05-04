@@ -296,7 +296,6 @@ pub fn build_router(
     let transactions_deps = transactions::init(
         state.shard_router.clone(),
         state.cache.clone(),
-        state.queue_producer.clone(),
         accounts_deps.service.clone(),
         config.verify_from_account_exists,
     );

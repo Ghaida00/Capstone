@@ -26,14 +26,14 @@ use super::ports::{AccountId, AccountStatus, Balance};
 /// not yet read by any use case — they're kept on the entity
 /// so the forthcoming `create_account` / `send_statement` use
 /// cases (Phase 2+) do not need to widen the row projection
-/// or the repo trait. `#[allow(dead_code)]` is deliberate and
+/// or the repo trait. `` is deliberate and
 /// scoped to these two fields only.
 #[derive(Debug, Clone)]
 pub(crate) struct Account {
     pub id: AccountId,
-    #[allow(dead_code)]
+    
     pub full_name: String,
-    #[allow(dead_code)]
+    
     pub email: Option<String>,
     pub amount_str: String,
     pub currency: String,
@@ -61,11 +61,11 @@ impl Account {
 /// superset — every variant here maps cleanly onto one there,
 /// with the infrastructure layer supplying `Infra(String)`.
 ///
-/// `#[allow(dead_code)]` because Phase 1 only exercises the
+/// `` because Phase 1 only exercises the
 /// happy-path read; the variants are referenced by the
 /// `From<DomainError> for AccountError` impl in the
 /// application layer, which future use cases will hit.
-#[allow(dead_code)]
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DomainError {
     #[error("account not found: {0}")]

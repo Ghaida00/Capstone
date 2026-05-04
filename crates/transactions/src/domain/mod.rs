@@ -6,7 +6,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::Serialize;
 use uuid::Uuid;
 
 use super::ports::{ListFilter, TransactionId};
@@ -65,9 +64,11 @@ pub(crate) trait TransactionRepository: Send + Sync + 'static {
 
 /// Encapsulates the create-time idempotency dance: reserve the
 /// key, decide replay vs. revive, return whether the caller
-/// should proceed to publish to the queue or just return the
-/// existing response. Implementation lives in `infrastructure/`
-/// because it spans Postgres + Redis.
+/// should proceed or just replay an earlier accepted response.
+/// `outbox_payload` is committed in the same Postgres transaction
+/// as the reservation, so a successful `Reserved` outcome means
+/// the queue message is durable in the outbox table even if the
+/// app pod dies before the publish-outbox worker drains it.
 #[async_trait]
 pub(crate) trait IdempotencyAwareWriter: Send + Sync + 'static {
     async fn reserve(
@@ -76,55 +77,17 @@ pub(crate) trait IdempotencyAwareWriter: Send + Sync + 'static {
         idempotency_key: &str,
         request_hash: &str,
         accepted_payload: &serde_json::Value,
+        outbox_payload: &serde_json::Value,
     ) -> Result<ReserveOutcome, String>;
-
-    /// Roll back a freshly-claimed reservation when the caller
-    /// failed to publish to the queue. Without this hook a publish
-    /// failure leaves a `processing` row in `idempotency_keys`
-    /// and a cached "accepted" payload in Redis — every subsequent
-    /// retry replays the cached success even though no message
-    /// reached the consumer. Implementations DELETE the row on the
-    /// reservation shard and DEL the Redis key.
-    async fn release(&self, shard: usize, idempotency_key: &str) -> Result<(), String>;
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
+
 pub(crate) enum ReserveOutcome {
-    /// Caller is the first to reserve — proceed to publish.
+    /// First-mover — durable reservation + outbox row committed.
     Reserved,
-    /// Existing matching reservation — replay accepted response.
+    /// Same key + same payload — replay the stored accepted response.
     Replay(serde_json::Value),
-    /// Different request used the same key.
+    /// Same key, different payload.
     HashConflict,
-}
-
-// ─── Outbound publisher trait (the queue port) ──────────────
-
-/// What the create use case needs from the message bus.
-/// Implementation in `infrastructure/publisher.rs` adapts the
-/// concrete `shared_kernel::queue::producer::QueueProducer`.
-///
-/// The payload is owned (`String`s, not `&str`s) so the trait
-/// method has no lifetime parameters — async-trait gets along
-/// with object-safe traits more cleanly that way. The few
-/// string clones per publish are negligible against the
-/// network round-trip cost of the AMQP publish itself.
-#[async_trait]
-pub(crate) trait TransactionPublisher: Send + Sync + 'static {
-    async fn publish_created(&self, payload: PublishedTransaction) -> Result<(), String>;
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct PublishedTransaction {
-    pub from_account: String,
-    pub to_account: String,
-    pub amount_str: String,
-    pub currency: String,
-    pub reference_id: String,
-    pub description: Option<String>,
-    pub request_id: String,
-    pub shard: usize,
-    pub idempotency_key: String,
-    pub request_hash: String,
 }

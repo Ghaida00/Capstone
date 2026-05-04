@@ -27,6 +27,7 @@ rust_decimal = { version = "1.37", features = ["serde-with-str", "maths"] }
 # ── Cache ──
 redis = { version = "1.0.5", features = ["tokio-comp", "connection-manager"] }
 deadpool-redis = "0.23"
+moka = { version = "0.12", features = ["future"] }
 
 # ── Message queue ──
 amqprs = { version = "2.1.3", features = ["urispec", "traces"] }

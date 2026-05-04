@@ -13,6 +13,7 @@ shared_kernel = { path = "../shared_kernel" }
 axum = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+moka = { workspace = true }
 
 sqlx = { workspace = true }
 rust_decimal = { workspace = true }

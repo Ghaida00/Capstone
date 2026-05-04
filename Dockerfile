@@ -4,13 +4,14 @@
 # ============================================================
 FROM rust:1.95-slim-bookworm AS chef
 
+# ca-certificates is the only runtime-relevant apt dep — all crypto is rustls
+# (sqlx runtime-tokio-rustls, redis tokio-comp), so no openssl-sys/-dev needed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config \
-    libssl-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install cargo-chef --locked
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo install cargo-chef --locked
 
 WORKDIR /app
 
@@ -39,6 +40,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Runtime — distroless (nonroot baked in: UID 65532)
 # ============================================================
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+
+LABEL org.opencontainers.image.title="peakload-capstone" \
+      org.opencontainers.image.description="Rust HTTP service — sharded Postgres + Redis-Sentinel + RabbitMQ" \
+      org.opencontainers.image.licenses="MIT"
 
 WORKDIR /app
 COPY --from=builder /app/target/release/peakload-capstone /app/peakload-capstone

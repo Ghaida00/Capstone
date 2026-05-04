@@ -88,6 +88,31 @@ bootstrap:
         # --- Checkpoint smoothing -------------------------
         checkpoint_completion_target: 0.9
         random_page_cost: 1.1
+        # Checkpoint cadence sized for the sustained insert
+        # workload. The 15 min timer plus 2 GiB WAL ceiling
+        # keeps the checkpointer on the timer rather than the
+        # WAL-full trigger. A WAL-full trigger forces a
+        # synchronous checkpoint that flushes every dirty
+        # buffer into the request path and evicts the index
+        # pages the keyset list query reads from shared
+        # buffers; the timer trigger spreads that flush over
+        # `checkpoint_completion_target=0.9` of the interval.
+        checkpoint_timeout: 15min
+        max_wal_size: 2GB
+        min_wal_size: 512MB
+
+        # --- Autovacuum tuning for `transactions` ---------
+        # Insert-heavy workload: `insert_scale_factor=0.05`
+        # schedules vacuum after ~5 % growth so each pass is
+        # small. `cost_limit=2000` lets the pass finish
+        # quickly once it starts. `naptime=30s` keeps the
+        # autovacuum launcher checking the table often enough
+        # that no single cycle accumulates a backlog large
+        # enough to contend with concurrent reads for shared
+        # buffers.
+        autovacuum_naptime: 30s
+        autovacuum_vacuum_cost_limit: 2000
+        autovacuum_vacuum_insert_scale_factor: 0.05
 
         # --- Write-path latency knobs ---------------------
         # Defaults assume durability matters more than commit

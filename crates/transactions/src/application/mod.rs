@@ -15,8 +15,7 @@ use accounts::ports::{AccountError, AccountId, DynAccountService};
 use shared_kernel::db::shard::ShardRouter;
 
 use super::domain::{
-    IdempotencyAwareWriter, PublishedTransaction, ReserveOutcome, Transaction,
-    TransactionPublisher, TransactionRepository,
+    IdempotencyAwareWriter, ReserveOutcome, Transaction, TransactionRepository,
 };
 use super::ports::{
     CreateTransactionInput, ListFilter, TransactionAccepted, TransactionError, TransactionId,
@@ -204,35 +203,24 @@ fn tx_to_view(t: Transaction) -> TransactionView {
 // ─── The single service, four use-case methods ──────────────
 //
 // Combining the four methods into one impl keeps the file flat.
-// Splitting into per-method structs is a refactor for when the
-// dependency graph diverges across methods (e.g. only `create`
-// needs the publisher; `list` does not). Today every method's
-// dependency set is a subset of the service struct's, so the
-// blob impl is simpler.
+// Every method's dependency set is a subset of the service
+// struct's, so the blob impl is simpler than per-method splits.
 
 pub(crate) struct TransactionsService {
     repo: Arc<dyn TransactionRepository>,
     idempotency: Arc<dyn IdempotencyAwareWriter>,
-    publisher: Arc<dyn TransactionPublisher>,
-    /// The cross-module port. We hold it as the trait alias so
-    /// that swapping the `accounts` impl (or stubbing it in
-    /// tests) requires zero edits here. This is the seam the
-    /// modular-monolith story is built on — see
-    /// docs/architecture/phase2-transactions-walkthrough.md §6.2.
+    /// The cross-module port. Held as the trait alias so swapping
+    /// the `accounts` impl (or stubbing it in tests) requires zero
+    /// edits here.
     accounts: DynAccountService,
-    /// Held so shard derivation goes through the instance method
-    /// `shard_for_account`, anchored to this router's actual
-    /// `shards.len()`. Earlier code used the static
-    /// `ShardRouter::shard_for` which read a process-global atomic
-    /// — fine in a single-router process, but a footgun the moment
-    /// a sibling router publishes a different shard count.
+    /// Anchors shard derivation to `shard_for_account` on this
+    /// router's actual `shards.len()`.
     shards: ShardRouter,
-    /// When false (load-test default), `create` skips the
-    /// `accounts.get_balance` round-trip — the consumer
-    /// re-validates balance under `UPDATE … WHERE balance >= $1`
-    /// before debiting, so the only thing this saves is the
-    /// fail-fast 400 for unknown senders. Toggled via
-    /// `TX_VERIFY_FROM_ACCOUNT` at startup.
+    /// When false, `create` skips the `accounts.get_balance` Redis
+    /// round-trip; the consumer re-validates balance under
+    /// `UPDATE … WHERE balance >= $1` before debiting, so the only
+    /// thing this saves is the fail-fast 400 for unknown senders.
+    /// Toggled via `TX_VERIFY_FROM_ACCOUNT` at startup.
     verify_from_account: bool,
 }
 
@@ -240,7 +228,6 @@ impl TransactionsService {
     pub(crate) fn new(
         repo: Arc<dyn TransactionRepository>,
         idempotency: Arc<dyn IdempotencyAwareWriter>,
-        publisher: Arc<dyn TransactionPublisher>,
         accounts: DynAccountService,
         shards: ShardRouter,
         verify_from_account: bool,
@@ -248,7 +235,6 @@ impl TransactionsService {
         Self {
             repo,
             idempotency,
-            publisher,
             accounts,
             shards,
             verify_from_account,
@@ -367,83 +353,52 @@ impl TransactionService for TransactionsService {
             status: "accepted".into(),
             message: format!("Transaction queued for processing (shard {})", shard),
         };
-        let payload = serde_json::to_value(&accepted)
+        let response_payload = serde_json::to_value(&accepted)
             .map_err(|e| TransactionError::Infra(format!("payload serialise: {e}")))?;
 
-        // Idempotency dance: reserve OR replay OR conflict.
+        // Wire-form RabbitMQ message. Field names match what the
+        // consumer expects; the publish-outbox worker forwards
+        // this JSONB column to the broker as-is.
+        let request_id = input.request_id.clone().unwrap_or_default();
+        let outbox_payload = serde_json::json!({
+            "from_account":    input.from_account,
+            "to_account":      input.to_account,
+            "amount":          amount_str,
+            "currency":        input.currency,
+            "reference_id":    reference_id,
+            "description":     input.description,
+            "request_id":      request_id,
+            "shard":           shard,
+            "idempotency_key": idempotency_key,
+            "request_hash":    request_hash,
+        });
+
+        // Reserve commits the response and the outbox payload in a
+        // single Postgres transaction. After this returns
+        // `Reserved` the queue message is durable; the worker
+        // drains it asynchronously.
         match self
             .idempotency
-            .reserve(shard, &idempotency_key, &request_hash, &payload)
+            .reserve(
+                shard,
+                &idempotency_key,
+                &request_hash,
+                &response_payload,
+                &outbox_payload,
+            )
             .await
             .map_err(TransactionError::Infra)?
         {
             ReserveOutcome::Replay(stored) => {
-                // Decode the stored accepted payload if it parses,
-                // otherwise return the new one (matches legacy
-                // fallback behaviour).
                 let replayed: TransactionAccepted =
                     serde_json::from_value(stored).unwrap_or_else(|_| accepted.clone());
-                return Ok(replayed);
+                Ok(replayed)
             }
-            ReserveOutcome::HashConflict => {
-                return Err(TransactionError::IdempotencyConflict(
-                    "idempotency key reused with a different payload".into(),
-                ));
-            }
-            ReserveOutcome::Reserved => { /* fall through to publish */ }
+            ReserveOutcome::HashConflict => Err(TransactionError::IdempotencyConflict(
+                "idempotency key reused with a different payload".into(),
+            )),
+            ReserveOutcome::Reserved => Ok(accepted),
         }
-
-        // Publish to the queue. On failure roll back the
-        // idempotency reservation so the caller can retry — and so
-        // a stuck `processing` row + cached "accepted" payload
-        // does not lie to subsequent retries about a transaction
-        // that never reached the consumer.
-        let request_id = input.request_id.clone().unwrap_or_default();
-        let publish_result = self
-            .publisher
-            .publish_created(PublishedTransaction {
-                from_account: input.from_account.clone(),
-                to_account: input.to_account.clone(),
-                amount_str,
-                currency: input.currency.clone(),
-                reference_id: reference_id.clone(),
-                description: input.description.clone(),
-                request_id,
-                shard,
-                idempotency_key: idempotency_key.clone(),
-                request_hash: request_hash.clone(),
-            })
-            .await;
-
-        if let Err(publish_err) = publish_result {
-            // Best-effort cleanup. If the cleanup itself fails the
-            // row will sit in `processing` until natural expiry —
-            // bad, but no worse than the no-cleanup status quo.
-            // Surface both errors in the log for triage.
-            if let Err(release_err) = self
-                .idempotency
-                .release(shard, &idempotency_key)
-                .await
-            {
-                tracing::error!(
-                    publish_err = %publish_err,
-                    release_err = %release_err,
-                    idempotency_key = %idempotency_key,
-                    "publish failed AND idempotency release failed — row stuck until expiry"
-                );
-                metrics::counter!("idempotency_release_failures_total").increment(1);
-            } else {
-                tracing::warn!(
-                    error = %publish_err,
-                    idempotency_key = %idempotency_key,
-                    "publish failed, idempotency reservation rolled back"
-                );
-                metrics::counter!("idempotency_releases_total").increment(1);
-            }
-            return Err(TransactionError::Infra(publish_err));
-        }
-
-        Ok(accepted)
     }
 
     async fn get_by_id(&self, id: TransactionId) -> Result<TransactionView, TransactionError> {

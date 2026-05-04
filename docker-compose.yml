@@ -300,6 +300,18 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # Hardening — distroless+nonroot already runs as UID 65532; this layer
+    # adds defence-in-depth: no writable rootfs, no kernel caps, no privilege
+    # escalation, fork-bomb cap. App code does no filesystem writes (verified
+    # via grep for std::fs / tokio::fs::write|create), so read_only is safe.
+    # /tmp tmpfs is provided in case any dep (rustls cert cache, etc.) writes.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     env_file: .env
     environment:
       # ── Failover wiring ─────────────────────────────────────────
@@ -360,6 +372,7 @@ services:
         limits:
           memory: 384M
           cpus: "1.0"
+          pids: 256
 
   # ============================================================
   # etcd cluster — Patroni's distributed config store

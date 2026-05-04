@@ -52,11 +52,20 @@ CREATE INDEX idx_transactions_status ON transactions (status)
 -- Fix #28: Removed redundant idx_transactions_reference_id — the UNIQUE
 -- constraint on `reference_id` already creates an implicit unique index.
 
--- Time-based queries
-CREATE INDEX idx_transactions_created_at ON transactions (created_at DESC);
-
--- BRIN index for time-series queries (very efficient for ordered data)
-CREATE INDEX idx_transactions_created_at_brin ON transactions USING BRIN (created_at);
+-- Keyset cursor index for `GET /api/v2/transactions`.
+--
+-- Serves the list pagination predicate
+--   WHERE (created_at, id) < ($1, $2)
+--   ORDER BY created_at DESC, id DESC
+--   LIMIT N
+-- one-to-one: column order matches both the cursor tuple and the
+-- ORDER BY, so the planner reads the index forward and stops at
+-- the LIMIT without a sort or a bitmap heap scan. `id DESC` is
+-- the tie-breaker for rows sharing `created_at`. This is the only
+-- time-ordered index on the table — keeping it the only choice
+-- prevents the planner from picking a bitmap-heap-scan path on
+-- small `LIMIT` reads.
+CREATE INDEX idx_transactions_created_id ON transactions (created_at DESC, id DESC);
 
 -- ============================================================
 -- Updated_at trigger
@@ -115,6 +124,18 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 
     response_payload    JSONB,
 
+    -- Outbox payload: the wire-form RabbitMQ message that the
+    -- background outbox worker drains. Written in the same
+    -- transaction as the idempotency reservation so a 202 to the
+    -- client is durable before any broker round-trip.
+    outbox_payload      JSONB,
+    -- True once the broker confirms the publish; flipped by the
+    -- outbox worker. Reservations created by the producer start
+    -- false; rows touched only by maintenance / cleanup may be
+    -- born true.
+    published           BOOLEAN NOT NULL DEFAULT false,
+    published_at        TIMESTAMPTZ,
+
     expires_at          TIMESTAMPTZ NOT NULL,
 
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -123,6 +144,9 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 
 CREATE INDEX idx_idempotency_keys_status ON idempotency_keys (status);
 CREATE INDEX idx_idempotency_keys_expires_at ON idempotency_keys (expires_at);
+-- Partial index on the outbox worker's scan predicate.
+CREATE INDEX idx_idempotency_keys_unpublished
+    ON idempotency_keys (created_at) WHERE NOT published;
 
 
 -- ============================================================
@@ -200,26 +224,17 @@ CREATE TRIGGER trigger_update_idempotency_keys_updated_at
 --     $$SELECT cleanup_expired_idempotency_keys()$$);
 -- ============================================================
 -- Sweeps any row whose 24h reservation has elapsed plus a 1h
--- grace window, regardless of status. Earlier versions filtered
--- on status IN ('completed','failed') — but the consumer never
--- transitions the row out of 'processing', so the table grew
--- unbounded. The application layer DELETEs 'processing' rows
--- explicitly via release() on publish failure; everything else
--- is the cleanup function's job.
+-- grace window, regardless of status. Unpublished rows are NEVER
+-- swept early: the publish-outbox worker is responsible for
+-- draining them, and a sweep of an unpublished row would lose
+-- the queue message the producer already returned 202 for.
 CREATE OR REPLACE FUNCTION cleanup_expired_idempotency_keys()
 RETURNS INTEGER AS $$
 DECLARE
     deleted_count INTEGER;
 BEGIN
-    -- Two sweeps:
-    --   * past-expiry rows (24h+1h grace).
-    --   * 'processing' rows older than 60s — bounds the
-    --     replay-without-publish window when an app crashed
-    --     between reserve and queue publish.
     DELETE FROM idempotency_keys
-    WHERE expires_at < NOW() - INTERVAL '1 hour'
-       OR (status = 'processing'
-           AND created_at < NOW() - INTERVAL '60 seconds');
+    WHERE expires_at < NOW() - INTERVAL '1 hour';
     GET DIAGNOSTICS deleted_count = ROW_COUNT;
     RETURN deleted_count;
 END;

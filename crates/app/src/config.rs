@@ -23,7 +23,7 @@ pub struct Config {
     // Loaded from env but not currently wired into ShardRouter
     // while shard 2 is disabled. Kept so re-enabling shard 2
     // is a one-line flip in src/bootstrap.rs.
-    #[allow(dead_code)]
+    
     pub database_shard2_read_urls: Vec<String>,
     pub db_write_pool_size: u32,
     pub db_read_pool_size: u32,
@@ -50,7 +50,7 @@ pub struct Config {
     // compatibility but not yet threaded into the `retry_transient`
     // call sites — they hardcode a backoff today. Wiring it through
     // is tracked outside Phase 4 scope.
-    #[allow(dead_code)]
+    
     pub db_write_retry_backoff_ms: u64,
 
     // RabbitMQ

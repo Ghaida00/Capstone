@@ -31,7 +31,7 @@ pub async fn spawn_postgres() -> (PgPool, ContainerAsync<Postgres>) {
 }
 
 /// Spin up an ephemeral Redis container and return the connection URL + container handle.
-#[allow(dead_code)]
+
 pub async fn spawn_redis() -> (String, ContainerAsync<Redis>) {
     let container = Redis::default().start().await.unwrap();
     let host_port = container.get_host_port_ipv4(6379).await.unwrap();
