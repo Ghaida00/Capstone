@@ -1,13 +1,47 @@
+# Build artefacts
 target/
 **/target/
+
+# VCS
 .git/
 .gitignore
+.gitattributes
+
+# Secrets / env
 .env
 .env.*
 !.env.example
+
+# Docs
 *.md
+LICENSE
+
+# Editor / OS
 .vscode/
 .idea/
+**/.DS_Store
+**/Thumbs.db
+
+# Docker definitions themselves
 Dockerfile
 .dockerignore
 docker-compose*.yml
+
+# Tooling
+Makefile
+
+# Orchestration & infra configs (not needed for the Rust binary build context;
+# each one has its own build/mount path in docker-compose.yml).
+db/
+nginx/
+haproxy/
+redis/
+prometheus/
+grafana/
+
+# Out-of-band assets
+docs/
+k6/
+
+# Logs
+**/*.log

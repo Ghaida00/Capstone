@@ -185,10 +185,10 @@ paths:
           content:
             text/plain:
               example: |
-                http_requests_total{method="POST",path="/api/v1/transactions",status="202"} 45
+                http_requests_total{method="POST",path="/api/v2/transactions",status="202"} 45
                 transactions_created_total 45
 
-  /api/v1/transactions:
+  /api/v2/transactions:
     get:
       summary: List Transactions
       description: Mengambil daftar transaksi terakhir dari semua shard.
@@ -246,7 +246,7 @@ paths:
         '429':
           description: Too Many Requests (Rate Limited)
 
-  /api/v1/transactions/{id}:
+  /api/v2/transactions/{id}:
     get:
       summary: Get Transaction by ID
       description: Mencari detail transaksi berdasarkan UUID internal sistem.
@@ -272,7 +272,7 @@ paths:
         '404':
           description: Not Found
 
-  /api/v1/transactions/status/{reference_id}:
+  /api/v2/transactions/status/{reference_id}:
     get:
       summary: Get Status by Reference ID
       description: Mengecek status pemrosesan transaksi menggunakan reference_id dari client.
@@ -295,10 +295,13 @@ paths:
                       data:
                         $ref: '#/components/schemas/TransactionStatusResponse'
 
-  /api/v1/users/{account_number}/balance:
+  /api/v2/accounts/{account_number}/balance:
     get:
-      summary: Get User Balance
-      description: Mengambil saldo terakhir user. Endpoint ini shard-aware.
+      summary: Get Account Balance
+      description: |
+        Mengambil saldo terakhir akun. Endpoint ini shard-aware.
+        Resource rename dari v1: `/api/v1/users/.../balance` →
+        `/api/v2/accounts/.../balance` (segmen `users` jadi `accounts`).
       parameters:
         - name: account_number
           in: path
