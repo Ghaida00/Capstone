@@ -57,7 +57,6 @@ struct Inner {
     failure_threshold: u32,
     recovery_timeout: Duration,
     half_open_max_requests: u32,
-    total_rejected: AtomicU64,
 }
 
 impl CircuitBreaker {
@@ -73,7 +72,6 @@ impl CircuitBreaker {
                 failure_threshold,
                 recovery_timeout: Duration::from_secs(recovery_timeout_secs),
                 half_open_max_requests: 5,
-                total_rejected: AtomicU64::new(0),
             }),
         }
     }
@@ -120,7 +118,6 @@ impl CircuitBreaker {
                     // Whether we won the CAS or not, the circuit is now half-open.
                     self.try_admit_half_open()
                 } else {
-                    inner.total_rejected.fetch_add(1, Ordering::Relaxed);
                     false
                 }
             }
@@ -130,13 +127,10 @@ impl CircuitBreaker {
 
     fn try_admit_half_open(&self) -> bool {
         let inner = &*self.inner;
-        let prev = inner.half_open_request_count.fetch_add(1, Ordering::Relaxed);
-        if prev < inner.half_open_max_requests {
-            true
-        } else {
-            inner.total_rejected.fetch_add(1, Ordering::Relaxed);
-            false
-        }
+        let prev = inner
+            .half_open_request_count
+            .fetch_add(1, Ordering::Relaxed);
+        prev < inner.half_open_max_requests
     }
 
     /// Record a successful request.
@@ -172,7 +166,9 @@ impl CircuitBreaker {
     pub fn record_failure(&self) {
         let inner = &*self.inner;
         let prev = inner.failure_count.fetch_add(1, Ordering::Relaxed);
-        inner.last_failure_ms.store(self.now_ms(), Ordering::Relaxed);
+        inner
+            .last_failure_ms
+            .store(self.now_ms(), Ordering::Relaxed);
 
         match state_from_u8(inner.state.load(Ordering::Acquire)) {
             CircuitState::Closed => {
@@ -209,15 +205,6 @@ impl CircuitBreaker {
         }
     }
 
-    
-    pub fn current_state(&self) -> CircuitState {
-        state_from_u8(self.inner.state.load(Ordering::Acquire))
-    }
-
-    
-    pub fn total_rejected(&self) -> u64 {
-        self.inner.total_rejected.load(Ordering::Relaxed)
-    }
 }
 
 /// Axum middleware function for circuit breaker.

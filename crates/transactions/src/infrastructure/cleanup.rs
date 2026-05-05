@@ -17,10 +17,7 @@ use shared_kernel::db::shard::ShardRouter;
 /// without measurable load.
 const DEFAULT_INTERVAL_SECS: u64 = 30;
 
-pub fn spawn_idempotency_cleanup(
-    shards: ShardRouter,
-    cancel: CancellationToken,
-) -> JoinHandle<()> {
+pub fn spawn_idempotency_cleanup(shards: ShardRouter, cancel: CancellationToken) -> JoinHandle<()> {
     let interval = Duration::from_secs(DEFAULT_INTERVAL_SECS);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);

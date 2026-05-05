@@ -6,7 +6,7 @@
 use sqlx::PgPool;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::ContainerAsync;
-use testcontainers_modules::{postgres::Postgres, redis::Redis};
+use testcontainers_modules::postgres::Postgres;
 
 /// Spin up an ephemeral PostgreSQL container, run init.sql, and return the pool + container handle.
 ///
@@ -30,13 +30,3 @@ pub async fn spawn_postgres() -> (PgPool, ContainerAsync<Postgres>) {
     (pool, container)
 }
 
-/// Spin up an ephemeral Redis container and return the connection URL + container handle.
-
-pub async fn spawn_redis() -> (String, ContainerAsync<Redis>) {
-    let container = Redis::default().start().await.unwrap();
-    let host_port = container.get_host_port_ipv4(6379).await.unwrap();
-
-    let url = format!("redis://127.0.0.1:{}", host_port);
-
-    (url, container)
-}

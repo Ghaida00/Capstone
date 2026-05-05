@@ -14,37 +14,20 @@ use super::ports::{AccountId, AccountStatus, Balance};
 
 // ─── Domain entity ───────────────────────────────────────────
 
-/// The domain's own view of an account, richer than the DTO in
-/// `ports.rs` (carries internal-only fields like `full_name`
-/// and `email` that are not exposed through the current ports).
+/// The domain's own view of an account.
 ///
 /// Intentionally private inside the module. Leaking this to
 /// another module is a review blocker; convert to the
 /// `Balance` port DTO at the infrastructure boundary.
-///
-/// `full_name` and `email` are populated by the repository but
-/// not yet read by any use case — they're kept on the entity
-/// so the forthcoming `create_account` / `send_statement` use
-/// cases (Phase 2+) do not need to widen the row projection
-/// or the repo trait. `` is deliberate and
-/// scoped to these two fields only.
 #[derive(Debug, Clone)]
 pub(crate) struct Account {
     pub id: AccountId,
-    
-    pub full_name: String,
-    
-    pub email: Option<String>,
     pub amount_str: String,
     pub currency: String,
     pub status: AccountStatus,
 }
 
 impl Account {
-    /// Convert to the port-facing DTO. The conversion is
-    /// lossy on purpose — `full_name` / `email` are not
-    /// exposed to other modules today. Widening the DTO is a
-    /// deliberate API evolution, not an accident.
     pub(crate) fn to_balance(&self) -> Balance {
         Balance {
             account_id: self.id.clone(),
@@ -53,26 +36,6 @@ impl Account {
             status: self.status,
         }
     }
-}
-
-// ─── Domain-local errors ────────────────────────────────────
-
-/// The domain's error enum. The port's `AccountError` is a
-/// superset — every variant here maps cleanly onto one there,
-/// with the infrastructure layer supplying `Infra(String)`.
-///
-/// `` because Phase 1 only exercises the
-/// happy-path read; the variants are referenced by the
-/// `From<DomainError> for AccountError` impl in the
-/// application layer, which future use cases will hit.
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum DomainError {
-    #[error("account not found: {0}")]
-    NotFound(String),
-
-    #[error("invalid account identifier: {0}")]
-    Validation(String),
 }
 
 // ─── Repository abstraction ─────────────────────────────────

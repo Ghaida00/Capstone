@@ -23,8 +23,6 @@ use super::super::ports::{AccountId, AccountStatus};
 #[derive(Debug, FromRow)]
 struct UsersRow {
     account_number: String,
-    full_name: String,
-    email: Option<String>,
     balance: Decimal,
     status: String,
 }
@@ -59,7 +57,7 @@ impl AccountRepository for SqlxAccountRepository {
                 async move {
                     sqlx::query_as::<_, UsersRow>(
                         r#"
-                        SELECT account_number, full_name, email, balance, status
+                        SELECT account_number, balance, status
                         FROM users
                         WHERE account_number = $1
                           AND status = 'active'
@@ -80,8 +78,6 @@ impl AccountRepository for SqlxAccountRepository {
         Ok(row.map(|r| {
             Account {
                 id: AccountId(r.account_number),
-                full_name: r.full_name,
-                email: r.email,
                 amount_str: r.balance.to_string(),
                 currency: "IDR".to_string(),
                 // DB-level CHECK constraint guarantees the

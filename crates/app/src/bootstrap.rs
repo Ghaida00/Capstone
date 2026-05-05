@@ -186,11 +186,9 @@ pub async fn init_infrastructure(
                 read_urls: config.database_shard1_read_urls.clone(),
             },
             // Shard 2 disabled — see "shard 2 disabled" markers in
-            // docker-compose.yml / haproxy.cfg / shard.rs.
-            // ShardUrls {
-            //     write_url: config.database_shard2_write_url.clone(),
-            //     read_urls: config.database_shard2_read_urls.clone(),
-            // },
+            // docker-compose.yml / haproxy.cfg / shard.rs. Re-enabling
+            // requires re-adding `database_shard2_read_urls` to Config
+            // and the env-parsing block, then a ShardUrls entry here.
         ],
         write_pool_size: config.db_write_pool_size,
         read_pool_size: config.db_read_pool_size,

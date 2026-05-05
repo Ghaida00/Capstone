@@ -20,11 +20,6 @@ pub struct Config {
     pub database_shard1_write_url: String,
     pub database_shard1_read_urls: Vec<String>,
     pub database_shard2_write_url: String,
-    // Loaded from env but not currently wired into ShardRouter
-    // while shard 2 is disabled. Kept so re-enabling shard 2
-    // is a one-line flip in src/bootstrap.rs.
-    
-    pub database_shard2_read_urls: Vec<String>,
     pub db_write_pool_size: u32,
     pub db_read_pool_size: u32,
 
@@ -46,12 +41,6 @@ pub struct Config {
     // DB Failover
     pub db_health_check_interval_secs: u64,
     pub db_write_retry_max_attempts: u32,
-    // Parsed from env (`DB_WRITE_RETRY_BACKOFF_MS`) for forward
-    // compatibility but not yet threaded into the `retry_transient`
-    // call sites — they hardcode a backoff today. Wiring it through
-    // is tracked outside Phase 4 scope.
-    
-    pub db_write_retry_backoff_ms: u64,
 
     // RabbitMQ
     pub rabbitmq_url: String,
@@ -143,11 +132,6 @@ impl Config {
                 "DATABASE_SHARD2_WRITE_URL",
                 "postgres://peakload_user:peakload_secure_pass@pgbouncer-shard2:5432/peakload_db",
             ),
-            database_shard2_read_urls: parse_csv_env(
-                "DATABASE_SHARD2_READ_URLS",
-                "postgres://peakload_user:peakload_secure_pass@pg-shard2-node-a:5432/peakload_db,postgres://peakload_user:peakload_secure_pass@pg-shard2-node-b:5432/peakload_db",
-            ),
-
             // Pool sizes raised: previous defaults bottlenecked at the
             // app↔pgBouncer hop. With 4 replicas each pool is now sized
             // to soak its share of 1000 concurrent VUs without queueing.
@@ -202,9 +186,6 @@ impl Config {
             db_write_retry_max_attempts: env_or("DB_WRITE_RETRY_MAX_ATTEMPTS", "6")
                 .parse()
                 .expect("DB_WRITE_RETRY_MAX_ATTEMPTS must be a number"),
-            db_write_retry_backoff_ms: env_or("DB_WRITE_RETRY_BACKOFF_MS", "200")
-                .parse()
-                .expect("DB_WRITE_RETRY_BACKOFF_MS must be a number"),
 
             rabbitmq_url: env_or(
                 "RABBITMQ_URL",
@@ -491,7 +472,6 @@ mod tests {
             database_shard1_write_url: "postgres://user:pass@host:5432/db".to_string(),
             database_shard1_read_urls: vec!["postgres://user:pass@host:5432/db".to_string()],
             database_shard2_write_url: "postgres://user:pass@host:5432/db".to_string(),
-            database_shard2_read_urls: vec!["postgres://user:pass@host:5432/db".to_string()],
             db_write_pool_size: 30,
             db_read_pool_size: 50,
             db_query_timeout_secs: 5,
@@ -505,7 +485,6 @@ mod tests {
             redis_sentinel_monitor_interval_secs: 5,
             db_health_check_interval_secs: 5,
             db_write_retry_max_attempts: 3,
-            db_write_retry_backoff_ms: 50,
             rabbitmq_url: "amqp://user:pass@localhost:5672".to_string(),
             rate_limit_per_second: 10000,
             rate_limit_burst: 20000,
