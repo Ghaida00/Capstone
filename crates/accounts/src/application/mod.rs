@@ -63,7 +63,10 @@ impl AccountService for GetBalanceService {
         match self.repo.find_active_by_id(id).await {
             Ok(Some(account)) => {
                 let bal = account.to_balance();
-                let _ = self.cache.set(&cache_key, &bal, ACCOUNT_CACHE_TTL_SECS).await;
+                let _ = self
+                    .cache
+                    .set(&cache_key, &bal, ACCOUNT_CACHE_TTL_SECS)
+                    .await;
                 Ok(bal)
             }
             Ok(None) => Err(AccountError::NotFound(id.as_str().to_owned())),

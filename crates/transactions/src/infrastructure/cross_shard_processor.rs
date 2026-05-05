@@ -149,7 +149,11 @@ async fn drain_shard(shards: &ShardRouter, sender_shard: usize) -> Result<(), sq
             match refund_sender(sender_pool, &row).await {
                 Ok(()) => {
                     metrics::counter!("cross_shard_refund_applied_total").increment(1);
-                    best_effort("mark_completed", row.id, mark_completed(sender_pool, row.id).await);
+                    best_effort(
+                        "mark_completed",
+                        row.id,
+                        mark_completed(sender_pool, row.id).await,
+                    );
                 }
                 Err(e) => {
                     handle_attempt_error(sender_pool, &row, e.to_string(), "refund").await;
@@ -162,11 +166,29 @@ async fn drain_shard(shards: &ShardRouter, sender_shard: usize) -> Result<(), sq
         match apply_on_receiver(receiver_pool, sender_shard, &row).await {
             Ok(ApplyOutcome::Applied) => {
                 metrics::counter!("cross_shard_credit_applied_total").increment(1);
-                best_effort("mark_completed", row.id, mark_completed(sender_pool, row.id).await);
+                best_effort(
+                    "mark_sender_completed",
+                    row.id,
+                    mark_sender_completed(sender_pool, &row.reference_id, &row.from_account).await,
+                );
+                best_effort(
+                    "mark_completed",
+                    row.id,
+                    mark_completed(sender_pool, row.id).await,
+                );
             }
             Ok(ApplyOutcome::AlreadyApplied) => {
                 metrics::counter!("cross_shard_credit_redundant_total").increment(1);
-                best_effort("mark_completed", row.id, mark_completed(sender_pool, row.id).await);
+                best_effort(
+                    "mark_sender_completed",
+                    row.id,
+                    mark_sender_completed(sender_pool, &row.reference_id, &row.from_account).await,
+                );
+                best_effort(
+                    "mark_completed",
+                    row.id,
+                    mark_completed(sender_pool, row.id).await,
+                );
             }
             Ok(ApplyOutcome::RecipientMissing) => {
                 metrics::counter!("cross_shard_credit_recipient_missing_total").increment(1);
@@ -234,7 +256,11 @@ async fn handle_attempt_error(
             error = %err,
             "cross-shard step failed, will retry"
         );
-        best_effort("bump_attempt", row.id, bump_attempt(pool, row.id, &err).await);
+        best_effort(
+            "bump_attempt",
+            row.id,
+            bump_attempt(pool, row.id, &err).await,
+        );
     }
 }
 
@@ -333,10 +359,7 @@ async fn apply_on_receiver(
 /// Returns Ok(()) regardless of whether the refund actually moved
 /// money — a no-op result means a previous attempt already
 /// reversed the row.
-async fn refund_sender(
-    pool: &sqlx::PgPool,
-    row: &OutboxRow,
-) -> Result<(), sqlx::Error> {
+async fn refund_sender(pool: &sqlx::PgPool, row: &OutboxRow) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query(
         r#"
@@ -386,6 +409,29 @@ async fn mark_completed(pool: &sqlx::PgPool, id: Uuid) -> Result<(), sqlx::Error
          WHERE id = $1 AND status = 'pending'",
     )
     .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Flip the sender-side `transactions` audit row from
+/// 'processing' to 'completed' once the cross-shard credit has
+/// landed on the receiver. Guarded on `status = 'processing'` so
+/// the update is a no-op against a row that is already terminal
+/// — either a redelivered apply, or the refund path having
+/// already moved the row to 'reversed'.
+async fn mark_sender_completed(
+    pool: &sqlx::PgPool,
+    reference_id: &str,
+    from_account: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE transactions \
+         SET status = 'completed', processed_at = NOW(), updated_at = NOW() \
+         WHERE reference_id = $1 AND from_account = $2 AND status = 'processing'",
+    )
+    .bind(reference_id)
+    .bind(from_account)
     .execute(pool)
     .await?;
     Ok(())

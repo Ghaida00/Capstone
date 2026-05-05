@@ -31,9 +31,9 @@ use super::ports::{AccountId, AccountStatus, Balance};
 #[derive(Debug, Clone)]
 pub(crate) struct Account {
     pub id: AccountId,
-    
+
     pub full_name: String,
-    
+
     pub email: Option<String>,
     pub amount_str: String,
     pub currency: String,

@@ -134,11 +134,13 @@ impl QueueProducer {
 
         // First connection — used to declare topology and serve
         // the first chunk of channels.
-        let connection =
-            tokio::time::timeout(Duration::from_secs(AMQP_CONTROL_TIMEOUT_SECS), Connection::open(&args))
-                .await
-                .map_err(|_| AppError::Internal("RabbitMQ connection open timed out".into()))?
-                .map_err(|e| AppError::Internal(format!("RabbitMQ connection error: {}", e)))?;
+        let connection = tokio::time::timeout(
+            Duration::from_secs(AMQP_CONTROL_TIMEOUT_SECS),
+            Connection::open(&args),
+        )
+        .await
+        .map_err(|_| AppError::Internal("RabbitMQ connection open timed out".into()))?
+        .map_err(|e| AppError::Internal(format!("RabbitMQ connection error: {}", e)))?;
 
         connection
             .register_callback(DefaultConnectionCallback)
@@ -207,8 +209,7 @@ impl QueueProducer {
             .await
             .map_err(|e| AppError::Internal(format!("Queue bind error: {}", e)))?;
 
-        let mut channels: Vec<Arc<ConfirmingChannel>> =
-            Vec::with_capacity(CHANNEL_POOL_SIZE);
+        let mut channels: Vec<Arc<ConfirmingChannel>> = Vec::with_capacity(CHANNEL_POOL_SIZE);
         channels.push(Self::wrap_channel(setup_channel).await?);
         for _ in 1..CHANNELS_PER_CONNECTION {
             let ch = tokio::time::timeout(
@@ -294,8 +295,7 @@ impl QueueProducer {
             let idx = self.rr.fetch_add(1, Ordering::Relaxed) % snapshot.channels.len();
             let cc = snapshot.channels[idx].clone();
 
-            match publish_with_confirm(&cc, properties.clone(), payload.clone(), args.clone())
-                .await
+            match publish_with_confirm(&cc, properties.clone(), payload.clone(), args.clone()).await
             {
                 Ok(_) => return Ok(()),
                 Err(e) => {
@@ -328,16 +328,14 @@ impl QueueProducer {
                                 Ok(new_state) => {
                                     *guard = Arc::new(new_state);
                                     self.connected.store(true, Ordering::SeqCst);
-                                    metrics::counter!("rabbitmq_reconnections_total")
-                                        .increment(1);
+                                    metrics::counter!("rabbitmq_reconnections_total").increment(1);
                                 }
                                 Err(rebuild_err) => {
                                     tracing::error!(
                                         error = %rebuild_err,
                                         "RabbitMQ rebuild failed"
                                     );
-                                    last_err =
-                                        Some(format!("rebuild failed: {}", rebuild_err));
+                                    last_err = Some(format!("rebuild failed: {}", rebuild_err));
                                 }
                             }
                         }
@@ -385,7 +383,9 @@ impl QueueProducer {
             .finish();
         let mut args = BasicPublishArguments::new(DLX_EXCHANGE, "health-probe");
         args.mandatory = false;
-        let ok = publish_with_confirm(&cc, properties, Vec::new(), args).await.is_ok();
+        let ok = publish_with_confirm(&cc, properties, Vec::new(), args)
+            .await
+            .is_ok();
         self.connected.store(ok, Ordering::SeqCst);
         ok
     }

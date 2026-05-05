@@ -191,10 +191,8 @@ pub(crate) async fn get_by_id(
 
     let view = deps.service.get_by_id(TransactionId(id)).await?;
     let resp: TransactionResponseV2 = view.into();
-    // Short TTL so a status flip (e.g. 'completed' → future
-    // 'reversed' under the outbox bundle) is not masked for long.
-    // Until the cache invalidator subscriber lands the bound is
-    // simply this timeout.
+    // Short TTL bounds worst-case staleness if the cache
+    // invalidator subscriber misses an event.
     let _ = deps.cache.set(&cache_key, &resp, 30).await;
     Ok(Json(ApiResponse::success(resp)))
 }
@@ -249,6 +247,7 @@ pub(crate) async fn list(
         metrics::counter!("cache_hits_total").increment(1);
         return Ok(Json(ApiResponse::success(cached)));
     }
+    metrics::counter!("cache_misses_total").increment(1);
 
     let views = deps
         .service

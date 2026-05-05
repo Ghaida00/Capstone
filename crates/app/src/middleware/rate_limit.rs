@@ -171,10 +171,7 @@ impl RateLimiter {
             let mut pipe = redis::pipe();
             for (ip, count) in &snapshot {
                 let key = format!("rl:global:{}", ip);
-                pipe.cmd("INCRBY")
-                    .arg(&key)
-                    .arg(*count as i64)
-                    .ignore();
+                pipe.cmd("INCRBY").arg(&key).arg(*count as i64).ignore();
                 pipe.cmd("EXPIRE")
                     .arg(&key)
                     .arg(self.window_secs as i64)

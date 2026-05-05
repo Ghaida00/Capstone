@@ -42,6 +42,19 @@ struct OutboxRow {
     outbox_payload: serde_json::Value,
 }
 
+/// Outcome of one `drain_once` iteration. Distinguishes "nothing
+/// to do" (sleep `IDLE_TICK`) from "broker is unhealthy" (sleep
+/// `ERROR_TICK`); previously both surfaced as `Ok(0)` and a broker
+/// outage degenerated into a 50 ms hot retry loop per shard.
+/// The shipped-row count is already tracked by the
+/// `publish_outbox_shipped_total` counter incremented inside the
+/// drain loop, so the variant carries no payload.
+enum DrainOutcome {
+    Empty,
+    Drained,
+    BrokerFailed,
+}
+
 /// Spawns one drainer task per shard. The returned handles join
 /// cleanly when `cancel` is fired; aborting the parent task is
 /// the supported shutdown.
@@ -75,16 +88,22 @@ async fn run_shard_worker(
         }
 
         match drain_once(shard_idx, &shards, &queue).await {
-            Ok(0) => {
+            Ok(DrainOutcome::Drained) => {
+                // Drained a non-empty batch; immediately look for
+                // more so a backlog drains as fast as the broker
+                // and the per-channel publish lock allow.
+            }
+            Ok(DrainOutcome::Empty) => {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = tokio::time::sleep(IDLE_TICK) => {}
                 }
             }
-            Ok(_) => {
-                // Drained a non-empty batch; immediately look for
-                // more so a backlog drains as fast as the broker
-                // and the per-channel publish lock allow.
+            Ok(DrainOutcome::BrokerFailed) => {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(ERROR_TICK) => {}
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -122,7 +141,7 @@ async fn drain_once(
     shard_idx: usize,
     shards: &ShardRouter,
     queue: &QueueProducer,
-) -> Result<usize, sqlx::Error> {
+) -> Result<DrainOutcome, sqlx::Error> {
     let pool = shards.writer(shard_idx);
     let mut tx = pool.begin().await?;
 
@@ -144,10 +163,9 @@ async fn drain_once(
         // Nothing to do — abort the empty tx promptly so the
         // pooled connection returns to the pool for other work.
         tx.rollback().await?;
-        return Ok(0);
+        return Ok(DrainOutcome::Empty);
     }
 
-    let mut shipped = 0usize;
     for row in rows {
         match queue.publish(&row.outbox_payload).await {
             Ok(()) => {
@@ -161,7 +179,6 @@ async fn drain_once(
                 .bind(row.id)
                 .execute(&mut *tx)
                 .await?;
-                shipped += 1;
                 metrics::counter!(
                     "publish_outbox_shipped_total",
                     "shard" => shard_idx.to_string()
@@ -181,14 +198,14 @@ async fn drain_once(
                 )
                 .increment(1);
                 tx.rollback().await?;
-                // Surface as Ok(0) rather than Err: the caller
-                // already counted the failure metric, and the
-                // outer loop will sleep and retry.
-                return Ok(0);
+                // Surface broker failure distinctly from "queue
+                // empty" so the outer loop sleeps `ERROR_TICK`
+                // instead of hot-looping on `IDLE_TICK`.
+                return Ok(DrainOutcome::BrokerFailed);
             }
         }
     }
 
     tx.commit().await?;
-    Ok(shipped)
+    Ok(DrainOutcome::Drained)
 }

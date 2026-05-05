@@ -130,7 +130,9 @@ impl CircuitBreaker {
 
     fn try_admit_half_open(&self) -> bool {
         let inner = &*self.inner;
-        let prev = inner.half_open_request_count.fetch_add(1, Ordering::Relaxed);
+        let prev = inner
+            .half_open_request_count
+            .fetch_add(1, Ordering::Relaxed);
         if prev < inner.half_open_max_requests {
             true
         } else {
@@ -172,7 +174,9 @@ impl CircuitBreaker {
     pub fn record_failure(&self) {
         let inner = &*self.inner;
         let prev = inner.failure_count.fetch_add(1, Ordering::Relaxed);
-        inner.last_failure_ms.store(self.now_ms(), Ordering::Relaxed);
+        inner
+            .last_failure_ms
+            .store(self.now_ms(), Ordering::Relaxed);
 
         match state_from_u8(inner.state.load(Ordering::Acquire)) {
             CircuitState::Closed => {
@@ -209,12 +213,10 @@ impl CircuitBreaker {
         }
     }
 
-    
     pub fn current_state(&self) -> CircuitState {
         state_from_u8(self.inner.state.load(Ordering::Acquire))
     }
 
-    
     pub fn total_rejected(&self) -> u64 {
         self.inner.total_rejected.load(Ordering::Relaxed)
     }

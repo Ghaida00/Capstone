@@ -72,10 +72,9 @@ struct PendingMessage {
     /// trust boundary leak that let a buggy/malicious producer
     /// route debits to the wrong DB.
     shard: usize,
-    /// Request id propagated from the producer for cross-process
-    /// trace correlation. Empty when the producer didn't supply
-    /// one. Attached to the per-batch span so log lines can be
-    /// joined with the originating HTTP request.
+    /// Request id propagated from the producer. Surfaced as a
+    /// field on event-publish warn lines for cross-process trace
+    /// correlation. Empty when the producer didn't supply one.
     request_id: String,
     /// Server-assigned `transactions.id` for this row. Filled in
     /// by `bulk_claim_slots` when the row is first claimed in
@@ -103,7 +102,6 @@ struct QueuePayload {
     reference_id: Option<String>,
     description: Option<String>,
     #[serde(default)]
-    
     shard: usize,
     #[serde(default)]
     request_id: String,
@@ -167,8 +165,7 @@ fn is_poison(err: &AppError) -> bool {
             if let Some(code) = pg_err.code() {
                 return matches!(
                     code.as_ref(),
-                    "23514" | "22003" | "22001" | "22P02" | "23502" | "22008"
-                        | "23505" | "21000"
+                    "23514" | "22003" | "22001" | "22P02" | "23502" | "22008" | "23505" | "21000"
                 );
             }
         }
@@ -200,18 +197,19 @@ pub async fn start_consumer(
 ) -> Result<JoinHandle<()>, AppError> {
     let parts = shared_kernel::queue::producer::parse_amqp_url_full(amqp_url)?;
 
-    let mut args = OpenConnectionArguments::new(&parts.host, parts.port, &parts.username, &parts.password);
+    let mut args =
+        OpenConnectionArguments::new(&parts.host, parts.port, &parts.username, &parts.password);
     args.virtual_host(&parts.vhost);
 
     // Cap broker handshake at 10s so a slow/down RabbitMQ does not
     // wedge app startup indefinitely.
-    let connection = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        Connection::open(&args),
-    )
-    .await
-    .map_err(|_| AppError::Internal("Consumer RabbitMQ connection open timed out".into()))?
-    .map_err(|e| AppError::Internal(format!("Consumer RabbitMQ connection error: {}", e)))?;
+    let connection =
+        tokio::time::timeout(std::time::Duration::from_secs(10), Connection::open(&args))
+            .await
+            .map_err(|_| AppError::Internal("Consumer RabbitMQ connection open timed out".into()))?
+            .map_err(|e| {
+                AppError::Internal(format!("Consumer RabbitMQ connection error: {}", e))
+            })?;
 
     connection
         .register_callback(DefaultConnectionCallback)
@@ -309,7 +307,9 @@ pub async fn start_consumer(
         let _connection = connection;
         let _channel = shared_channel;
         cancel.cancelled().await;
-        tracing::info!("Consumer connection holder: cancellation received, awaiting timer drain...");
+        tracing::info!(
+            "Consumer connection holder: cancellation received, awaiting timer drain..."
+        );
         if let Err(e) = timer_handle.await {
             tracing::warn!(error = %e, "Timer task did not exit cleanly");
         }
@@ -350,10 +350,7 @@ async fn apply_acks(
             tracing::warn!(context, "skipping ACK with delivery_tag=0");
             continue;
         }
-        if let Err(e) = channel
-            .basic_ack(BasicAckArguments::new(*tag, false))
-            .await
-        {
+        if let Err(e) = channel.basic_ack(BasicAckArguments::new(*tag, false)).await {
             tracing::error!(error = %e, context, tag = *tag, "failed to ACK");
         }
     }
@@ -390,8 +387,7 @@ fn record_batch_metrics(report: &FlushReport) {
         metrics::histogram!("transactions_batch_size").record(acked as f64);
     }
     if !report.failed_tags.is_empty() {
-        metrics::counter!("transactions_failed_total")
-            .increment(report.failed_tags.len() as u64);
+        metrics::counter!("transactions_failed_total").increment(report.failed_tags.len() as u64);
     }
     if !report.skipped_tags.is_empty() {
         // Idempotent redeliveries — separate counter so the
@@ -510,10 +506,7 @@ impl AsyncConsumer for BatchTransactionConsumer {
 /// tx on infra error (`requeue_tags`). Because each shard's tx
 /// is independent the failure of one shard never affects the
 /// other shards' ACKs.
-async fn flush_batch_to_shards(
-    batch: &[PendingMessage],
-    router: &ShardRouter,
-) -> FlushReport {
+async fn flush_batch_to_shards(batch: &[PendingMessage], router: &ShardRouter) -> FlushReport {
     let mut report = FlushReport::default();
     if batch.is_empty() {
         return report;
@@ -522,10 +515,7 @@ async fn flush_batch_to_shards(
     let mut shard_groups: std::collections::HashMap<usize, Vec<PendingMessage>> =
         std::collections::HashMap::new();
     for msg in batch {
-        shard_groups
-            .entry(msg.shard)
-            .or_default()
-            .push(msg.clone());
+        shard_groups.entry(msg.shard).or_default().push(msg.clone());
     }
 
     let mut handles: Vec<(
@@ -577,15 +567,16 @@ async fn flush_batch_to_shards(
                 report.failed_tags.extend(split.failed_tags);
                 report.skipped_tags.extend(split.skipped_tags);
                 if !split.dlq_tags.is_empty() {
-                    metrics::counter!("dlq_messages_total")
-                        .increment(split.dlq_tags.len() as u64);
+                    metrics::counter!("dlq_messages_total").increment(split.dlq_tags.len() as u64);
                 }
                 report.dlq_tags.extend(split.dlq_tags);
                 report.requeue_tags.extend(split.requeue_tags);
             }
             Ok(Err(e)) => {
                 tracing::error!(error = %e, shard = sender_shard, "shard batch failed, requeuing");
-                report.requeue_tags.extend(messages.iter().map(|m| m.delivery_tag));
+                report
+                    .requeue_tags
+                    .extend(messages.iter().map(|m| m.delivery_tag));
             }
             Err(e) => {
                 tracing::error!(error = %e, shard = sender_shard, "shard task join error, requeuing");
@@ -678,6 +669,13 @@ async fn process_shard_batch(
 
     let mut completed_msgs: Vec<PendingMessage> = Vec::with_capacity(messages.len());
     let mut failed_msgs: Vec<PendingMessage> = Vec::new();
+    // Cross-shard rows: sender-side audit row stays at 'processing'
+    // until `cross_shard_processor` confirms the credit landed on
+    // the receiver. Marking these 'completed' at sender commit time
+    // would surface a "completed" status to clients during the
+    // 250 ms+ window before the cross-shard apply runs, even though
+    // the recipient has not been credited yet.
+    let mut processing_msgs: Vec<PendingMessage> = Vec::new();
     // (msg, receiver_shard) — outbox rows queued for cross-shard credit.
     let mut cross_shard_outbox: Vec<(PendingMessage, usize)> = Vec::new();
     // Intra-batch dedupe: ON CONFLICT DO NOTHING returns one
@@ -771,35 +769,39 @@ async fn process_shard_batch(
                     "same-shard credit hit no row, refunding sender"
                 );
                 metrics::counter!("same_shard_credit_missing_total").increment(1);
-                sqlx::query(
-                    "UPDATE users SET balance = balance + $1 WHERE account_number = $2",
-                )
-                .bind(owned.request.amount)
-                .bind(&owned.request.from_account)
-                .execute(&mut *tx)
-                .await?;
+                sqlx::query("UPDATE users SET balance = balance + $1 WHERE account_number = $2")
+                    .bind(owned.request.amount)
+                    .bind(&owned.request.from_account)
+                    .execute(&mut *tx)
+                    .await?;
                 failed_msgs.push(owned);
                 continue;
             }
+            completed_msgs.push(owned);
         } else {
             // Cross-shard credit deferred to outbox row written
-            // INSIDE this tx — atomic with the debit.
+            // INSIDE this tx — atomic with the debit. The sender
+            // audit row commits as 'processing' and is flipped to
+            // 'completed' by `cross_shard_processor` only after the
+            // receiver shard's credit lands.
             cross_shard_outbox.push((owned.clone(), receiver_shard));
+            processing_msgs.push(owned);
         }
-
-        completed_msgs.push(owned);
     }
 
     // Insert outbox rows in same tx as debit.
     if !cross_shard_outbox.is_empty() {
-        let outbox_refs: Vec<(&PendingMessage, usize)> = cross_shard_outbox
-            .iter()
-            .map(|(m, s)| (m, *s))
-            .collect();
+        let outbox_refs: Vec<(&PendingMessage, usize)> =
+            cross_shard_outbox.iter().map(|(m, s)| (m, *s)).collect();
         bulk_insert_outbox(&mut tx, &outbox_refs).await?;
     }
 
-    // ─── Promote placeholder rows to terminal status ────────
+    // ─── Promote placeholder rows from 'pending' ────────────
+    // Same-shard outcomes are terminal here ('completed' /
+    // 'failed'). Cross-shard rows go to the non-terminal
+    // 'processing' state — `cross_shard_processor` flips them to
+    // 'completed' once the receiver-shard credit lands, or to
+    // 'reversed' on the recipient-missing refund path.
     if !failed_msgs.is_empty() {
         bulk_update_status(&mut tx, &failed_msgs, "failed").await?;
         for msg in &failed_msgs {
@@ -812,11 +814,19 @@ async fn process_shard_batch(
         completed.extend(completed_msgs);
     }
 
-    tx.commit().await?;
+    if !processing_msgs.is_empty() {
+        bulk_update_status(&mut tx, &processing_msgs, "processing").await?;
+        // Both same-shard 'completed' and cross-shard 'processing'
+        // rows are durably committed at this point. Publish the
+        // `transactions.committed` event for both so the cache
+        // invalidator DELs the per-id / per-status keys; clients
+        // who poll status during the cross-shard window then read
+        // the truthful 'processing' state from the DB instead of a
+        // stale cached value.
+        completed.extend(processing_msgs);
+    }
 
-    // Cross-shard credits are now in the outbox table. The
-    // outbox processor (`cross_shard_processor.rs`) drains them.
-    let _ = router;
+    tx.commit().await?;
 
     Ok(ShardOutcome {
         completed,

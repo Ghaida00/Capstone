@@ -119,11 +119,8 @@ async fn post_v2_transaction_lands_in_db_and_notifications() {
     // Drives the outbox row from `idempotency_keys` to RabbitMQ so
     // the consumer downstream sees the message — without this the
     // create returns 202 but nothing ever lands in the queue.
-    let _publish_outbox_handles = transactions::spawn_publish_outbox(
-        shards.clone(),
-        producer,
-        cancel.child_token(),
-    );
+    let _publish_outbox_handles =
+        transactions::spawn_publish_outbox(shards.clone(), producer, cancel.child_token());
     let (notif_deps, _notif_handle) = notifications::init(subscriber, cancel.child_token());
 
     // ── 6. Start consumer ──────────────────────────────────

@@ -14,9 +14,7 @@ use uuid::Uuid;
 use accounts::ports::{AccountError, AccountId, DynAccountService};
 use shared_kernel::db::shard::ShardRouter;
 
-use super::domain::{
-    IdempotencyAwareWriter, ReserveOutcome, Transaction, TransactionRepository,
-};
+use super::domain::{IdempotencyAwareWriter, ReserveOutcome, Transaction, TransactionRepository};
 use super::ports::{
     CreateTransactionInput, ListFilter, TransactionAccepted, TransactionError, TransactionId,
     TransactionService, TransactionStatusView, TransactionView,
@@ -172,9 +170,7 @@ fn validate_description(s: &str) -> Result<(), TransactionError> {
     // simple UI rendering downstream. Restrict to printable ASCII +
     // common Latin-1 punctuation; clients with multi-byte needs
     // can update this rule deliberately.
-    if s.chars()
-        .any(|c| c.is_control() && c != '\t')
-    {
+    if s.chars().any(|c| c.is_control() && c != '\t') {
         return Err(TransactionError::Validation(
             "description must not contain control characters".into(),
         ));
@@ -260,10 +256,7 @@ impl TransactionService for TransactionsService {
         // closes a hash-bypass: the idempotency key embeds
         // `from_account`, so distinct casings would otherwise
         // produce distinct keys for the same logical account.
-        if input
-            .from_account
-            .eq_ignore_ascii_case(&input.to_account)
-        {
+        if input.from_account.eq_ignore_ascii_case(&input.to_account) {
             return Err(TransactionError::Validation(
                 "from_account and to_account must differ".into(),
             ));
@@ -440,4 +433,3 @@ impl TransactionService for TransactionsService {
         }
     }
 }
-

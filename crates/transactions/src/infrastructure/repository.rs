@@ -297,13 +297,6 @@ fn status_priority(s: &str) -> u8 {
 #[derive(FromRow)]
 struct IdempotencyRowSlim {
     request_hash: String,
-    /// Decoded but never branched on: `idempotency_keys.status` is
-    /// always `'processing'` once the producer has reserved (the
-    /// consumer never writes back to this table). Kept on the row
-    /// for observability dumps and to keep the SELECT projection
-    /// stable across migrations.
-    
-    status: String,
     response_payload: Option<serde_json::Value>,
     /// SQL-side `NOW() >= expires_at` is the only thing the
     /// caller branches on; the raw timestamp stays for logs.
@@ -418,7 +411,6 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         let existing: Option<IdempotencyRowSlim> = sqlx::query_as(
             r#"
             SELECT request_hash,
-                   status,
                    response_payload,
                    expires_at,
                    (NOW() >= expires_at) AS expired
