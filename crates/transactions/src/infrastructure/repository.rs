@@ -298,14 +298,10 @@ fn status_priority(s: &str) -> u8 {
 struct IdempotencyRowSlim {
     request_hash: String,
     response_payload: Option<serde_json::Value>,
-    /// SQL-side `NOW() >= expires_at` is the only thing the
-    /// caller branches on; the raw timestamp stays for logs.
-    /// Comparing `expires_at` against `Utc::now()` in the
+    /// SQL-side `NOW() >= expires_at` — sidesteps app/DB clock drift.
+    /// Comparing the raw timestamp against `Utc::now()` in the
     /// application would risk app-vs-DB clock skew producing
     /// premature/late revives.
-    
-    expires_at: chrono::DateTime<Utc>,
-    /// SQL-side `NOW() >= expires_at` — sidesteps app/DB clock drift.
     expired: bool,
 }
 
@@ -335,6 +331,18 @@ struct IdempotencyCacheEntry {
     payload: serde_json::Value,
 }
 
+impl SqlxIdempotencyWriter {
+    /// Detach the cache populate so the hot path returns one Redis
+    /// round-trip earlier. A dropped SET is not a correctness
+    /// issue: the next replay falls through to the DB SELECT and
+    /// repopulates from there.
+    fn spawn_cache_set(cache: RedisCache, key: String, entry: IdempotencyCacheEntry) {
+        tokio::spawn(async move {
+            let _ = cache.set(&key, &entry, IDEMPOTENCY_TTL_SECS).await;
+        });
+    }
+}
+
 #[async_trait]
 impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
     async fn reserve(
@@ -347,33 +355,11 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
     ) -> Result<ReserveOutcome, String> {
         let writer = self.shards.writer(shard);
 
-        // Fast-path: Redis cache for already-accepted responses.
-        // The cached entry embeds the original `request_hash` so a
-        // duplicate `idempotency_key` carrying a different payload
-        // falls through to the DB and surfaces `HashConflict`
-        // instead of silently replaying.
-        match self
-            .cache
-            .get::<IdempotencyCacheEntry>(idempotency_key)
-            .await
-        {
-            Ok(Some(cached)) => {
-                if cached.request_hash == request_hash {
-                    metrics::counter!("idempotency_hits_total").increment(1);
-                    return Ok(ReserveOutcome::Replay(cached.payload));
-                }
-                let _ = self.cache.delete(idempotency_key).await;
-                metrics::counter!("idempotency_cache_hash_mismatch_total").increment(1);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, key = %idempotency_key, "idempotency cache get failed");
-            }
-        }
-
-        // Atomic first-mover claim. Writes both the response and
-        // the outbox payload in the same row so commit makes the
-        // queue message durable before this function returns.
+        // Optimistic INSERT first. The fresh path is ~95% of
+        // steady-state traffic, so skipping the pre-INSERT cache
+        // GET removes a Redis round-trip from the hot path. The
+        // conflict path (~5%) probes the cache below to short-
+        // circuit replay detection before the DB SELECT.
         let inserted = sqlx::query(
             r#"
             INSERT INTO idempotency_keys (
@@ -395,24 +381,47 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         .map_err(|e| e.to_string())?;
 
         if inserted.rows_affected() > 0 {
-            let entry = IdempotencyCacheEntry {
-                request_hash: request_hash.to_string(),
-                payload: accepted_payload.clone(),
-            };
-            let _ = self
-                .cache
-                .set(idempotency_key, &entry, IDEMPOTENCY_TTL_SECS)
-                .await;
+            Self::spawn_cache_set(
+                self.cache.clone(),
+                idempotency_key.to_string(),
+                IdempotencyCacheEntry {
+                    request_hash: request_hash.to_string(),
+                    payload: accepted_payload.clone(),
+                },
+            );
             return Ok(ReserveOutcome::Reserved);
         }
 
-        // Conflict path. SQL-side `expired` projection sidesteps
-        // app-vs-DB clock drift.
+        // Conflict path. Probe the cache to short-circuit a Replay
+        // before paying the DB SELECT. The cached entry embeds the
+        // original `request_hash` so a duplicate `idempotency_key`
+        // carrying a different payload falls through to the DB and
+        // surfaces `HashConflict` instead of silently replaying.
+        match self
+            .cache
+            .get::<IdempotencyCacheEntry>(idempotency_key)
+            .await
+        {
+            Ok(Some(cached)) => {
+                if cached.request_hash == request_hash {
+                    metrics::counter!("idempotency_hits_total").increment(1);
+                    return Ok(ReserveOutcome::Replay(cached.payload));
+                }
+                let _ = self.cache.delete(idempotency_key).await;
+                metrics::counter!("idempotency_cache_hash_mismatch_total").increment(1);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, key = %idempotency_key, "idempotency cache get failed");
+            }
+        }
+
+        // SQL-side `expired` projection sidesteps app-vs-DB clock
+        // drift.
         let existing: Option<IdempotencyRowSlim> = sqlx::query_as(
             r#"
             SELECT request_hash,
                    response_payload,
-                   expires_at,
                    (NOW() >= expires_at) AS expired
             FROM idempotency_keys
             WHERE idempotency_key = $1
@@ -443,14 +452,14 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
             let payload = existing
                 .response_payload
                 .unwrap_or_else(|| accepted_payload.clone());
-            let entry = IdempotencyCacheEntry {
-                request_hash: request_hash.to_string(),
-                payload: payload.clone(),
-            };
-            let _ = self
-                .cache
-                .set(idempotency_key, &entry, IDEMPOTENCY_TTL_SECS)
-                .await;
+            Self::spawn_cache_set(
+                self.cache.clone(),
+                idempotency_key.to_string(),
+                IdempotencyCacheEntry {
+                    request_hash: request_hash.to_string(),
+                    payload: payload.clone(),
+                },
+            );
             metrics::counter!("idempotency_hits_total").increment(1);
             return Ok(ReserveOutcome::Replay(payload));
         }
@@ -481,14 +490,14 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         .map_err(|e| e.to_string())?;
 
         if revived.rows_affected() > 0 {
-            let entry = IdempotencyCacheEntry {
-                request_hash: request_hash.to_string(),
-                payload: accepted_payload.clone(),
-            };
-            let _ = self
-                .cache
-                .set(idempotency_key, &entry, IDEMPOTENCY_TTL_SECS)
-                .await;
+            Self::spawn_cache_set(
+                self.cache.clone(),
+                idempotency_key.to_string(),
+                IdempotencyCacheEntry {
+                    request_hash: request_hash.to_string(),
+                    payload: accepted_payload.clone(),
+                },
+            );
             return Ok(ReserveOutcome::Reserved);
         }
 
@@ -497,9 +506,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         let winner: Option<IdempotencyRowSlim> = sqlx::query_as(
             r#"
             SELECT request_hash,
-                   status,
                    response_payload,
-                   expires_at,
                    (NOW() >= expires_at) AS expired
             FROM idempotency_keys
             WHERE idempotency_key = $1

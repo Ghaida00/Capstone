@@ -45,8 +45,8 @@ use shared_kernel::events::{Event, EventPublisher, EVENT_TRANSACTIONS_COMMITTED}
 
 const QUEUE_NAME: &str = "transactions.process";
 const CONSUMER_TAG: &str = "peakload-consumer";
-const BATCH_SIZE: usize = 50;
-const BATCH_FLUSH_MS: u64 = 100;
+const BATCH_SIZE: usize = 100;
+const BATCH_FLUSH_MS: u64 = 200;
 
 /// Wire-shape DTO for the queue message. Owned by the consumer
 /// because it represents the format the producer writes — the
@@ -88,11 +88,10 @@ struct PendingMessage {
 
 /// Message payload from queue.
 ///
-/// `shard` is no longer read — kept on the wire for backwards
-/// compat but the consumer re-derives shard via
-/// `ShardRouter::shard_for(&from_account)` so the routing decision
-/// is anchored to the same hash function the producer used (and
-/// would compute on a fresh re-publish).
+/// Consumer re-derives shard via `ShardRouter::shard_for(&from_account)`
+/// so routing is anchored to the same hash function the producer used.
+/// Serde tolerates extra fields, so old producers that still send
+/// `shard` continue to deserialize fine.
 #[derive(serde::Deserialize)]
 struct QueuePayload {
     from_account: String,
@@ -102,8 +101,6 @@ struct QueuePayload {
     reference_id: Option<String>,
     description: Option<String>,
     #[serde(default)]
-    shard: usize,
-    #[serde(default)]
     request_id: String,
 }
 
@@ -111,15 +108,14 @@ struct QueuePayload {
 ///
 /// `successful_tags`, `failed_tags`, and `skipped_tags` are all
 /// ACKed to the broker:
-///   * `successful_tags` — durable `'completed'` row in transactions
-///   * `failed_tags`     — durable `'failed'` row (business-state
-///                          failure: insufficient balance, missing
-///                          recipient on the same shard).
-///   * `skipped_tags`    — idempotent redelivery, the row already
-///                          existed from a prior batch's commit.
-///                          No DB write happened in this batch;
-///                          counting these as "failed" pollutes the
-///                          dashboards.
+///
+/// * `successful_tags` — durable `'completed'` row in transactions.
+/// * `failed_tags` — durable `'failed'` row (business-state failure:
+///   insufficient balance, missing recipient on the same shard).
+/// * `skipped_tags` — idempotent redelivery, the row already existed
+///   from a prior batch's commit. No DB write happened in this batch;
+///   counting these as "failed" pollutes the dashboards.
+///
 /// `requeue_tags` cover infrastructure errors that should be
 /// re-delivered for retry.
 #[derive(Default)]
@@ -518,11 +514,12 @@ async fn flush_batch_to_shards(batch: &[PendingMessage], router: &ShardRouter) -
         shard_groups.entry(msg.shard).or_default().push(msg.clone());
     }
 
-    let mut handles: Vec<(
+    type ShardHandle = (
         usize,
         Vec<PendingMessage>,
         JoinHandle<Result<ShardOutcome, AppError>>,
-    )> = Vec::with_capacity(shard_groups.len());
+    );
+    let mut handles: Vec<ShardHandle> = Vec::with_capacity(shard_groups.len());
 
     for (sender_shard, messages) in shard_groups {
         let pool = router.writer(sender_shard).clone();
@@ -609,23 +606,24 @@ struct ShardOutcome {
 }
 
 /// Tx structure (atomic on `pool`):
-///   1. **Claim slots** — bulk INSERT a placeholder row (status='pending',
-///      processed_at=NOW()) for every message, `ON CONFLICT (reference_id,
-///      from_account) DO NOTHING RETURNING id, reference_id, from_account`.
-///      Messages whose key was already inserted by a prior batch (or a
-///      concurrent batch racing this one) lose the claim and are reported
-///      as `skipped` — they ARE NOT debited again.
-///   2. For each message that won the claim:
-///      a. UPDATE balance debit (atomic check-and-decrement).
-///      b. If debit matched zero rows: mark message 'failed', continue.
-///      c. If receiver lives on this shard: UPDATE balance credit. If
-///         credit matched zero rows (recipient missing): refund the
-///         sender atomically within this tx, mark message 'failed'.
-///      d. Else: queue an outbox row for the cross-shard processor.
-///   3. Bulk INSERT outbox rows (in tx).
-///   4. Bulk UPDATE the placeholder transactions rows to terminal
-///      ('completed' or 'failed') status.
-///   5. tx.commit().
+///
+/// 1. **Claim slots** — bulk INSERT a placeholder row (status='pending',
+///    processed_at=NOW()) for every message, `ON CONFLICT (reference_id,
+///    from_account) DO NOTHING RETURNING id, reference_id, from_account`.
+///    Messages whose key was already inserted by a prior batch (or a
+///    concurrent batch racing this one) lose the claim and are reported
+///    as `skipped` — they ARE NOT debited again.
+/// 2. For each message that won the claim:
+///    a. UPDATE balance debit (atomic check-and-decrement).
+///    b. If debit matched zero rows: mark message 'failed', continue.
+///    c. If receiver lives on this shard: UPDATE balance credit. If
+///    credit matched zero rows (recipient missing): refund the
+///    sender atomically within this tx, mark message 'failed'.
+///    d. Else: queue an outbox row for the cross-shard processor.
+/// 3. Bulk INSERT outbox rows (in tx).
+/// 4. Bulk UPDATE the placeholder transactions rows to terminal
+///    ('completed' or 'failed') status.
+/// 5. tx.commit().
 ///
 /// Why insert-first rather than the previous SELECT-then-UPDATE:
 /// the dedupe SELECT runs at READ COMMITTED snapshot time, so two

@@ -135,7 +135,7 @@ fn validate_amount(amount: rust_decimal::Decimal) -> Result<(), TransactionError
     // the decimal point, 2 after). Reject amounts that would overflow
     // before the consumer hits a DB CHECK violation that aborts the
     // whole batch.
-    let max_amount = rust_decimal::Decimal::new(9_999_999_999_999_999_99i64, 2);
+    let max_amount = rust_decimal::Decimal::new(999_999_999_999_999_999_i64, 2);
     if amount > max_amount {
         return Err(TransactionError::Validation(
             "amount exceeds maximum DECIMAL(18, 2) value".into(),

@@ -14,7 +14,7 @@ use async_trait::async_trait;
 
 use shared_kernel::cache::redis::RedisCache;
 
-use super::domain::{AccountRepository, DomainError};
+use super::domain::AccountRepository;
 use super::ports::{AccountError, AccountId, AccountService, Balance};
 
 /// TTL for the existence/balance cache. Transactions only check that
@@ -75,14 +75,3 @@ impl AccountService for GetBalanceService {
     }
 }
 
-// `DomainError` → `AccountError` mapping. Kept here rather than
-// in `ports.rs` because the domain error type is module-private
-// and must never appear in a port signature.
-impl From<DomainError> for AccountError {
-    fn from(err: DomainError) -> Self {
-        match err {
-            DomainError::NotFound(msg) => AccountError::NotFound(msg),
-            DomainError::Validation(msg) => AccountError::Validation(msg),
-        }
-    }
-}
