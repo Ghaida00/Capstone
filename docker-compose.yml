@@ -915,6 +915,27 @@ services:
           memory: 128M
           cpus: "0.2"
 
+  # ============================================================
+  # jaeger — Distributed Tracing
+  # ============================================================
+  jaeger:
+      image: jaegertracing/all-in-one:latest
+      container_name: peakload-jaeger
+      environment:
+        - COLLECTOR_OTLP_ENABLED=true
+      ports:
+        - "16686:16686"
+        - "4317:4317"
+        - "4318:4318"
+      restart: unless-stopped
+      networks:
+        - peakload-network
+      deploy:
+        resources:
+          limits:
+            memory: 256M
+            cpus: "0.5"
+
 # ============================================================
 # Volumes
 # ------------------------------------------------------------
@@ -942,23 +963,3 @@ networks:
   peakload-network:
     driver: bridge
 
-# ============================================================
-# Jaeger — Distributed Tracing
-# ============================================================
-jaeger:
-    image: jaegertracing/all-in-one:1.64
-    container_name: peakload-jaeger
-    environment:
-      - COLLECTOR_OTLP_ENABLED=true
-    ports:
-      - "16686:16686" # Jaeger UI
-      - "4317:4317"   # OTLP gRPC receiver
-      - "4318:4318"   # OTLP HTTP receiver
-    restart: unless-stopped
-    networks:
-      - peakload-network 
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: "0.5"
