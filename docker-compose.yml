@@ -657,19 +657,19 @@ networks:
 # Jaeger — Distributed Tracing
 # ============================================================
 jaeger:
-  image: jaegertracing/all-in-one:1.64
-  container_name: gn-jaeger
-  environment:
-    - COLLECTOR_OTLP_ENABLED=true
-  ports:
-    - "16686:16686" # Jaeger UI
-    - "4317:4317"   # OTLP gRPC receiver
-    - "4318:4318"   # OTLP HTTP receiver
-  restart: unless-stopped
-  networks:
-    - gn-network
-  deploy:
-    resources:
-      limits:
-        memory: 256M
-        cpus: "0.5"
+    image: jaegertracing/all-in-one:1.64
+    container_name: peakload-jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+    restart: unless-stopped
+    networks:
+      - peakload-network 
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
