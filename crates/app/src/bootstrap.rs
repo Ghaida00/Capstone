@@ -84,8 +84,8 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics::describe_histogram!("transactions_batch_size", "Batch sizes");
     metrics::describe_counter!("dlq_messages_total", "Dead letter queue messages");
     metrics::describe_counter!(
-        "cross_shard_credit_failures_total",
-        "Cross-shard credit UPDATEs that failed AFTER the sender's tx committed — needs reconciliation"
+        "cross_shard_step_failures_total",
+        "Cross-shard outbox step failures (label `step`: `credit` or `refund`) — credit failures stranded a sender debit; refund failures left a sender un-compensated"
     );
 
     // Failover metrics

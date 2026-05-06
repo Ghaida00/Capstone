@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use shared_kernel::error::{AppError, AppResult};
 use shared_kernel::responses::ApiResponse;
 
+use super::super::application::BALANCE_CACHE_TTL_SECS;
 use super::super::infrastructure::AccountsDeps;
 use super::super::ports::{AccountError, AccountId, Balance};
 
@@ -95,21 +96,39 @@ pub(crate) async fn get_balance(
     );
 
     // L2: Redis. On hit, populate L1 so the next request on this
-    // replica skips the Redis hop.
-    if let Some(cached) = deps.cache.get::<BalanceResponse>(&cache_key).await? {
-        metrics::counter!("cache_hits_total", "tier" => "redis").increment(1);
-        deps.moka_balance
-            .insert(account_number.clone(), cached.clone())
-            .await;
-        return Ok(Json(ApiResponse::success(cached)));
+    // replica skips the Redis hop. On error, log + degrade to a
+    // DB read instead of returning 500: a transient Redis outage
+    // must not take down the balance endpoint when the DB is
+    // healthy.
+    match deps.cache.get::<BalanceResponse>(&cache_key).await {
+        Ok(Some(cached)) => {
+            metrics::counter!("cache_hits_total", "tier" => "redis").increment(1);
+            deps.moka_balance
+                .insert(account_number.clone(), cached.clone())
+                .await;
+            return Ok(Json(ApiResponse::success(cached)));
+        }
+        Ok(None) => {
+            metrics::counter!("cache_misses_total").increment(1);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Redis cache.get failed; falling through to DB");
+            metrics::counter!("cache_errors_total", "op" => "get").increment(1);
+        }
     }
-    metrics::counter!("cache_misses_total").increment(1);
 
     let id = AccountId(account_number.clone());
     let balance = deps.service.get_balance(&id).await?;
     let response: BalanceResponse = balance.into();
 
-    let _ = deps.cache.set(&cache_key, &response, 30).await;
+    if let Err(e) = deps
+        .cache
+        .set(&cache_key, &response, BALANCE_CACHE_TTL_SECS)
+        .await
+    {
+        tracing::warn!(error = %e, "Redis cache.set failed; serving DB result");
+        metrics::counter!("cache_errors_total", "op" => "set").increment(1);
+    }
     deps.moka_balance
         .insert(account_number, response.clone())
         .await;
