@@ -1,0 +1,214 @@
+# ============================================================
+# Patroni node config template
+# ============================================================
+#
+# Rendered by patroni-entrypoint.sh through envsubst on every
+# container start. The ${VAR} placeholders are the ONLY things
+# replaced — any literal $ elsewhere must be written as $$.
+#
+# scope + name together uniquely identify a node to etcd:
+#   key prefix: /service/${PATRONI_SCOPE}/...
+#   member key: /service/${PATRONI_SCOPE}/members/${PATRONI_NAME}
+#
+# Every node of the same shard shares ${PATRONI_SCOPE}. The
+# leader election picks one of them as primary; the loser is
+# a streaming replica.
+# ============================================================
+
+scope: ${PATRONI_SCOPE}
+namespace: /service/
+name: ${PATRONI_NAME}
+
+# ------------------------------------------------------------
+# REST API — HAProxy health-check target
+# ------------------------------------------------------------
+# Patroni serves:
+#   GET /primary   → 200 on the current primary, 503 elsewhere
+#   GET /replica   → 200 on a healthy streaming replica
+#   GET /health    → 200 when Postgres is running (role-agnostic)
+# Our haproxy.cfg uses GET /primary; see haproxy/README.md.
+# ------------------------------------------------------------
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: ${PATRONI_HOSTNAME}:8008
+
+# ------------------------------------------------------------
+# Distributed config store
+# ------------------------------------------------------------
+# ETCD_HOSTS is a comma-separated list like
+# "etcd-1:2379,etcd-2:2379,etcd-3:2379". Patroni will reconnect
+# if an endpoint disappears, so as long as a quorum of etcd
+# nodes is alive the cluster stays writable.
+# ------------------------------------------------------------
+etcd3:
+  hosts: ${ETCD_HOSTS}
+
+# ------------------------------------------------------------
+# Bootstrap: only consulted the very first time ANY node in
+# the scope comes up. Once the DCS has a leader record, these
+# settings are ignored in favour of whatever is in etcd (tune
+# cluster-wide knobs with `patronictl edit-config`).
+# ------------------------------------------------------------
+bootstrap:
+  dcs:
+    # How long a leader key lives in etcd without a refresh
+    # before the cluster considers the leader dead.
+    ttl: 30
+    # Patroni's internal "check my role" loop interval.
+    loop_wait: 10
+    # Give up and demote if we can't reach etcd within this
+    # many seconds. Must be < ttl/2 to avoid split-brain.
+    retry_timeout: 10
+    # Max WAL lag (bytes) a replica may have and still be
+    # promotable. 1 MiB = a conservative default; tune for
+    # replication volume.
+    maximum_lag_on_failover: 1048576
+
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        # --- Replication ---------------------------------
+        wal_level: replica
+        max_wal_senders: 10
+        max_replication_slots: 10
+        hot_standby: "on"
+
+        # --- Performance / resource-bounded capstone -----
+        # Matches the 192 MB per-node compose limit. PG 18's
+        # new async I/O and sequential-scan improvements are
+        # what motivated keeping the current major version
+        # rather than downgrading to 15 under pg_auto_failover.
+        shared_buffers: 64MB
+        effective_cache_size: 192MB
+        work_mem: 4MB
+        maintenance_work_mem: 32MB
+        max_connections: 120
+
+        # --- Checkpoint smoothing -------------------------
+        checkpoint_completion_target: 0.9
+        random_page_cost: 1.1
+        # Checkpoint cadence sized for the sustained insert
+        # workload. The 15 min timer plus 2 GiB WAL ceiling
+        # keeps the checkpointer on the timer rather than the
+        # WAL-full trigger. A WAL-full trigger forces a
+        # synchronous checkpoint that flushes every dirty
+        # buffer into the request path and evicts the index
+        # pages the keyset list query reads from shared
+        # buffers; the timer trigger spreads that flush over
+        # `checkpoint_completion_target=0.9` of the interval.
+        checkpoint_timeout: 15min
+        max_wal_size: 2GB
+        min_wal_size: 512MB
+
+        # --- Autovacuum tuning for `transactions` ---------
+        # Insert-heavy workload: `insert_scale_factor=0.05`
+        # schedules vacuum after ~5 % growth so each pass is
+        # small. `cost_limit=2000` lets the pass finish
+        # quickly once it starts. `naptime=30s` keeps the
+        # autovacuum launcher checking the table often enough
+        # that no single cycle accumulates a backlog large
+        # enough to contend with concurrent reads for shared
+        # buffers.
+        autovacuum_naptime: 30s
+        autovacuum_vacuum_cost_limit: 2000
+        autovacuum_vacuum_insert_scale_factor: 0.05
+
+        # --- Write-path latency knobs ---------------------
+        # Defaults assume durability matters more than commit
+        # latency. The capstone trades the other way: an
+        # idempotency-row write losing the last few ms of
+        # committed transactions on power-loss is acceptable
+        # because Redis still holds the accepted-payload
+        # cache for 24 h and the producer is idempotent on
+        # retry. `synchronous_commit=off` keeps fsync out of
+        # the request path — biggest single p95 win on the
+        # write side. Streaming replication is unaffected;
+        # only the WAL fsync to local disk is skipped.
+        synchronous_commit: "off"
+        # Group nearby commits into the same WAL flush so
+        # batches of inserts ride one fsync. Tiny because we
+        # care about latency, not throughput-at-cost-of-tail.
+        commit_delay: 100
+        commit_siblings: 5
+        # Tell PG the underlying disk can handle some
+        # parallel I/O. Default (1) underestimates the
+        # NVMe / overlay-fs combo Docker runs on.
+        effective_io_concurrency: 200
+        # WAL writer naps less, flushes earlier — pairs with
+        # the reduced commit_delay above.
+        wal_writer_delay: 200ms
+
+  # NOTE: Patroni 4.0 dropped the declarative `bootstrap.users:`
+  # block — it now logs:
+  #     "User creation is not be supported starting from
+  #      v4.0.0. Please use bootstrap.post_bootstrap script
+  #      to create users."
+  # The app login role is therefore created in
+  # post-bootstrap.sh alongside the app database.
+
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+    - locale: C
+
+  # Runs once on the first node of a scope, after initdb +
+  # users: block but before the node is marked healthy. We
+  # use it only to create the app database if it doesn't
+  # exist — schema is applied later by db/bootstrap/bootstrap-
+  # schema.sh via pg-haproxy.
+  post_bootstrap: /var/lib/patroni/post-bootstrap.sh
+
+  # pg_hba entries written BEFORE the node accepts traffic.
+  # Scoped to the docker network — these must NEVER be
+  # exposed to the public internet (pg-shardN-node-* are not
+  # port-forwarded in compose).
+  pg_hba:
+    - local all all trust
+    - host  all all 0.0.0.0/0 scram-sha-256
+    - host  replication replicator 0.0.0.0/0 scram-sha-256
+
+# ------------------------------------------------------------
+# PostgreSQL — per-node settings
+# ------------------------------------------------------------
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: ${PATRONI_HOSTNAME}:5432
+  data_dir: ${PGDATA}
+  bin_dir: /usr/lib/postgresql/18/bin
+
+  authentication:
+    superuser:
+      username: postgres
+      password: ${POSTGRES_SUPERUSER_PASSWORD}
+    replication:
+      username: replicator
+      password: ${REPL_PASSWORD}
+    rewind:
+      username: postgres
+      password: ${POSTGRES_SUPERUSER_PASSWORD}
+
+  # Creates the `replicator` role + app user on first boot.
+  # Patroni adds it to pg_hba automatically based on the
+  # bootstrap.pg_hba section above.
+  create_replica_methods:
+    - basebackup
+  basebackup:
+    max-rate: 100M
+    checkpoint: fast
+
+# ------------------------------------------------------------
+# Watchdog: intentionally disabled for the capstone. In
+# production under a real kernel, enabling this plus
+# /dev/watchdog makes the node reliably STONITH-itself if it
+# loses DCS contact long enough to be unsafe. See the Patroni
+# docs and docs/ha-architecture.md §5 for the tradeoff.
+# ------------------------------------------------------------
+watchdog:
+  mode: off
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false

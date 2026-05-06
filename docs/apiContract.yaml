@@ -1,0 +1,324 @@
+# TUTORIAL: Cara Membaca API Contract iniz
+# 1. Copy seluruh isi file.
+# 2. Buka https://editor.swagger.io/ di browser.
+# 3. Paste isinya ke bagian editor sebelah kiri.
+# ----------------------------------------------------------------
+
+openapi: "3.0.3"
+info:
+  title: Exploding User Data Scalabilities (Topik B.4)
+  description: |
+    Prototype sistem manajemen Peak Load yang dibangun dengan Rust.
+    Sistem ini menangani transaksi finansial dengan mekanisme sharding, idempotency, 
+    dan pemrosesan asinkron via RabbitMQ.
+  version: "1.0.0"
+
+
+components:
+  schemas:
+    ApiResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        message:
+          type: string
+          nullable: true
+          example: "Success"
+        data:
+          type: object
+          nullable: true
+
+    Transaction:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        from_account:
+          type: string
+          example: "ACC-1001"
+        to_account:
+          type: string
+          example: "ACC-2002"
+        amount:
+          type: string
+          description: "Jumlah uang dalam format string (BigDecimal)"
+          example: "50000.00"
+        currency:
+          type: string
+          example: "IDR"
+        status:
+          type: string
+          enum: [pending, processing, completed, failed, accepted]
+          example: "completed"
+        reference_id:
+          type: string
+          nullable: true
+          example: "REF-12345"
+        description:
+          type: string
+          nullable: true
+          example: "Bayar Makan"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        processed_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    CreateTransactionRequest:
+      type: object
+      required:
+        - from_account
+        - to_account
+        - amount
+      properties:
+        from_account:
+          type: string
+          example: "ACC-1001"
+        to_account:
+          type: string
+          example: "ACC-2002"
+        amount:
+          type: number
+          format: double
+          example: 50000.0
+        currency:
+          type: string
+          default: "IDR"
+          example: "IDR"
+        reference_id:
+          type: string
+          description: "ID unik dari client untuk idempotency"
+          example: "ref-uuid-001"
+        description:
+          type: string
+          example: "Transfer bulanan"
+
+    TransactionCreatedResponse:
+      type: object
+      properties:
+        reference_id:
+          type: string
+        status:
+          type: string
+          example: "accepted"
+        message:
+          type: string
+          example: "Transaction queued for processing"
+
+    TransactionStatusResponse:
+      type: object
+      properties:
+        reference_id:
+          type: string
+          example: "REF-12345"
+        status:
+          type: string
+          enum: [pending, processing, completed, failed, accepted]
+          example: "completed"
+        processed_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    BalanceResponse:
+      type: object
+      properties:
+        account_number:
+          type: string
+          example: "ACC-1001"
+        balance:
+          type: string
+          example: "1250000.50"
+        currency:
+          type: string
+          example: "IDR"
+        status:
+          type: string
+          example: "active"
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: "healthy"
+        services:
+          type: object
+          properties:
+            database_write:
+              type: boolean
+            database_read:
+              type: boolean
+            redis:
+              type: boolean
+            rabbitmq:
+              type: boolean
+
+paths:
+  /health:
+    get:
+      summary: Health Check
+      description: Mengecek status kesehatan database, redis, dan rabbitmq di semua shard.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /metrics:
+    get:
+      summary: Prometheus Metrics
+      description: Mengambil data metrik internal aplikasi untuk dimonitor oleh Prometheus.
+      responses:
+        '200':
+          description: OK
+          content:
+            text/plain:
+              example: |
+                http_requests_total{method="POST",path="/api/v2/transactions",status="202"} 45
+                transactions_created_total 45
+
+  /api/v2/transactions:
+    get:
+      summary: List Transactions
+      description: Mengambil daftar transaksi terakhir dari semua shard.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Transaction'
+
+    post:
+      summary: Create Transaction
+      description: |
+        Membuat transaksi baru. Menggunakan mekanisme idempotency lewat `reference_id`.
+        Transaksi akan dimasukkan ke antrian (RabbitMQ) dan diproses secara asinkron.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTransactionRequest'
+      responses:
+        '202':
+          description: Accepted (Queued)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/TransactionCreatedResponse'
+        '400':
+          description: Bad Request (Validation Error)
+        '429':
+          description: Too Many Requests (Rate Limited)
+
+  /api/v2/transactions/{id}:
+    get:
+      summary: Get Transaction by ID
+      description: Mencari detail transaksi berdasarkan UUID internal sistem.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Transaction'
+        '404':
+          description: Not Found
+
+  /api/v2/transactions/status/{reference_id}:
+    get:
+      summary: Get Status by Reference ID
+      description: Mengecek status pemrosesan transaksi menggunakan reference_id dari client.
+      parameters:
+        - name: reference_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/TransactionStatusResponse'
+
+  /api/v2/accounts/{account_number}/balance:
+    get:
+      summary: Get Account Balance
+      description: |
+        Mengambil saldo terakhir akun. Endpoint ini shard-aware.
+        Resource rename dari v1: `/api/v1/users/.../balance` →
+        `/api/v2/accounts/.../balance` (segmen `users` jadi `accounts`).
+      parameters:
+        - name: account_number
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/BalanceResponse'
+        '404':
+          description: Account Not Found

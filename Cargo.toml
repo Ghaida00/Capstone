@@ -1,67 +1,79 @@
-[package]
-name = "gn-backend"
-version = "0.1.0"
-edition = "2021"
-description = "High-performance transaction processing backend"
+[workspace]
+resolver = "2"
+members = [
+    "crates/app",
+    "crates/shared_kernel",
+    "crates/accounts",
+    "crates/transactions",
+    "crates/notifications",
+]
 
-[dependencies]
-# Memory allocator — v3 engine: atomic ownership model, first-class heaps
-mimalloc = { version = "0.1.48", features = ["v3"], default-features = false }
-# Web framework & async runtime
+# Centralised dep versions so every crate stays in lockstep. Each
+# crate declares `<dep>.workspace = true` instead of repeating
+# version strings; bumping a version is a one-line change here.
+[workspace.dependencies]
+# ── Web framework + async runtime ──
 axum = { version = "0.8.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5.3", features = ["full"] }
 tower-http = { version = "0.6.8", features = ["cors", "compression-gzip", "trace", "timeout"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
 
-# Database
-sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "migrate", "bigdecimal"] }
-bigdecimal = "0.4.10" # Fixed version
+# ── Database ──
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "migrate", "bigdecimal", "rust_decimal"] }
+bigdecimal = { version = "0.4.10", features = ["serde"] }
+rust_decimal = { version = "1.37", features = ["serde-with-str", "maths"] }
 
-# Cache
+# ── Cache ──
 redis = { version = "1.0.5", features = ["tokio-comp", "connection-manager"] }
 deadpool-redis = "0.23"
+moka = { version = "0.12", features = ["future"] }
 
-# Message Queue (RabbitMQ) — native Tokio async
-amqprs = { version = "2.1.3", features = ["urispec", "traces"] } # Fixed version
-async-trait = "0.1.89" # Fixed version
+# ── Message queue ──
+amqprs = { version = "2.1.3", features = ["urispec", "traces"] }
+async-trait = "0.1.89"
 
-# Serialization
-serde = { version = "1.0.228", features = ["derive"] } # Fixed version
+# ── Serialization ──
+serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 
-# Utilities
+# ── Utilities ──
 uuid = { version = "1.22.0", features = ["v4", "v7", "serde", "fast-rng"] }
-chrono = { version = "0.4.44", features = ["serde"] } # Fixed version
-dotenvy = "0.15.7" # Fixed version
+chrono = { version = "0.4.44", features = ["serde"] }
+fnv = "1.0.7"
+sha2 = "0.10"
+url = "2.5"
+dotenvy = "0.15.7"
 
-# Logging & Tracing
-tracing = "0.1.44" # Fixed version
+# ── Auth ──
+jsonwebtoken = "9.3.1"
+once_cell = "1.20.2"
+
+# ── Logging / tracing ──
+tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
 
-# OpenTelemetry (semantic observability)
-opentelemetry = "0.31.0" # Fixed version
-opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] } # Fixed version
-opentelemetry-stdout = { version = "0.31.0", features = ["trace"] } # Fixed version
-tracing-opentelemetry = "0.32.1" # Fixed version
+# ── OpenTelemetry ──
+opentelemetry = "0.31.0"
+opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
+opentelemetry-stdout = { version = "0.31.0", features = ["trace"] }
+tracing-opentelemetry = "0.32.1"
 
-# Prometheus metrics
-metrics = "0.24.3" # Fixed version
+# ── Prometheus ──
+metrics = "0.24.3"
 metrics-exporter-prometheus = "0.18.1"
 
-# Shutdown coordination
-tokio-util = { version = "0.7.18", features = ["rt"] } # Fixed version
-
-# Error handling
-thiserror = "2.0.18" # Fixed version
+# ── Error handling ──
+thiserror = "2.0.18"
 anyhow = "1.0.102"
 
-[dev-dependencies]
-# Property-based testing
-proptest = "1.10.0" # Fixed version
-# In-process API testing
-axum-test = "19.1.1" # Fixed version
-# Hermetic integration tests (ephemeral containers)
-testcontainers = "0.27.1" # Fixed version
+# ── Allocator ──
+mimalloc = { version = "0.1.48", features = ["v3"], default-features = false }
+
+# ── Dev / tests ──
+proptest = "1.10.0"
+axum-test = "19.1.1"
+testcontainers = "0.27.1"
 testcontainers-modules = { version = "0.15.0", features = ["postgres", "redis"] }
 
 [profile.release]

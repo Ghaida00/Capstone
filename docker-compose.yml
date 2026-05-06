@@ -1,4 +1,267 @@
-name: gn
+name: peakload
+
+# ============================================================
+# TOTAL RESOURCE BUDGET (steady-state, semua service jalan)
+# ------------------------------------------------------------
+# Hitungan dari `deploy.resources.limits` tiap service.
+# Shard 2 (pg-shard2-*) di-disable, jadi tidak masuk total.
+# `db-bootstrap-schema` one-shot (exit setelah init), jadi
+# tidak dihitung di steady-state — hanya nambah 0.1 CPU /
+# 64 MB selama beberapa detik di startup.
+#
+#  service                          CPU      MEM
+#  ───────────────────────────────  ───────  ────────
+#  nginx                            1.0      256 M
+#  app          (× 2 replicas)      2.0       768 M     (1.0 CPU × 2, 384 M × 2)
+#  etcd-1/2/3   (× 3)               0.45     192 M      (0.15 × 3, 64 M × 3)
+#  pg-shard0-node-a/b   (× 2)       3.0      1024 M     (1.5 × 2, 512 M × 2)
+#  pg-shard1-node-a/b   (× 2)       3.0      1024 M
+#  pgbouncer-shard0/1   (× 2)       0.2      64 M       (0.1 × 2, 32 M × 2)
+#  pg-haproxy                       0.15     64 M
+#  redis-master                     1.0      256 M
+#  redis-replica                    1.0      256 M
+#  redis-sentinel-1/2/3 (× 3)       0.3      96 M       (0.1 × 3, 32 M × 3)
+#  rabbitmq                         1.0      512 M
+#  prometheus                       0.5      256 M
+#  grafana                          0.5      256 M
+#  cadvisor                         0.2      128 M
+#  ───────────────────────────────  ───────  ────────
+#  TOTAL steady-state               14.30    5152 M (~5.03 GB)
+#  TOTAL termasuk bootstrap         14.40    5216 M (~5.09 GB)
+#
+# Catatan:
+# * Ini limit, bukan request — pemakaian aktual idle jauh
+#   lebih rendah. Cores fisik 8 + 8 GB RAM cukup; di bawah
+#   itu mulai contended.
+# * Kalau host < 12 GB RAM atau < 6 cores, turunkan `app`
+#   replicas ke 2 dan PG node ke 0.5 CPU / 256 M (lihat
+#   anchors `x-pg-node-deploy` & service `app` di bawah).
+# ============================================================
+
+# ============================================================
+# Shared config via YAML anchors
+# ============================================================
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# ============================================================
+# Patroni anchors
+# ------------------------------------------------------------
+# All Postgres nodes (currently 2 shards × 2 — shard 2 is
+# commented out below for resource conservation; flip it back
+# on to return to the documented 3×2 topology) run the same
+# custom image defined in db/patroni/Dockerfile: PostgreSQL
+# 18.3 on bookworm + Patroni 4.x + python-etcd3 + envsubst.
+# Patroni renders a per-node config from
+# templates/patroni.yml.tmpl at container start and then IS
+# the PG process manager.
+#
+# See docs/ha-architecture.md and db/patroni/README.md for
+# the full rationale — notably why we chose Patroni over
+# pg_auto_failover (to keep PG 18) and why we deferred the
+# watchdog / per-scope etcd clustering.
+# ============================================================
+x-patroni-build: &patroni-build
+  context: ./db/patroni
+  dockerfile: Dockerfile
+
+x-pg-node-common: &pg-node-common
+  build: *patroni-build
+  image: peakload/patroni-pg18:local
+  restart: unless-stopped
+  logging: *default-logging
+  networks:
+    - peakload-network
+  # 60s start_period tolerates the first-boot sequence
+  # (initdb on the first primary, pg_basebackup on the
+  # replica). Patroni exits non-zero on config errors, so
+  # the healthcheck plus Docker restart policy is enough to
+  # surface misconfigurations.
+  healthcheck:
+    test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U $$POSTGRES_USER -d $$POSTGRES_DB" ]
+    interval: 10s
+    timeout: 5s
+    retries: 6
+    start_period: 60s
+
+# Shared env for every Patroni node. Per-node variance
+# (scope, name, hostname) is injected at the service level.
+x-pg-node-env: &pg-node-env
+  PGDATA: /var/lib/postgresql/data
+  POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+  POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+  POSTGRES_SUPERUSER_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD in .env}
+  REPL_PASSWORD: ${REPL_PASSWORD:?set REPL_PASSWORD in .env}
+  ETCD_HOSTS: "etcd-1:2379,etcd-2:2379,etcd-3:2379"
+
+# Per-node resource envelope. 1.0 CPU still bottlenecked the
+# write path under 1000 VU — `UPDATE … WHERE balance >= …`
+# contention plus the WAL flush kept PG pinned. Bumped to
+# 1.5 CPU / 512 MB so the primary has headroom for both the
+# request-driven INSERT/UPDATE traffic and the streaming-
+# replication walsender. Memory unchanged — shared_buffers /
+# work_mem in patroni.yml.tmpl are sized for 512 MB.
+#
+# Total host CPU budget stays roughly even because the `app`
+# service drops from 4 × 1.0 to 2 × 1.0 in the same patch
+# (see the comment block at the top of this file).
+x-pg-node-deploy: &pg-node-deploy
+  resources:
+    limits:
+      memory: 512M
+      cpus: "1.5"
+
+# ============================================================
+# etcd anchors
+# ------------------------------------------------------------
+# Patroni's DCS. Three-node cluster so we tolerate one loss
+# without losing quorum. Upstream `quay.io/coreos/etcd` image
+# (the canonical etcd-io build, also shipped inside Kubernetes)
+# instead of the Bitnami image — Broadcom retired large parts
+# of the free Bitnami catalogue mid-2025 and `bitnami/etcd:*`
+# tags now intermittently return "manifest unknown". Upstream
+# ships `etcdctl` at `/usr/local/bin/etcdctl` so the
+# operational cheatsheet in db/patroni/README.md still works.
+# ============================================================
+x-etcd-common: &etcd-common
+  image: quay.io/coreos/etcd:v3.6.5
+  restart: unless-stopped
+  logging: *default-logging
+  networks:
+    - peakload-network
+  healthcheck:
+    test: [ "CMD", "etcdctl", "endpoint", "health" ]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 20s
+  deploy:
+    resources:
+      limits:
+        memory: 64M
+        cpus: "0.15"
+
+x-etcd-env-common: &etcd-env-common
+  # Upstream etcd has auth disabled by default — no
+  # `ALLOW_NONE_AUTHENTICATION` (Bitnami-only) needed. We run
+  # this on a trusted overlay network so unauthenticated peer
+  # access is acceptable for the capstone.
+  ETCD_DATA_DIR: "/etcd-data"
+  ETCD_INITIAL_CLUSTER: "etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380"
+  ETCD_INITIAL_CLUSTER_STATE: "new"
+  ETCD_INITIAL_CLUSTER_TOKEN: "peakload-etcd-cluster"
+  ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+  ETCD_LISTEN_PEER_URLS: "http://0.0.0.0:2380"
+
+# ============================================================
+# pgBouncer anchors
+# ------------------------------------------------------------
+# pgBouncer now points at pg-haproxy instead of a specific
+# primary host. HAProxy forwards each shard's frontend
+# (:5000/:5001/:5002) to whichever node is currently primary,
+# so pgBouncer's backend URL is stable across failovers.
+# ============================================================
+x-pgbouncer-common: &pgbouncer-common
+  image: edoburu/pgbouncer:v1.25.1-p0
+  restart: unless-stopped
+  logging: *default-logging
+  networks:
+    - peakload-network
+  expose:
+    - "5432"
+
+x-pgbouncer-env: &pgbouncer-env
+  AUTH_TYPE: scram-sha-256
+  POOL_MODE: transaction
+  # Pool sizes raised to soak the new write workload — at 1000 VUs
+  # split across 2 shards each shard gets ~500 concurrent writers,
+  # and pgBouncer needs to be able to multiplex them onto Postgres
+  # without queueing. DEFAULT_POOL_SIZE caps backend conns per
+  # (db,user); MAX_CLIENT_CONN caps front-end conns from the app.
+  DEFAULT_POOL_SIZE: 80
+  MAX_CLIENT_CONN: 2000
+  MAX_DB_CONNECTIONS: 200
+  MIN_POOL_SIZE: 30
+  RESERVE_POOL_SIZE: 20
+  RESERVE_POOL_TIMEOUT: 2
+  # server_lifetime is deliberately short (1h) so that
+  # long-lived pgBouncer→HAProxy conns get recycled, which
+  # bounds the window in which a stale route could persist
+  # after a promotion. `on-marked-down shutdown-sessions` in
+  # haproxy.cfg handles the acute case; this is the belt-
+  # and-suspenders cap.
+  SERVER_IDLE_TIMEOUT: 300
+  SERVER_LIFETIME: 3600
+  LOG_CONNECTIONS: 0
+  LOG_DISCONNECTIONS: 0
+
+x-pgbouncer-healthcheck: &pgbouncer-healthcheck
+  test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U ${POSTGRES_USER}" ]
+  interval: 5s
+  timeout: 3s
+  retries: 5
+  start_period: 10s
+
+x-pgbouncer-deploy: &pgbouncer-deploy
+  resources:
+    limits:
+      memory: 32M
+      cpus: "0.1"
+
+# ============================================================
+# Redis anchors — unchanged from pre-failover revision
+# ============================================================
+x-redis-command: &redis-command >
+  redis-server
+    --maxmemory 96mb
+    --maxmemory-policy allkeys-lru
+    --save ""
+    --appendonly no
+    --tcp-backlog 511
+    --tcp-keepalive 300
+    --hz 100
+    --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    --masterauth ${REDIS_PASSWORD}
+
+x-redis-healthcheck: &redis-healthcheck
+  test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping" ]
+  interval: 5s
+  timeout: 3s
+  retries: 5
+  start_period: 5s
+
+x-sentinel-common: &sentinel-common
+  image: redis:8.6.1-alpine3.23
+  restart: unless-stopped
+  logging: *default-logging
+  networks:
+    - peakload-network
+  volumes:
+    - ./redis/sentinel.conf:/tmp/sentinel.conf:ro
+  command: >
+    sh -c "cp /tmp/sentinel.conf /etc/sentinel.conf &&
+           chmod 644 /etc/sentinel.conf &&
+           redis-sentinel /etc/sentinel.conf"
+  depends_on:
+    redis-master:
+      condition: service_healthy
+  expose:
+    - "26379"
+  healthcheck:
+    test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+    interval: 5s
+    timeout: 3s
+    retries: 5
+    start_period: 10s
+  deploy:
+    resources:
+      limits:
+        memory: 32M
+        cpus: "0.1"
 
 services:
   # ============================================================
@@ -6,7 +269,7 @@ services:
   # ============================================================
   nginx:
     image: nginx:1.29.6-alpine3.23-slim
-    container_name: gn-nginx
+    container_name: peakload-nginx
     ports:
       - "8080:80"
     volumes:
@@ -15,22 +278,55 @@ services:
       app:
         condition: service_healthy
     restart: unless-stopped
+    logging: *default-logging
     networks:
-      - gn-network
+      - peakload-network
     deploy:
       resources:
         limits:
-          memory: 128M
-          cpus: "0.5"
+          memory: 256M
+          cpus: "1.0"
 
   # ============================================================
   # Rust Application — 2 replicas
+  # ------------------------------------------------------------
+  # depends_on `db-bootstrap-schema: service_completed_successfully`
+  # guarantees that init.sql has been applied to every shard
+  # primary before the app tries to query. The bootstrap job
+  # is idempotent so restarts don't trigger re-runs on a
+  # populated database.
   # ============================================================
   app:
     build:
       context: .
       dockerfile: Dockerfile
+    # Hardening — distroless+nonroot already runs as UID 65532; this layer
+    # adds defence-in-depth: no writable rootfs, no kernel caps, no privilege
+    # escalation, fork-bomb cap. App code does no filesystem writes (verified
+    # via grep for std::fs / tokio::fs::write|create), so read_only is safe.
+    # /tmp tmpfs is provided in case any dep (rustls cert cache, etc.) writes.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     env_file: .env
+    environment:
+      # ── Failover wiring ─────────────────────────────────────────
+      # Sentinel-aware Redis client (unchanged).
+      REDIS_SENTINEL_NODES: "redis://redis-sentinel-1:26379,redis://redis-sentinel-2:26379,redis://redis-sentinel-3:26379"
+      REDIS_SENTINEL_MASTER_NAME: "peakload-master"
+      REDIS_SENTINEL_MONITOR_INTERVAL_SECS: "5"
+      # Per-replica health probe interval for Postgres reads.
+      DB_HEALTH_CHECK_INTERVAL_SECS: "5"
+      # Retry policy — must cover the Patroni promotion window
+      # (typically 5–15s, bounded by the etcd leader-lease TTL).
+      # Defaults in src/config.rs are tuned for this; override
+      # here only for experimentation.
+      DB_WRITE_RETRY_MAX_ATTEMPTS: "6"
+      DB_WRITE_RETRY_BACKOFF_MS: "200"
     expose:
       - "3000"
     depends_on:
@@ -38,397 +334,412 @@ services:
         condition: service_healthy
       pgbouncer-shard1:
         condition: service_healthy
-      pgbouncer-shard2:
-        condition: service_healthy
+      # Shard 2 disabled — see "SHARD 2" block below.
+      # pgbouncer-shard2:
+      #   condition: service_healthy
+      db-bootstrap-schema:
+        condition: service_completed_successfully
       redis-master:
+        condition: service_healthy
+      redis-sentinel-1:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
     healthcheck:
-      test: [ "CMD", "/app/gn-backend", "--health-check" ]
+      test: [ "CMD", "/app/peakload-capstone", "--health-check" ]
       interval: 10s
       timeout: 3s
       retries: 3
       start_period: 15s
     restart: unless-stopped
+    logging: *default-logging
     networks:
-      - gn-network
+      - peakload-network
     deploy:
+      # 4 replicas × 1 CPU on an 8-core laptop oversubscribed the
+      # scheduler — every container competing for cores produced
+      # context-switch storms that inflated p95 / p99. Halved to
+      # 2 replicas × 1 CPU so each Tokio runtime gets a cleaner
+      # slice of CPU time, and the freed budget lets PG run at
+      # 1.5 CPU per node (see x-pg-node-deploy).
+      #
+      # HA tradeoff: with only 2 replicas a single crash leaves
+      # one survivor instead of three. Acceptable for the
+      # capstone benchmark; bump back to 4 if you want the
+      # broader fault-tolerance story.
       replicas: 2
       resources:
         limits:
-          memory: 128M
-          cpus: "0.5"
+          memory: 384M
+          cpus: "1.0"
+          pids: 256
 
   # ============================================================
-  # SHARD 0 — PostgreSQL Primary + 1 Replica + pgBouncer
+  # etcd cluster — Patroni's distributed config store
+  # ------------------------------------------------------------
+  # Three nodes so we tolerate one loss without losing quorum.
+  # Patroni talks to this cluster for leader election, cluster
+  # configuration, and member state. A majority MUST be alive
+  # for primaries to stay writable; if quorum is lost, Patroni
+  # demotes all primaries to read-only to prevent split-brain.
+  #
+  # No external port exposure — etcd is only reached from
+  # inside the peakload network.
   # ============================================================
-  pg-shard0-primary:
-    image: postgres:18.3-alpine3.23
-    container_name: gn-pg-shard0-primary
+  etcd-1:
+    <<: *etcd-common
+    container_name: peakload-etcd-1
     environment:
-      POSTGRES_DB: gn_db
-      POSTGRES_USER: gn_user
-      POSTGRES_PASSWORD: gn_secure_pass
-      POSTGRES_INITDB_ARGS: "--data-checksums"
+      <<: *etcd-env-common
+      ETCD_NAME: etcd-1
+      ETCD_ADVERTISE_CLIENT_URLS: "http://etcd-1:2379"
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: "http://etcd-1:2380"
     volumes:
-      - pg_shard0_primary_data:/var/lib/postgresql/data
-      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
-      - ./db/primary-setup.sh:/docker-entrypoint-initdb.d/02-primary-setup.sh:ro
-    command: >
-      postgres
-        -c wal_level=replica
-        -c max_wal_senders=10
-        -c max_replication_slots=10
-        -c hot_standby=on
-        -c shared_buffers=64MB
-        -c effective_cache_size=192MB
-        -c work_mem=4MB
-        -c maintenance_work_mem=32MB
-        -c max_connections=300
-        -c checkpoint_completion_target=0.9
-        -c random_page_cost=1.1
-        -c synchronous_commit=off
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U gn_user -d gn_db" ]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 15s
-    restart: unless-stopped
-    networks:
-      - gn-network
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: "0.5"
+      - etcd_1_data:/etcd-data
 
-  pg-shard0-replica1:
-    image: postgres:18.3-alpine3.23
-    container_name: gn-pg-shard0-replica1
+  etcd-2:
+    <<: *etcd-common
+    container_name: peakload-etcd-2
     environment:
-      PGUSER: gn_user
-      PGPASSWORD: gn_secure_pass
-      PRIMARY_HOST: pg-shard0-primary
+      <<: *etcd-env-common
+      ETCD_NAME: etcd-2
+      ETCD_ADVERTISE_CLIENT_URLS: "http://etcd-2:2379"
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: "http://etcd-2:2380"
     volumes:
-      - pg_shard0_replica1_data:/var/lib/postgresql/data
-      - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
-    entrypoint: [ "/bin/sh", "/replica-entrypoint.sh" ]
+      - etcd_2_data:/etcd-data
+
+  etcd-3:
+    <<: *etcd-common
+    container_name: peakload-etcd-3
+    environment:
+      <<: *etcd-env-common
+      ETCD_NAME: etcd-3
+      ETCD_ADVERTISE_CLIENT_URLS: "http://etcd-3:2379"
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: "http://etcd-3:2380"
+    volumes:
+      - etcd_3_data:/etcd-data
+
+  # ============================================================
+  # SHARD 0 — two Patroni-managed nodes
+  # ------------------------------------------------------------
+  # Patroni + etcd assign primary/replica roles dynamically.
+  # On first boot, whichever node wins the etcd leader lock
+  # for scope `peakload-shard0` becomes primary; the other
+  # joins as a streaming replica and catches up via
+  # pg_basebackup. After a promotion they flip roles.
+  # Do NOT assume node-a is always the primary.
+  # ============================================================
+  pg-shard0-node-a:
+    <<: *pg-node-common
+    container_name: peakload-pg-shard0-node-a
+    environment:
+      <<: *pg-node-env
+      PATRONI_SCOPE:    peakload-shard0
+      PATRONI_NAME:     shard0-a
+      PATRONI_HOSTNAME: pg-shard0-node-a
+    volumes:
+      - pg_shard0_node_a_data:/var/lib/postgresql/data
     depends_on:
-      pg-shard0-primary:
+      etcd-1:
         condition: service_healthy
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U gn_user -d gn_db" ]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 30s
-    restart: unless-stopped
-    networks:
-      - gn-network
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: "0.25"
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+    deploy: *pg-node-deploy
+
+  pg-shard0-node-b:
+    <<: *pg-node-common
+    container_name: peakload-pg-shard0-node-b
+    environment:
+      <<: *pg-node-env
+      PATRONI_SCOPE:    peakload-shard0
+      PATRONI_NAME:     shard0-b
+      PATRONI_HOSTNAME: pg-shard0-node-b
+    volumes:
+      - pg_shard0_node_b_data:/var/lib/postgresql/data
+    depends_on:
+      etcd-1:
+        condition: service_healthy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+      # Slight stagger so node-a wins the etcd leader-lock
+      # race on a cold boot. Not a correctness requirement
+      # — Patroni converges either way — just a tidier
+      # first-time log.
+      pg-shard0-node-a:
+        condition: service_started
+    deploy: *pg-node-deploy
 
   pgbouncer-shard0:
-    image: edoburu/pgbouncer:v1.25.1-p0
-    container_name: gn-pgbouncer-shard0
+    <<: *pgbouncer-common
+    container_name: peakload-pgbouncer-shard0
     environment:
-      DATABASE_URL: postgres://gn_user:gn_secure_pass@pg-shard0-primary:5432/gn_db
-      AUTH_TYPE: plain
-      POOL_MODE: transaction
-      DEFAULT_POOL_SIZE: 40
-      MAX_CLIENT_CONN: 500
-      MAX_DB_CONNECTIONS: 100
-      MIN_POOL_SIZE: 15
-      RESERVE_POOL_SIZE: 10
-      RESERVE_POOL_TIMEOUT: 3
-      SERVER_IDLE_TIMEOUT: 300
-      SERVER_LIFETIME: 3600
-      LOG_CONNECTIONS: 0
-      LOG_DISCONNECTIONS: 0
-    expose:
-      - "5432"
+      <<: *pgbouncer-env
+      # Backend → HAProxy :5000 → whichever node is primary.
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-haproxy:5000/${POSTGRES_DB}
     depends_on:
-      pg-shard0-primary:
+      pg-haproxy:
         condition: service_healthy
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U gn_user" ]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 10s
-    restart: unless-stopped
-    networks:
-      - gn-network
-    deploy:
-      resources:
-        limits:
-          memory: 32M
-          cpus: "0.1"
+    healthcheck: *pgbouncer-healthcheck
+    deploy: *pgbouncer-deploy
 
   # ============================================================
-  # SHARD 1 — PostgreSQL Primary + 1 Replica + pgBouncer
+  # SHARD 1 — two Patroni-managed nodes (scope peakload-shard1)
   # ============================================================
-  pg-shard1-primary:
-    image: postgres:18.3-alpine3.23
-    container_name: gn-pg-shard1-primary
+  pg-shard1-node-a:
+    <<: *pg-node-common
+    container_name: peakload-pg-shard1-node-a
     environment:
-      POSTGRES_DB: gn_db
-      POSTGRES_USER: gn_user
-      POSTGRES_PASSWORD: gn_secure_pass
-      POSTGRES_INITDB_ARGS: "--data-checksums"
+      <<: *pg-node-env
+      PATRONI_SCOPE:    peakload-shard1
+      PATRONI_NAME:     shard1-a
+      PATRONI_HOSTNAME: pg-shard1-node-a
     volumes:
-      - pg_shard1_primary_data:/var/lib/postgresql/data
-      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
-      - ./db/primary-setup.sh:/docker-entrypoint-initdb.d/02-primary-setup.sh:ro
-    command: >
-      postgres
-        -c wal_level=replica
-        -c max_wal_senders=10
-        -c max_replication_slots=10
-        -c hot_standby=on
-        -c shared_buffers=64MB
-        -c effective_cache_size=192MB
-        -c work_mem=4MB
-        -c maintenance_work_mem=32MB
-        -c max_connections=300
-        -c checkpoint_completion_target=0.9
-        -c random_page_cost=1.1
-        -c synchronous_commit=off
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U gn_user -d gn_db" ]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 15s
-    restart: unless-stopped
-    networks:
-      - gn-network
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: "0.5"
-
-  pg-shard1-replica1:
-    image: postgres:18.3-alpine3.23
-    container_name: gn-pg-shard1-replica1
-    environment:
-      PGUSER: gn_user
-      PGPASSWORD: gn_secure_pass
-      PRIMARY_HOST: pg-shard1-primary
-    volumes:
-      - pg_shard1_replica1_data:/var/lib/postgresql/data
-      - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
-    entrypoint: [ "/bin/sh", "/replica-entrypoint.sh" ]
+      - pg_shard1_node_a_data:/var/lib/postgresql/data
     depends_on:
-      pg-shard1-primary:
+      etcd-1:
         condition: service_healthy
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U gn_user -d gn_db" ]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 30s
-    restart: unless-stopped
-    networks:
-      - gn-network
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: "0.25"
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+    deploy: *pg-node-deploy
+
+  pg-shard1-node-b:
+    <<: *pg-node-common
+    container_name: peakload-pg-shard1-node-b
+    environment:
+      <<: *pg-node-env
+      PATRONI_SCOPE:    peakload-shard1
+      PATRONI_NAME:     shard1-b
+      PATRONI_HOSTNAME: pg-shard1-node-b
+    volumes:
+      - pg_shard1_node_b_data:/var/lib/postgresql/data
+    depends_on:
+      etcd-1:
+        condition: service_healthy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+      pg-shard1-node-a:
+        condition: service_started
+    deploy: *pg-node-deploy
 
   pgbouncer-shard1:
-    image: edoburu/pgbouncer:v1.25.1-p0
-    container_name: gn-pgbouncer-shard1
+    <<: *pgbouncer-common
+    container_name: peakload-pgbouncer-shard1
     environment:
-      DATABASE_URL: postgres://gn_user:gn_secure_pass@pg-shard1-primary:5432/gn_db
-      AUTH_TYPE: plain
-      POOL_MODE: transaction
-      DEFAULT_POOL_SIZE: 40
-      MAX_CLIENT_CONN: 500
-      MAX_DB_CONNECTIONS: 100
-      MIN_POOL_SIZE: 15
-      RESERVE_POOL_SIZE: 10
-      RESERVE_POOL_TIMEOUT: 3
-      SERVER_IDLE_TIMEOUT: 300
-      SERVER_LIFETIME: 3600
-      LOG_CONNECTIONS: 0
-      LOG_DISCONNECTIONS: 0
-    expose:
-      - "5432"
+      <<: *pgbouncer-env
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-haproxy:5001/${POSTGRES_DB}
     depends_on:
-      pg-shard1-primary:
+      pg-haproxy:
         condition: service_healthy
+    healthcheck: *pgbouncer-healthcheck
+    deploy: *pgbouncer-deploy
+
+  # ============================================================
+  # SHARD 2 — DISABLED (resource-conservation mode)
+  # ------------------------------------------------------------
+  # Temporarily commented out to keep host memory/CPU within
+  # capstone-dev limits. The Rust shard router, HAProxy, and
+  # bootstrap script have all been narrowed to two shards in
+  # lockstep — re-enabling shard 2 means flipping all of:
+  #   * this block + the `pg_shard2_*` volumes at the bottom
+  #   * pgbouncer-shard2 dependency on the `app` service above
+  #   * pg-shard2-node-{a,b} entries in pg-haproxy.depends_on
+  #   * PG_HAPROXY_PORTS env on db-bootstrap-schema (add 5002)
+  #   * SHARD 2 frontend/backend in haproxy/haproxy.cfg
+  #   * NUM_SHARDS = 3 in crates/shared_kernel/src/db/shard.rs
+  #   * the third ShardUrls entry in crates/app/src/bootstrap.rs
+  #   * database_shard2_* fields in crates/app/src/config.rs
+  #   * DATABASE_SHARD2_* in .env.example / .env
+  # ============================================================
+  # pg-shard2-node-a:
+  #   <<: *pg-node-common
+  #   container_name: peakload-pg-shard2-node-a
+  #   environment:
+  #     <<: *pg-node-env
+  #     PATRONI_SCOPE:    peakload-shard2
+  #     PATRONI_NAME:     shard2-a
+  #     PATRONI_HOSTNAME: pg-shard2-node-a
+  #   volumes:
+  #     - pg_shard2_node_a_data:/var/lib/postgresql/data
+  #   depends_on:
+  #     etcd-1:
+  #       condition: service_healthy
+  #     etcd-2:
+  #       condition: service_healthy
+  #     etcd-3:
+  #       condition: service_healthy
+  #   deploy: *pg-node-deploy
+  #
+  # pg-shard2-node-b:
+  #   <<: *pg-node-common
+  #   container_name: peakload-pg-shard2-node-b
+  #   environment:
+  #     <<: *pg-node-env
+  #     PATRONI_SCOPE:    peakload-shard2
+  #     PATRONI_NAME:     shard2-b
+  #     PATRONI_HOSTNAME: pg-shard2-node-b
+  #   volumes:
+  #     - pg_shard2_node_b_data:/var/lib/postgresql/data
+  #   depends_on:
+  #     etcd-1:
+  #       condition: service_healthy
+  #     etcd-2:
+  #       condition: service_healthy
+  #     etcd-3:
+  #       condition: service_healthy
+  #     pg-shard2-node-a:
+  #       condition: service_started
+  #   deploy: *pg-node-deploy
+  #
+  # pgbouncer-shard2:
+  #   <<: *pgbouncer-common
+  #   container_name: peakload-pgbouncer-shard2
+  #   environment:
+  #     <<: *pgbouncer-env
+  #     DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-haproxy:5002/${POSTGRES_DB}
+  #   depends_on:
+  #     pg-haproxy:
+  #       condition: service_healthy
+  #   healthcheck: *pgbouncer-healthcheck
+  #   deploy: *pgbouncer-deploy
+
+  # ============================================================
+  # pg-haproxy — role-aware write router
+  # ------------------------------------------------------------
+  # One HAProxy with three TCP frontends, one per shard. Each
+  # backend's health check hits the socat sidecar on port
+  # 8008 of both shard nodes and forwards writes to whichever
+  # answers HTTP 200 on GET /primary. See haproxy/README.md
+  # for the detailed protocol.
+  #
+  # Port 7000 stats dashboard is bound to 127.0.0.1 so it is
+  # visible from the host for debugging but never from the
+  # public internet.
+  # ============================================================
+  pg-haproxy:
+    image: haproxy:3.3-alpine
+    container_name: peakload-pg-haproxy
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "127.0.0.1:7000:7000"
+    expose:
+      - "5000"
+      - "5001"
+      # Shard 2 disabled.
+      # - "5002"
+    depends_on:
+      pg-shard0-node-a:
+        condition: service_healthy
+      pg-shard0-node-b:
+        condition: service_healthy
+      pg-shard1-node-a:
+        condition: service_healthy
+      pg-shard1-node-b:
+        condition: service_healthy
+      # Shard 2 disabled.
+      # pg-shard2-node-a:
+      #   condition: service_healthy
+      # pg-shard2-node-b:
+      #   condition: service_healthy
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U gn_user" ]
+      # Stats page on :7000 is served unconditionally once
+      # HAProxy is up, so this is a cheap liveness probe.
+      # Backend UP/DOWN state is observable there for humans
+      # but we don't assert it in Docker — pgBouncer retries
+      # cover the transient-no-backend window.
+      test: [ "CMD-SHELL", "wget -q -O- http://127.0.0.1:7000/ >/dev/null || exit 1" ]
       interval: 5s
       timeout: 3s
       retries: 5
       start_period: 10s
     restart: unless-stopped
+    logging: *default-logging
     networks:
-      - gn-network
+      - peakload-network
     deploy:
       resources:
         limits:
-          memory: 32M
+          memory: 64M
+          cpus: "0.15"
+
+  # ============================================================
+  # db-bootstrap-schema — one-shot init.sql applier
+  # ------------------------------------------------------------
+  # Patroni runs PG under its own entrypoint and bypasses the
+  # standard /docker-entrypoint-initdb.d mechanism, so init.sql
+  # never auto-runs. This container uses the stock postgres
+  # image (for `psql`), waits for each shard primary to be up
+  # via pg-haproxy, and applies init.sql iff the canary table
+  # is missing. Idempotent; safe to re-run.
+  #
+  # The script it mounts (db/bootstrap/bootstrap-schema.sh) is
+  # intentionally HA-agnostic — it talks only to pg-haproxy,
+  # so it survived the move from pg_auto_failover to Patroni
+  # with only a header edit.
+  #
+  # restart: "no" + condition: service_completed_successfully
+  # on the `app` service gates app start on schema readiness.
+  # ============================================================
+  db-bootstrap-schema:
+    image: postgres:18.3-alpine3.23
+    container_name: peakload-db-bootstrap-schema
+    entrypoint: [ "/bin/sh", "/opt/bootstrap-schema.sh" ]
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB:       ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      PG_HAPROXY_HOST:   pg-haproxy
+      # Shard 2 disabled — was "5000 5001 5002".
+      PG_HAPROXY_PORTS:  "5000 5001"
+    volumes:
+      - ./db/bootstrap/bootstrap-schema.sh:/opt/bootstrap-schema.sh:ro
+      - ./db/init.sql:/sql/init.sql:ro
+    depends_on:
+      pg-haproxy:
+        condition: service_healthy
+    restart: "no"
+    logging: *default-logging
+    networks:
+      - peakload-network
+    deploy:
+      resources:
+        limits:
+          memory: 64M
           cpus: "0.1"
 
   # ============================================================
-  # SHARD 2 — PostgreSQL Primary + 1 Replica + pgBouncer
-  # ============================================================
-  pg-shard2-primary:
-    image: postgres:18.3-alpine3.23
-    container_name: gn-pg-shard2-primary
-    environment:
-      POSTGRES_DB: gn_db
-      POSTGRES_USER: gn_user
-      POSTGRES_PASSWORD: gn_secure_pass
-      POSTGRES_INITDB_ARGS: "--data-checksums"
-    volumes:
-      - pg_shard2_primary_data:/var/lib/postgresql/data
-      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
-      - ./db/primary-setup.sh:/docker-entrypoint-initdb.d/02-primary-setup.sh:ro
-    command: >
-      postgres
-        -c wal_level=replica
-        -c max_wal_senders=10
-        -c max_replication_slots=10
-        -c hot_standby=on
-        -c shared_buffers=64MB
-        -c effective_cache_size=192MB
-        -c work_mem=4MB
-        -c maintenance_work_mem=32MB
-        -c max_connections=300
-        -c checkpoint_completion_target=0.9
-        -c random_page_cost=1.1
-        -c synchronous_commit=off
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U gn_user -d gn_db" ]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 15s
-    restart: unless-stopped
-    networks:
-      - gn-network
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: "0.5"
-
-  pg-shard2-replica1:
-    image: postgres:18.3-alpine3.23
-    container_name: gn-pg-shard2-replica1
-    environment:
-      PGUSER: gn_user
-      PGPASSWORD: gn_secure_pass
-      PRIMARY_HOST: pg-shard2-primary
-    volumes:
-      - pg_shard2_replica1_data:/var/lib/postgresql/data
-      - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
-    entrypoint: [ "/bin/sh", "/replica-entrypoint.sh" ]
-    depends_on:
-      pg-shard2-primary:
-        condition: service_healthy
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U gn_user -d gn_db" ]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 30s
-    restart: unless-stopped
-    networks:
-      - gn-network
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: "0.25"
-
-  pgbouncer-shard2:
-    image: edoburu/pgbouncer:v1.25.1-p0
-    container_name: gn-pgbouncer-shard2
-    environment:
-      DATABASE_URL: postgres://gn_user:gn_secure_pass@pg-shard2-primary:5432/gn_db
-      AUTH_TYPE: plain
-      POOL_MODE: transaction
-      DEFAULT_POOL_SIZE: 40
-      MAX_CLIENT_CONN: 500
-      MAX_DB_CONNECTIONS: 100
-      MIN_POOL_SIZE: 15
-      RESERVE_POOL_SIZE: 10
-      RESERVE_POOL_TIMEOUT: 3
-      SERVER_IDLE_TIMEOUT: 300
-      SERVER_LIFETIME: 3600
-      LOG_CONNECTIONS: 0
-      LOG_DISCONNECTIONS: 0
-    expose:
-      - "5432"
-    depends_on:
-      pg-shard2-primary:
-        condition: service_healthy
-    healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U gn_user" ]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 10s
-    restart: unless-stopped
-    networks:
-      - gn-network
-    deploy:
-      resources:
-        limits:
-          memory: 32M
-          cpus: "0.1"
-
-  # ============================================================
-  # Redis HA — Master + Replica + Sentinel
+  # Redis HA — Master + Replica + Sentinel (unchanged)
   # ============================================================
   redis-master:
     image: redis:8.6.1-alpine3.23
-    container_name: gn-redis-master
-    command: >
-      redis-server
-        --maxmemory 96mb
-        --maxmemory-policy allkeys-lru
-        --save ""
-        --appendonly no
-        --tcp-backlog 511
-        --tcp-keepalive 300
-        --hz 100
-        --requirepass gn_redis_pass
-        --masterauth gn_redis_pass
+    container_name: peakload-redis-master
+    command: *redis-command
     expose:
       - "6379"
     volumes:
       - redis_data:/data
-    healthcheck:
-      test: [ "CMD", "redis-cli", "-a", "gn_redis_pass", "ping" ]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
+    healthcheck: *redis-healthcheck
     restart: unless-stopped
+    logging: *default-logging
     networks:
-      - gn-network
+      - peakload-network
     deploy:
       resources:
         limits:
-          memory: 128M
-          cpus: "0.25"
+          memory: 256M
+          cpus: "1.0"
 
   redis-replica:
     image: redis:8.6.1-alpine3.23
-    container_name: gn-redis-replica
+    container_name: peakload-redis-replica
     command: >
       redis-server
         --maxmemory 96mb
@@ -438,112 +749,51 @@ services:
         --tcp-backlog 511
         --tcp-keepalive 300
         --hz 100
-        --requirepass gn_redis_pass
-        --masterauth gn_redis_pass
+        --requirepass ${REDIS_PASSWORD}
+        --masterauth ${REDIS_PASSWORD}
         --replicaof redis-master 6379
     expose:
       - "6379"
     depends_on:
       redis-master:
         condition: service_healthy
-    healthcheck:
-      test: [ "CMD", "redis-cli", "-a", "gn_redis_pass", "ping" ]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
+    healthcheck: *redis-healthcheck
     restart: unless-stopped
+    logging: *default-logging
     networks:
-      - gn-network
+      - peakload-network
     deploy:
       resources:
         limits:
-          memory: 128M
-          cpus: "0.25"
+          memory: 256M
+          cpus: "1.0"
 
   redis-sentinel-1:
-    image: redis:8.6.1-alpine3.23
-    container_name: gn-redis-sentinel-1
-    command: >
-      sh -c "cp /tmp/sentinel.conf /etc/sentinel.conf &&
-             chmod 644 /etc/sentinel.conf &&
-             redis-sentinel /etc/sentinel.conf"
-    volumes:
-      - ./redis/sentinel.conf:/tmp/sentinel.conf:ro
-    depends_on:
-      redis-master:
-        condition: service_healthy
-    expose:
-      - "26379"
-    restart: unless-stopped
-    networks:
-      - gn-network
-    deploy:
-      resources:
-        limits:
-          memory: 32M
-          cpus: "0.1"
+    <<: *sentinel-common
+    container_name: peakload-redis-sentinel-1
 
   redis-sentinel-2:
-    image: redis:8.6.1-alpine3.23
-    container_name: gn-redis-sentinel-2
-    command: >
-      sh -c "cp /tmp/sentinel.conf /etc/sentinel.conf &&
-             chmod 644 /etc/sentinel.conf &&
-             redis-sentinel /etc/sentinel.conf"
-    volumes:
-      - ./redis/sentinel.conf:/tmp/sentinel.conf:ro
-    depends_on:
-      redis-master:
-        condition: service_healthy
-    expose:
-      - "26379"
-    restart: unless-stopped
-    networks:
-      - gn-network
-    deploy:
-      resources:
-        limits:
-          memory: 32M
-          cpus: "0.1"
+    <<: *sentinel-common
+    container_name: peakload-redis-sentinel-2
 
   redis-sentinel-3:
-    image: redis:8.6.1-alpine3.23
-    container_name: gn-redis-sentinel-3
-    command: >
-      sh -c "cp /tmp/sentinel.conf /etc/sentinel.conf &&
-             chmod 644 /etc/sentinel.conf &&
-             redis-sentinel /etc/sentinel.conf"
-    volumes:
-      - ./redis/sentinel.conf:/tmp/sentinel.conf:ro
-    depends_on:
-      redis-master:
-        condition: service_healthy
-    expose:
-      - "26379"
-    restart: unless-stopped
-    networks:
-      - gn-network
-    deploy:
-      resources:
-        limits:
-          memory: 32M
-          cpus: "0.1"
+    <<: *sentinel-common
+    container_name: peakload-redis-sentinel-3
 
   # ============================================================
   # RabbitMQ — Async Message Queue
   # ============================================================
   rabbitmq:
     image: rabbitmq:4.2.4-alpine
-    container_name: gn-rabbitmq
+    container_name: peakload-rabbitmq
     environment:
-      RABBITMQ_DEFAULT_USER: gn_user
-      RABBITMQ_DEFAULT_PASS: gn_secure_pass
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
       RABBITMQ_DEFAULT_VHOST: /
     expose:
       - "5672"
     ports:
-      - "15672:15672"
+      - "127.0.0.1:15672:15672"
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
@@ -553,20 +803,37 @@ services:
       retries: 10
       start_period: 30s
     restart: unless-stopped
+    logging: *default-logging
     networks:
-      - gn-network
+      - peakload-network
     deploy:
       resources:
         limits:
-          memory: 256M
-          cpus: "0.5"
+          memory: 512M
+          cpus: "1.0"
 
   # ============================================================
   # Prometheus — Metrics Collection
   # ============================================================
+  # NOTE: No healthcheck is defined on purpose.
+  #
+  # The `*-distroless` image ships ONLY the `prometheus` binary — no
+  # shell, no `wget`, no `curl`, no `busybox`. Any healthcheck that
+  # shells out (e.g. `wget http://localhost:9090/-/healthy`) will exec-
+  # fail every probe → container stuck `(unhealthy)` → every service
+  # with `depends_on: prometheus: condition: service_healthy` (notably
+  # Grafana) will refuse to start with:
+  #     "dependency prometheus failed to start"
+  #
+  # Do NOT re-add a wget/curl healthcheck unless you also drop the
+  # `-distroless` suffix from the image tag. If you need dependency
+  # ordering for Grafana, use `condition: service_started` (already
+  # set on the Grafana service below) — Prometheus start-up is
+  # deterministic and does not need a readiness gate here.
+  # ============================================================
   prometheus:
     image: prom/prometheus:v3.10.0-distroless
-    container_name: gn-prometheus
+    container_name: peakload-prometheus
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -577,8 +844,9 @@ services:
       - "--storage.tsdb.path=/prometheus"
       - "--storage.tsdb.retention.time=7d"
     restart: unless-stopped
+    logging: *default-logging
     networks:
-      - gn-network
+      - peakload-network
     deploy:
       resources:
         limits:
@@ -590,10 +858,10 @@ services:
   # ============================================================
   grafana:
     image: grafana/grafana:12.3
-    container_name: gn-grafana
+    container_name: peakload-grafana
     environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:?set GRAFANA_USER in .env}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in .env}
       GF_USERS_ALLOW_SIGN_UP: "false"
     ports:
       - "3001:3000"
@@ -601,11 +869,18 @@ services:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    # Grafana waits for Prometheus to START, not to be HEALTHY, because
+    # the Prometheus service has no healthcheck (see comment above the
+    # prometheus service for why). Prometheus start-up is deterministic
+    # enough that this is safe — Grafana's own datasource provisioning
+    # tolerates a Prometheus that isn't answering scrapes yet.
     depends_on:
-      - prometheus
+      prometheus:
+        condition: service_started
     restart: unless-stopped
+    logging: *default-logging
     networks:
-      - gn-network
+      - peakload-network
     deploy:
       resources:
         limits:
@@ -617,8 +892,7 @@ services:
   # ============================================================
   cadvisor:
     image: ghcr.io/google/cadvisor:0.56.2
-    container_name: gn-cadvisor
-    privileged: true
+    container_name: peakload-cadvisor
     ports:
       - "8081:8080"
     volumes:
@@ -627,30 +901,45 @@ services:
       - /sys:/sys:ro
       - /var/lib/docker/:/var/lib/docker:ro
       - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
+    logging: *default-logging
     networks:
-      - gn-network
+      - peakload-network
     deploy:
       resources:
         limits:
           memory: 128M
           cpus: "0.2"
 
+# ============================================================
+# Volumes
+# ------------------------------------------------------------
+# One volume per Patroni node (not per role, because roles
+# flip on failover) and one per etcd member. Nothing is
+# shared across containers — all persistence is per-service.
+# ============================================================
 volumes:
-  pg_shard0_primary_data:
-  pg_shard0_replica1_data:
-  pg_shard1_primary_data:
-  pg_shard1_replica1_data:
-  pg_shard2_primary_data:
-  pg_shard2_replica1_data:
+  etcd_1_data:
+  etcd_2_data:
+  etcd_3_data:
+  pg_shard0_node_a_data:
+  pg_shard0_node_b_data:
+  pg_shard1_node_a_data:
+  pg_shard1_node_b_data:
+  # Shard 2 disabled.
+  # pg_shard2_node_a_data:
+  # pg_shard2_node_b_data:
   redis_data:
   rabbitmq_data:
   prometheus_data:
   grafana_data:
 
-
 networks:
-  gn-network:
+  peakload-network:
     driver: bridge
 
 # ============================================================

@@ -1,0 +1,608 @@
+{
+    "annotations": {
+        "list": []
+    },
+    "editable": true,
+    "fiscalYearStartMonth": 0,
+    "graphTooltip": 1,
+    "id": null,
+    "links": [],
+    "panels": [
+        {
+            "title": "🖥️ CPU Usage per Container",
+            "type": "row",
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 0
+            },
+            "collapsed": false
+        },
+        {
+            "title": "CPU Usage % of 1 core (all containers)",
+            "description": "Per-container CPU as percentage of ONE core. PG nodes have 1.5 CPU limit (max ~150%), app + redis 1.0 CPU (max ~100%). Threshold yellow=80% (near 1-core), red=130% (above 1-core, multi-core territory).",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 10,
+                "w": 24,
+                "x": 0,
+                "y": 1
+            },
+            "targets": [
+                {
+                    "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"peakload-.*\"}[$__rate_interval])) * 100",
+                    "legendFormat": "{{name}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "percent",
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 15,
+                        "spanNulls": true,
+                        "stacking": {
+                            "mode": "none"
+                        }
+                    },
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 80
+                            },
+                            {
+                                "color": "red",
+                                "value": 130
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "title": "CPU — Top 5 Consumers (current)",
+            "description": "Top 5 containers by CPU. Values are % of 1 core — PG node max 150%, others 100%.",
+            "type": "bargauge",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 11
+            },
+            "targets": [
+                {
+                    "expr": "topk(5, sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"peakload-.*\"}[1m])) * 100)",
+                    "legendFormat": "{{name}}",
+                    "refId": "A",
+                    "instant": true
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "percent",
+                    "max": 150,
+                    "thresholds": {
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 80
+                            },
+                            {
+                                "color": "red",
+                                "value": 130
+                            }
+                        ]
+                    }
+                }
+            },
+            "options": {
+                "orientation": "horizontal",
+                "displayMode": "gradient"
+            }
+        },
+        {
+            "title": "CPU — App Replicas",
+            "description": "CPU per app replica — should be roughly even",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 11
+            },
+            "targets": [
+                {
+                    "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"peakload-app-.*\"}[$__rate_interval])) * 100",
+                    "legendFormat": "{{name}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "percent",
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 2,
+                        "fillOpacity": 20,
+                        "spanNulls": true
+                    }
+                }
+            }
+        },
+        {
+            "title": "💾 Memory Usage per Container",
+            "type": "row",
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 19
+            },
+            "collapsed": false
+        },
+        {
+            "title": "Memory Usage (all containers)",
+            "description": "Working set memory per container — shows who's consuming the most RAM",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 10,
+                "w": 24,
+                "x": 0,
+                "y": 20
+            },
+            "targets": [
+                {
+                    "expr": "container_memory_working_set_bytes{name=~\"peakload-.*\"}",
+                    "legendFormat": "{{name}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "bytes",
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 15,
+                        "spanNulls": true
+                    }
+                }
+            }
+        },
+        {
+            "title": "Memory — Top 5 Consumers (current)",
+            "description": "Top 5 containers by working-set memory. Per-container compose limits vary (PG=512 MiB, redis=256 MiB, app=384 MiB, nginx=256 MiB) — thresholds calibrated to the largest single limit (PG 512 MiB).",
+            "type": "bargauge",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 30
+            },
+            "targets": [
+                {
+                    "expr": "topk(5, container_memory_working_set_bytes{name=~\"peakload-.*\"})",
+                    "legendFormat": "{{name}}",
+                    "refId": "A",
+                    "instant": true
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "bytes",
+                    "max": 536870912,
+                    "thresholds": {
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 402653184
+                            },
+                            {
+                                "color": "red",
+                                "value": 482344960
+                            }
+                        ]
+                    }
+                }
+            },
+            "options": {
+                "orientation": "horizontal",
+                "displayMode": "gradient"
+            }
+        },
+        {
+            "title": "Memory — DB Shards",
+            "description": "Memory per PostgreSQL / pgBouncer container",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 30
+            },
+            "targets": [
+                {
+                    "expr": "container_memory_working_set_bytes{name=~\"peakload-pg.*\"}",
+                    "legendFormat": "{{name}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "bytes",
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 2,
+                        "fillOpacity": 15,
+                        "spanNulls": true
+                    }
+                }
+            }
+        },
+        {
+            "title": "🌐 Network I/O per Container",
+            "type": "row",
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 38
+            },
+            "collapsed": false
+        },
+        {
+            "title": "Network Receive (bytes/s)",
+            "description": "Incoming network traffic per container",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 39
+            },
+            "targets": [
+                {
+                    "expr": "sum by (name) (rate(container_network_receive_bytes_total{name=~\"peakload-.*\"}[$__rate_interval]))",
+                    "legendFormat": "{{name}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "Bps",
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 15,
+                        "spanNulls": true
+                    }
+                }
+            }
+        },
+        {
+            "title": "Network Transmit (bytes/s)",
+            "description": "Outgoing network traffic per container",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 39
+            },
+            "targets": [
+                {
+                    "expr": "sum by (name) (rate(container_network_transmit_bytes_total{name=~\"peakload-.*\"}[$__rate_interval]))",
+                    "legendFormat": "{{name}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "Bps",
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 15,
+                        "spanNulls": true
+                    }
+                }
+            }
+        },
+        {
+            "title": "📊 Resource Summary",
+            "type": "row",
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 47
+            },
+            "collapsed": false
+        },
+        {
+            "title": "Total Containers",
+            "type": "stat",
+            "gridPos": {
+                "h": 5,
+                "w": 4,
+                "x": 0,
+                "y": 48
+            },
+            "targets": [
+                {
+                    "expr": "count(container_memory_working_set_bytes{name=~\"peakload-.*\"})",
+                    "refId": "A",
+                    "instant": true
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "thresholds": {
+                        "steps": [
+                            {
+                                "color": "blue",
+                                "value": null
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "title": "Total CPU Usage",
+            "description": "Sum of CPU across all peakload containers, in % of 1 core. Total compose CPU budget = ~1430% (14.3 cores). Yellow=700% (~50% of budget), red=1100% (~77% of budget).",
+            "type": "stat",
+            "gridPos": {
+                "h": 5,
+                "w": 5,
+                "x": 4,
+                "y": 48
+            },
+            "targets": [
+                {
+                    "expr": "sum(rate(container_cpu_usage_seconds_total{name=~\"peakload-.*\"}[1m])) * 100",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "percent",
+                    "thresholds": {
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 700
+                            },
+                            {
+                                "color": "red",
+                                "value": 1100
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "title": "Total Memory",
+            "description": "Sum of working-set memory across all peakload containers. Total compose budget = ~5.15 GiB. Yellow=3.6 GiB (~70% of budget), red=4.6 GiB (~90%).",
+            "type": "stat",
+            "gridPos": {
+                "h": 5,
+                "w": 5,
+                "x": 9,
+                "y": 48
+            },
+            "targets": [
+                {
+                    "expr": "sum(container_memory_working_set_bytes{name=~\"peakload-.*\"})",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "bytes",
+                    "thresholds": {
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 3865470566
+                            },
+                            {
+                                "color": "red",
+                                "value": 4939212390
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "title": "Total Network RX",
+            "type": "stat",
+            "gridPos": {
+                "h": 5,
+                "w": 5,
+                "x": 14,
+                "y": 48
+            },
+            "targets": [
+                {
+                    "expr": "sum(rate(container_network_receive_bytes_total{name=~\"peakload-.*\"}[$__rate_interval]))",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "Bps",
+                    "thresholds": {
+                        "steps": [
+                            {
+                                "color": "purple",
+                                "value": null
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "title": "Total Network TX",
+            "type": "stat",
+            "gridPos": {
+                "h": 5,
+                "w": 5,
+                "x": 19,
+                "y": 48
+            },
+            "targets": [
+                {
+                    "expr": "sum(rate(container_network_transmit_bytes_total{name=~\"peakload-.*\"}[$__rate_interval]))",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "Bps",
+                    "thresholds": {
+                        "steps": [
+                            {
+                                "color": "semi-dark-blue",
+                                "value": null
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        {
+            "title": "Container Memory Usage (table)",
+            "description": "Sortable table of all container memory and CPU",
+            "type": "table",
+            "gridPos": {
+                "h": 10,
+                "w": 24,
+                "x": 0,
+                "y": 53
+            },
+            "targets": [
+                {
+                    "expr": "container_memory_working_set_bytes{name=~\"peakload-.*\"}",
+                    "legendFormat": "{{name}}",
+                    "refId": "A",
+                    "instant": true,
+                    "format": "table"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "bytes"
+                },
+                "overrides": [
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "name"
+                        },
+                        "properties": [
+                            {
+                                "id": "custom.width",
+                                "value": 250
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "Value"
+                        },
+                        "properties": [
+                            {
+                                "id": "displayName",
+                                "value": "Memory (bytes)"
+                            },
+                            {
+                                "id": "custom.width",
+                                "value": 150
+                            }
+                        ]
+                    }
+                ]
+            },
+            "transformations": [
+                {
+                    "id": "organize",
+                    "options": {
+                        "excludeByName": {
+                            "Time": true,
+                            "__name__": true,
+                            "id": true,
+                            "image": true,
+                            "instance": true,
+                            "job": true
+                        },
+                        "renameByName": {
+                            "name": "Container",
+                            "Value": "Memory"
+                        }
+                    }
+                },
+                {
+                    "id": "sortBy",
+                    "options": {
+                        "sort": [
+                            {
+                                "field": "Memory",
+                                "desc": true
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    ],
+    "refresh": "5s",
+    "schemaVersion": 39,
+    "tags": [
+        "peakload-capstone",
+        "infrastructure",
+        "containers"
+    ],
+    "templating": {
+        "list": []
+    },
+    "time": {
+        "from": "now-15m",
+        "to": "now"
+    },
+    "timepicker": {},
+    "timezone": "browser",
+    "title": "Peakload Infrastructure — Container Resources",
+    "uid": "peakload-infra-containers",
+    "version": 3
+}
