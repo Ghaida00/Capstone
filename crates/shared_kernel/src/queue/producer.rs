@@ -55,10 +55,15 @@ struct ConnState {
 
 /// RabbitMQ message producer with automatic reconnection.
 ///
-/// Hot path is lock-free: each `publish` clones an `Arc<ConnState>` out
-/// of an `RwLock` (read side, never contends), picks a channel via
-/// round-robin, and calls `basic_publish` directly. Reconnect rebuilds
-/// the whole `ConnState` under the write side of the lock.
+/// Hot path acquires the `RwLock` read side briefly to clone an
+/// `Arc<ConnState>`, then picks a channel via round-robin and calls
+/// `basic_publish` directly — under normal operation the read is
+/// uncontended. Reconnect takes the write side and rebuilds the
+/// whole `ConnState`. Tokio's `RwLock` is write-preferring, so once
+/// a rebuild is queued every concurrent `read().await` blocks until
+/// the rebuild commits — which is desirable here, because retries
+/// after a publish failure want to see the fresh state rather than
+/// pound the dead channels.
 #[derive(Clone)]
 pub struct QueueProducer {
     state: Arc<RwLock<Arc<ConnState>>>,
@@ -417,7 +422,12 @@ impl QueueProducer {
             self.connected.store(false, Ordering::Relaxed);
             return false;
         }
-        let cc = snapshot.channels[0].clone();
+        // Rotate the probe across channels so an individually-wedged
+        // channel (e.g. broker-side close on a specific channel id)
+        // surfaces in subsequent probes — pinning to channels[0]
+        // would mask 1..N being dead.
+        let idx = self.rr.fetch_add(1, Ordering::Relaxed) % snapshot.channels.len();
+        let cc = snapshot.channels[idx].clone();
         let properties = BasicProperties::default()
             .with_content_type("application/octet-stream")
             .finish();
@@ -482,7 +492,15 @@ async fn publish_with_confirm(
             Err(AppError::Internal("confirm sender dropped".into()))
         }
         Err(_) => {
-            cc.registry.drop_tag(tag).await;
+            // Deliberately leave the tag in `pending`. The broker may
+            // still send `basic.return` + `basic.ack` for this publish
+            // after our timeout; removing the tag now would let the
+            // late return be misattributed to the next publisher's
+            // tag (which `note_returned` reads as the singular
+            // pending entry) and silently downgrade their ack to Nack.
+            // The orphan oneshot send-into-dropped-rx is harmless;
+            // `resolve` removes the entry when the late frames land,
+            // and reconnect drops the whole registry anyway.
             Err(AppError::Internal("publish confirm timeout".into()))
         }
     }

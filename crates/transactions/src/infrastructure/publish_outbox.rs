@@ -18,23 +18,36 @@ use uuid::Uuid;
 use shared_kernel::db::shard::ShardRouter;
 use shared_kernel::queue::producer::QueueProducer;
 
-/// Maximum number of rows shipped per iteration. The batch runs
-/// inside a single PG transaction with `FOR UPDATE SKIP LOCKED`,
-/// so the value caps both the publisher's per-channel lock hold
-/// and how long a row's lock keeps a sibling replica from
-/// claiming it.
+/// Maximum number of rows shipped per iteration. Each batch is
+/// claimed in a short PG transaction (lease stamp via
+/// `claimed_at`), then published outside any transaction, so the
+/// value no longer caps row-lock hold time. It still caps how
+/// many rows one worker holds against the lease before the next
+/// re-claim window opens.
 const BATCH_SIZE: i64 = 25;
 
 /// Sleep between iterations when the previous batch was empty.
 /// Trades CPU and database load against publish latency: every
 /// not-yet-published row waits at most this long before its first
-/// shipment attempt.
-const IDLE_TICK: Duration = Duration::from_millis(50);
+/// shipment attempt. Each idle tick is one cheap UPDATE-RETURNING
+/// that returns 0 rows, so the cost of polling more frequently is
+/// dominated by sqlx round-trip overhead, not PG work.
+const IDLE_TICK: Duration = Duration::from_millis(10);
 
 /// Sleep between iterations when the previous batch errored.
 /// Longer than `IDLE_TICK` so a transient broker outage does not
 /// turn into a tight retry loop.
 const ERROR_TICK: Duration = Duration::from_millis(500);
+
+/// Lease window after a worker stamps `claimed_at` on a batch.
+/// A row that stays unpublished beyond this is re-claimable by
+/// any worker (the original holder either crashed, hung on a
+/// slow broker, or failed mid-batch). Sized to comfortably
+/// exceed the worst-case publish budget for a full batch
+/// (`BATCH_SIZE × MAX_PUBLISH_ATTEMPTS × CONFIRM_TIMEOUT_SECS`
+/// ≈ 25 × 3 × 5 = 375 s) so a healthy worker never has its
+/// own lease expire under it.
+const LEASE_SECS: i64 = 600;
 
 #[derive(FromRow)]
 struct OutboxRow {
@@ -126,46 +139,73 @@ async fn run_shard_worker(
     tracing::info!(shard = shard_idx, "publish-outbox worker exiting");
 }
 
-/// Drains up to `BATCH_SIZE` unpublished rows from this shard.
-/// Returns the number of rows shipped + marked.
+/// Ships up to `BATCH_SIZE` unpublished rows from this shard.
 ///
-/// Runs in a single PG transaction. `FOR UPDATE SKIP LOCKED`
-/// hands disjoint batches to concurrent workers (multiple app
-/// replicas) so a row is only ever published by one of them. A
-/// broker failure mid-batch rolls back the entire transaction:
-/// no row's `published=true` mark sticks, and the rows return to
-/// the pool for the next iteration. The consumer is idempotent on
-/// `idempotency_key` so a re-shipment after rollback is a Replay
-/// downstream.
+/// Two phases per iteration:
+///
+/// 1. **Claim** (one short PG transaction): pick up to `BATCH_SIZE`
+///    rows that are unpublished and either never claimed or whose
+///    lease has expired, stamp `claimed_at = NOW()` on them, and
+///    commit. The `FOR UPDATE SKIP LOCKED` keeps two workers from
+///    grabbing the same row in the same instant; the `claimed_at`
+///    stamp keeps them apart for the next `LEASE_SECS` once the
+///    transaction commits and the row lock is released.
+///
+/// 2. **Publish + mark** (no enclosing transaction): for each
+///    claimed row, `queue.publish` the payload and, on broker ack,
+///    flip `published = true` in a single-row UPDATE.
+///
+/// The PG row lock is held only for the Phase 1 transaction —
+/// milliseconds — so broker latency never holds a Postgres
+/// connection or row lock open. If a worker crashes or hangs
+/// mid-publish, the next worker re-claims the row after
+/// `LEASE_SECS`. A re-claim of a row whose publish actually
+/// reached the broker results in a duplicate publish; the
+/// consumer absorbs it via `ON CONFLICT (reference_id,
+/// from_account)` in `bulk_claim_slots`, so the only cost is
+/// extra broker traffic and a counted skip downstream.
 async fn drain_once(
     shard_idx: usize,
     shards: &ShardRouter,
     queue: &QueueProducer,
 ) -> Result<DrainOutcome, sqlx::Error> {
     let pool = shards.writer(shard_idx);
-    let mut tx = pool.begin().await?;
 
+    // Phase 1: claim a batch under a short transaction. The
+    // outer UPDATE…RETURNING wraps an inner SELECT…FOR UPDATE
+    // SKIP LOCKED so the lease stamp is set atomically with the
+    // claim, and the row lock is released the moment the
+    // statement returns.
     let rows: Vec<OutboxRow> = sqlx::query_as(
         r#"
-        SELECT id, outbox_payload
-        FROM idempotency_keys
-        WHERE NOT published AND outbox_payload IS NOT NULL
-        ORDER BY created_at
-        LIMIT $1
-        FOR UPDATE SKIP LOCKED
+        UPDATE idempotency_keys
+           SET claimed_at = NOW(),
+               updated_at = NOW()
+         WHERE id IN (
+             SELECT id FROM idempotency_keys
+              WHERE NOT published
+                AND outbox_payload IS NOT NULL
+                AND (claimed_at IS NULL
+                     OR claimed_at < NOW() - make_interval(secs => $2))
+              ORDER BY created_at
+              LIMIT $1
+              FOR UPDATE SKIP LOCKED
+         )
+         RETURNING id, outbox_payload
         "#,
     )
     .bind(BATCH_SIZE)
-    .fetch_all(&mut *tx)
+    .bind(LEASE_SECS)
+    .fetch_all(pool)
     .await?;
 
     if rows.is_empty() {
-        // Nothing to do — abort the empty tx promptly so the
-        // pooled connection returns to the pool for other work.
-        tx.rollback().await?;
         return Ok(DrainOutcome::Empty);
     }
 
+    // Phase 2: publish + mark per row, with no enclosing tx. A
+    // publish failure leaves the row's `claimed_at` stamped;
+    // re-claim resumes naturally after `LEASE_SECS`.
     for row in rows {
         match queue.publish(&row.outbox_payload).await {
             Ok(()) => {
@@ -173,11 +213,12 @@ async fn drain_once(
                     "UPDATE idempotency_keys
                        SET published = true,
                            published_at = NOW(),
+                           claimed_at = NULL,
                            updated_at = NOW()
                      WHERE id = $1",
                 )
                 .bind(row.id)
-                .execute(&mut *tx)
+                .execute(pool)
                 .await?;
                 metrics::counter!(
                     "publish_outbox_shipped_total",
@@ -190,14 +231,14 @@ async fn drain_once(
                     shard = shard_idx,
                     id = %row.id,
                     error = %e,
-                    "publish-outbox publish failed; rolling back batch"
+                    "publish-outbox publish failed; remaining rows in batch \
+                     will be retried after lease expiry"
                 );
                 metrics::counter!(
                     "publish_outbox_publish_failures_total",
                     "shard" => shard_idx.to_string()
                 )
                 .increment(1);
-                tx.rollback().await?;
                 // Surface broker failure distinctly from "queue
                 // empty" so the outer loop sleeps `ERROR_TICK`
                 // instead of hot-looping on `IDLE_TICK`.
@@ -206,6 +247,5 @@ async fn drain_once(
         }
     }
 
-    tx.commit().await?;
     Ok(DrainOutcome::Drained)
 }
