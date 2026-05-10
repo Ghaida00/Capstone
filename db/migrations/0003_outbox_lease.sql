@@ -1,0 +1,26 @@
+-- ============================================================
+-- 0003_outbox_lease.sql
+--
+-- Adds `claimed_at` to `idempotency_keys` so the publish-outbox
+-- worker can stamp a logical lease in a short transaction and
+-- release the PG row lock before any broker round-trip.
+--
+-- Without this column the worker held `FOR UPDATE` row locks
+-- across up to `BATCH_SIZE` sequential `queue.publish()` awaits,
+-- which under broker latency could keep a Postgres transaction
+-- open for minutes per shard worker (`25 rows × 5s confirm
+-- timeout × 3 retries`).
+--
+-- End state after this migration:
+--   * `claimed_at TIMESTAMPTZ` (nullable) — logical lease stamp.
+--     NULL means "available". A non-NULL value gates re-claim
+--     until `claimed_at < NOW() - lease window`.
+--   * Existing rows are NULL by default (i.e. immediately
+--     claimable), matching pre-migration behaviour exactly.
+--
+-- Apply against each shard primary via the pg-haproxy frontend
+-- (5000 for shard 0, 5001 for shard 1). Idempotent. Fresh
+-- clusters reach the same end state from `db/init.sql`.
+-- ============================================================
+
+ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;

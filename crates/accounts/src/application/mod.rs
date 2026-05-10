@@ -17,20 +17,28 @@ use shared_kernel::cache::redis::RedisCache;
 use super::domain::AccountRepository;
 use super::ports::{AccountError, AccountId, AccountService, Balance};
 
-/// TTL for the existence/balance cache. Transactions only check that
-/// the `from_account` exists and is active — staleness on the balance
-/// itself is irrelevant because the consumer re-checks balance under
-/// row-level UPDATE before debiting.
-const ACCOUNT_CACHE_TTL_SECS: u64 = 60;
+/// TTL for both balance-cache write sites — the `:acc:` key written
+/// here and the `:balance:` key written by [`super::api::handlers::
+/// get_balance`]. Bounded short on purpose: cached entries carry the
+/// `status` field, and `cache_invalidator` only fires on
+/// `transactions.committed` events. Status flips that do NOT commit
+/// a transaction (admin freeze, fraud lock, KYC hold) are bounded by
+/// this TTL alone, so an oversized value would make `GET /balance`
+/// advertise `status: Active` for the full window after the underlying
+/// row was blocked. The debit path stays correct independently — the
+/// consumer's `UPDATE … WHERE status = 'active'` rejects stale writes
+/// at the row — so this constant only governs the read endpoint's
+/// staleness.
+pub(crate) const BALANCE_CACHE_TTL_SECS: u64 = 10;
 
 /// Implementation of [`AccountService`] backed by repo + Redis cache.
 ///
-/// Previously every transaction-create issued a synchronous DB SELECT
-/// against `users` to verify the from-account existed. Under load that
-/// roundtrip dominated p95 (~10–25 ms even on a cache-warm box). We now
-/// read-through Redis with a 60 s TTL — verification stays correct
-/// (consumer re-validates balance with `UPDATE … WHERE balance >= $1`)
-/// while the hot path drops to a single Redis GET on warm keys.
+/// `get_balance` reads through the `{v}:acc:{id}` Redis key on the
+/// hot path, falling back to a single repo SELECT on miss and
+/// writing the freshly loaded `Balance` back with
+/// `BALANCE_CACHE_TTL_SECS`. Debit-path correctness does not depend
+/// on this cache — the consumer's `UPDATE … WHERE balance >= $1
+/// AND status = 'active'` validates against the row at debit time.
 pub(crate) struct GetBalanceService {
     repo: Arc<dyn AccountRepository>,
     cache: RedisCache,
@@ -65,7 +73,7 @@ impl AccountService for GetBalanceService {
                 let bal = account.to_balance();
                 let _ = self
                     .cache
-                    .set(&cache_key, &bal, ACCOUNT_CACHE_TTL_SECS)
+                    .set(&cache_key, &bal, BALANCE_CACHE_TTL_SECS)
                     .await;
                 Ok(bal)
             }

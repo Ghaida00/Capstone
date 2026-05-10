@@ -114,6 +114,10 @@ async fn post_v2_transaction_lands_in_db_and_notifications() {
         // covered. Production / load-test paths still bypass it
         // by leaving `TX_VERIFY_FROM_ACCOUNT` at its default.
         true,
+        // Synchronous PG path so the test exercises the legacy
+        // reservation route end-to-end without needing the
+        // Redis-intake worker spawned alongside.
+        transactions::IdempotencyBackend::Pg,
     );
 
     // Drives the outbox row from `idempotency_keys` to RabbitMQ so

@@ -44,6 +44,15 @@ const MAX_ATTEMPTS: i32 = 10;
 /// Lease window after a row is claimed. If the holder crashes,
 /// another instance re-claims it after this expiry.
 const LEASE_SECS: i64 = 60;
+/// Backoff lease for the refund stuck-state path. Past
+/// `MAX_ATTEMPTS` a refund row stays claimable forever (we never
+/// terminal-fail it — sender is debited), so without this lease
+/// the row would be re-claimed every `POLL_INTERVAL_MS` and
+/// hammer a struggling downstream shard. Five minutes is short
+/// enough that auto-recovery from a transient downstream outage
+/// catches up quickly, long enough that an extended outage does
+/// not produce per-tick failure spam.
+const REFUND_STUCK_BACKOFF_SECS: i64 = 300;
 
 #[derive(FromRow)]
 struct OutboxRow {
@@ -213,9 +222,22 @@ async fn drain_shard(shards: &ShardRouter, sender_shard: usize) -> Result<(), sq
 }
 
 /// Common path for "step failed, decide whether to retry or
-/// terminally fail". Bumps `attempts`; once `attempts + 1 >=
-/// MAX_ATTEMPTS` the row is marked 'failed' so it drops out of
-/// the working set and surfaces in dashboards for ops triage.
+/// terminally fail". Step semantics differ:
+///
+/// * `step = "credit"` — bumps `attempts`; once `attempts + 1 >=
+///   MAX_ATTEMPTS` the row is marked 'failed' so it drops out of
+///   the working set. The sender's `transactions` audit row is
+///   left at 'processing' so ops triage can see what's stuck.
+/// * `step = "refund"` — NEVER terminal-fails. The sender is
+///   already debited and only a successful refund can make them
+///   whole; marking the outbox 'failed' here would strand funds
+///   with the audit row stuck at 'processing' forever. Past the
+///   `MAX_ATTEMPTS` threshold we hold `attempts` at the cap and
+///   defer the lease by `REFUND_STUCK_BACKOFF_SECS` so re-claim
+///   happens at a sane cadence rather than every poll tick. The
+///   `cross_shard_refund_stuck_total` counter therefore reads as
+///   "refund retry attempts while stuck" (12/hour/row at the
+///   default backoff), not as a count of distinct stuck rows.
 async fn handle_attempt_error(
     pool: &sqlx::PgPool,
     row: &OutboxRow,
@@ -223,7 +245,30 @@ async fn handle_attempt_error(
     step: &'static str,
 ) {
     let next_attempt = row.attempts + 1;
-    metrics::counter!("cross_shard_credit_failures_total", "step" => step).increment(1);
+    metrics::counter!("cross_shard_step_failures_total", "step" => step).increment(1);
+
+    if next_attempt >= MAX_ATTEMPTS && step == "refund" {
+        tracing::error!(
+            outbox_id = %row.id,
+            attempts = row.attempts,
+            step,
+            backoff_secs = REFUND_STUCK_BACKOFF_SECS,
+            error = %err,
+            "cross-shard REFUND exceeded retry budget — sender debited, no compensation yet. Deferring re-claim; manual ops triage required."
+        );
+        metrics::counter!("cross_shard_refund_stuck_total").increment(1);
+        // Hold attempts at the cap (don't bump) so the
+        // `attempts < MAX_ATTEMPTS` filter in the claim query
+        // still selects this row, and defer the next claim by
+        // REFUND_STUCK_BACKOFF_SECS.
+        best_effort(
+            "defer_lease (refund stuck)",
+            row.id,
+            defer_lease(pool, row.id, &err, REFUND_STUCK_BACKOFF_SECS).await,
+        );
+        return;
+    }
+
     if next_attempt >= MAX_ATTEMPTS {
         tracing::error!(
             outbox_id = %row.id,
@@ -262,6 +307,33 @@ async fn handle_attempt_error(
             bump_attempt(pool, row.id, &err).await,
         );
     }
+}
+
+/// Records the last error and pushes the lease forward by
+/// `defer_secs` seconds without bumping `attempts`. Used by the
+/// refund stuck-state path: the row stays eligible for re-claim
+/// indefinitely, but the next claim is gated on the lease
+/// expiring, so a stuck downstream is hit at most once per
+/// `defer_secs` rather than once per poll tick.
+async fn defer_lease(
+    pool: &sqlx::PgPool,
+    id: Uuid,
+    last_error: &str,
+    defer_secs: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE cross_shard_outbox \
+         SET last_error = $2, \
+             lease_until = NOW() + (INTERVAL '1 second' * $3), \
+             updated_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(last_error)
+    .bind(defer_secs)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 fn best_effort(op: &'static str, id: Uuid, res: Result<(), sqlx::Error>) {

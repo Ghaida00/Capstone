@@ -24,12 +24,13 @@
 //! outbox-table fix lives in a follow-up bundle.
 
 use amqprs::{
-    callbacks::{DefaultChannelCallback, DefaultConnectionCallback},
+    callbacks::DefaultConnectionCallback,
     channel::{BasicAckArguments, BasicConsumeArguments, BasicNackArguments, BasicQosArguments},
     connection::{Connection, OpenConnectionArguments},
     consumer::AsyncConsumer,
     BasicProperties, Deliver,
 };
+use shared_kernel::queue::callback::ConsumerChannelCallback;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -46,7 +47,12 @@ use shared_kernel::events::{Event, EventPublisher, EVENT_TRANSACTIONS_COMMITTED}
 const QUEUE_NAME: &str = "transactions.process";
 const CONSUMER_TAG: &str = "peakload-consumer";
 const BATCH_SIZE: usize = 100;
-const BATCH_FLUSH_MS: u64 = 200;
+/// Maximum time a partial batch waits in the buffer before being
+/// flushed to PG. Caps the average status-reflection latency at
+/// `BATCH_FLUSH_MS / 2` for any single message that doesn't fill
+/// a full batch on its own. The value is the dominant tunable for
+/// the 202-to-`completed` window.
+const BATCH_FLUSH_MS: u64 = 50;
 
 /// Wire-shape DTO for the queue message. Owned by the consumer
 /// because it represents the format the producer writes — the
@@ -221,7 +227,7 @@ pub async fn start_consumer(
     .map_err(|e| AppError::Internal(format!("Consumer channel error: {}", e)))?;
 
     channel
-        .register_callback(DefaultChannelCallback)
+        .register_callback(ConsumerChannelCallback::new(cancel.clone()))
         .await
         .map_err(|e| AppError::Internal(format!("Consumer channel callback error: {}", e)))?;
 
@@ -348,6 +354,7 @@ async fn apply_acks(
         }
         if let Err(e) = channel.basic_ack(BasicAckArguments::new(*tag, false)).await {
             tracing::error!(error = %e, context, tag = *tag, "failed to ACK");
+            metrics::counter!("amqp_ack_failures_total", "kind" => "ack").increment(1);
         }
     }
     for tag in &report.requeue_tags {
@@ -360,6 +367,7 @@ async fn apply_acks(
             .await
         {
             tracing::error!(error = %e, context, tag = *tag, "failed to NACK");
+            metrics::counter!("amqp_ack_failures_total", "kind" => "nack_requeue").increment(1);
         }
     }
     // Poison: requeue=false → DLX route per queue declare args.
@@ -372,6 +380,7 @@ async fn apply_acks(
             .await
         {
             tracing::error!(error = %e, context, tag = *tag, "failed to NACK to DLQ");
+            metrics::counter!("amqp_ack_failures_total", "kind" => "nack_dlq").increment(1);
         }
     }
 }
@@ -482,10 +491,23 @@ impl AsyncConsumer for BatchTransactionConsumer {
             if batch.is_empty() {
                 return;
             }
-            let report = flush_batch_to_shards(&batch, &self.shard_router).await;
-            apply_acks(&self.channel, &report, "size-flush").await;
-            record_batch_metrics(&report);
-            publish_committed_events(&report.successful, &self.events);
+            // Spawn the flush so this `consume()` returns quickly
+            // and amqprs can dispatch the next delivery. The
+            // AsyncConsumer trait serializes calls per consumer,
+            // so awaiting flush_batch_to_shards + apply_acks here
+            // would wedge the AMQP read loop for the entire
+            // DB-write + ACK round-trip. Prefetch caps in-flight
+            // flushes — broker won't deliver past `BATCH_SIZE`
+            // unacked messages until apply_acks runs.
+            let router = self.shard_router.clone();
+            let channel = self.channel.clone();
+            let events = self.events.clone();
+            tokio::spawn(async move {
+                let report = flush_batch_to_shards(&batch, &router).await;
+                apply_acks(&channel, &report, "size-flush").await;
+                record_batch_metrics(&report);
+                publish_committed_events(&report.successful, &events);
+            });
         }
         // No individual ACK here — messages stay unacknowledged
         // until the batch is flushed (either by size threshold above
@@ -1003,9 +1025,10 @@ async fn bulk_claim_slots(
 }
 
 /// Promote the placeholder rows claimed by `bulk_claim_slots` to
-/// the given terminal status. `processed_at` is left at the value
-/// set during the claim INSERT (already `NOW()`); `updated_at` is
-/// refreshed by the `update_updated_at_column` trigger.
+/// the given terminal status. Both `processed_at` and `updated_at`
+/// are refreshed to `NOW()` so the timestamp on the terminal row
+/// reflects when the status was finalised, not when the placeholder
+/// was first inserted.
 async fn bulk_update_status(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     msgs: &[PendingMessage],

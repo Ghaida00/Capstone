@@ -48,8 +48,11 @@ pub struct AccountsDeps {
 /// Capped at ~50 MB given an ~80-byte `BalanceResponse` plus moka overhead.
 const MOKA_BALANCE_CAPACITY: u64 = 100_000;
 
-/// Shorter than the Redis handler-cache TTL (30 s); upper-bounds
-/// per-replica balance staleness.
+/// Per-replica L1 in front of Redis. Capped at 1 s so worst-case
+/// staleness on a moka hit is bounded well below the Redis TTL
+/// (`BALANCE_CACHE_TTL_SECS` in `application/mod.rs`); this layer
+/// exists to absorb fan-in on hot keys, not to trade staleness for
+/// throughput.
 const MOKA_BALANCE_TTL_SECS: u64 = 1;
 
 /// Wire a concrete [`AccountsDeps`] from the application's

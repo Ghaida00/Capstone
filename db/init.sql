@@ -135,6 +135,13 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
     -- born true.
     published           BOOLEAN NOT NULL DEFAULT false,
     published_at        TIMESTAMPTZ,
+    -- Logical lease stamp set by the publish-outbox worker when
+    -- it claims a row in a short tx, so it can release the PG
+    -- row lock before any broker round-trip. NULL means
+    -- "available immediately"; a non-NULL value gates re-claim
+    -- until the worker's lease window expires (`claimed_at <
+    -- NOW() - lease`).
+    claimed_at          TIMESTAMPTZ,
 
     expires_at          TIMESTAMPTZ NOT NULL,
 

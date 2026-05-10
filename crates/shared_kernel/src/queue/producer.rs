@@ -33,9 +33,13 @@ const CONNECTION_POOL_SIZE: usize = 2;
 /// Total channel-slot count = connections × channels-per-connection.
 const CHANNEL_POOL_SIZE: usize = CONNECTION_POOL_SIZE * CHANNELS_PER_CONNECTION;
 
-/// One channel + its confirm-tracking state. Publishes serialise
-/// per-channel via `publish_lock` so our internal tag counter
-/// (`next_tag`) matches broker's broker-side counter.
+/// One channel + its confirm-tracking state. `publish_lock` is
+/// held across BOTH `basic_publish` and the confirm-wait, so a
+/// channel has at most one pending confirm at a time. That
+/// invariant is what lets `ConfirmRegistry::note_returned` capture
+/// the singular pending tag for `basic.return` disambiguation. Tag
+/// counter alignment with the broker (`next_tag` vs broker-side)
+/// is preserved as a side benefit.
 struct ConfirmingChannel {
     channel: Arc<amqprs::channel::Channel>,
     registry: Arc<ConfirmRegistry>,
@@ -51,16 +55,42 @@ struct ConnState {
 
 /// RabbitMQ message producer with automatic reconnection.
 ///
-/// Hot path is lock-free: each `publish` clones an `Arc<ConnState>` out
-/// of an `RwLock` (read side, never contends), picks a channel via
-/// round-robin, and calls `basic_publish` directly. Reconnect rebuilds
-/// the whole `ConnState` under the write side of the lock.
+/// Hot path acquires the `RwLock` read side briefly to clone an
+/// `Arc<ConnState>`, then picks a channel via round-robin and calls
+/// `basic_publish` directly — under normal operation the read is
+/// uncontended. Reconnect takes the write side and rebuilds the
+/// whole `ConnState`. Tokio's `RwLock` is write-preferring, so once
+/// a rebuild is queued every concurrent `read().await` blocks until
+/// the rebuild commits — which is desirable here, because retries
+/// after a publish failure want to see the fresh state rather than
+/// pound the dead channels.
 #[derive(Clone)]
 pub struct QueueProducer {
     state: Arc<RwLock<Arc<ConnState>>>,
     rr: Arc<AtomicUsize>,
     connected: Arc<AtomicBool>,
+    /// Single-flight latch for the rebuild path. Decoupled from
+    /// `connected` so a failed rebuild attempt releases the latch
+    /// and the next failing publisher can retry. A `RebuildLatch`
+    /// RAII guard releases it even on panic.
+    rebuild_in_progress: Arc<AtomicBool>,
     config: Arc<ProducerConfig>,
+}
+
+/// RAII guard that flips `rebuild_in_progress` back to `false` on
+/// drop. Acquired via `compare_exchange(false, true)` — only the
+/// caller that won the race holds one. Drops on every exit path
+/// (Ok, Err, panic).
+struct RebuildLatch<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for RebuildLatch<'_> {
+    fn drop(&mut self) {
+        // Release pairs with the Acquire on the next caller's
+        // compare_exchange so they see the latch as available.
+        self.flag.store(false, Ordering::Release);
+    }
 }
 
 struct ProducerConfig {
@@ -118,6 +148,7 @@ impl QueueProducer {
             state: Arc::new(RwLock::new(Arc::new(state))),
             rr: Arc::new(AtomicUsize::new(0)),
             connected: Arc::new(AtomicBool::new(true)),
+            rebuild_in_progress: Arc::new(AtomicBool::new(false)),
             config: producer_config,
         })
     }
@@ -307,14 +338,28 @@ impl QueueProducer {
                         "RabbitMQ publish failed"
                     );
                     last_err = Some(err_msg);
-                    // Mark stale + (single-flight) rebuild on the
-                    // first failure. Subsequent attempts re-pick
-                    // from the freshly-rebuilt channel pool.
-                    if self.connected.swap(false, Ordering::SeqCst) {
+                    self.connected.store(false, Ordering::Relaxed);
+                    // Single-flight latch via `rebuild_in_progress`. Only the
+                    // caller that wins the compare_exchange enters the rebuild
+                    // arm; concurrent failers see `Err` and skip, retrying
+                    // their publish on the next attempt against whatever
+                    // channels the rebuilder produces. The `RebuildLatch`
+                    // releases the flag on every exit path (success, failure,
+                    // panic), so a failed rebuild does not strand the producer.
+                    if self
+                        .rebuild_in_progress
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        let _latch = RebuildLatch {
+                            flag: &self.rebuild_in_progress,
+                        };
                         let mut guard = self.state.write().await;
-                        // Re-check under lock: another concurrent
-                        // failure may have already rebuilt.
-                        if !self.connected.load(Ordering::SeqCst) {
+                        // Re-check under the write lock — another caller may
+                        // have already rebuilt while we were queued behind
+                        // them. The RwLock acquire pairs with the rebuilder's
+                        // release, so an ordering Relaxed load is sufficient.
+                        if !self.connected.load(Ordering::Relaxed) {
                             tracing::warn!("RabbitMQ: rebuilding channel pool...");
                             match Self::connect_and_setup(
                                 &self.config.host,
@@ -327,7 +372,7 @@ impl QueueProducer {
                             {
                                 Ok(new_state) => {
                                     *guard = Arc::new(new_state);
-                                    self.connected.store(true, Ordering::SeqCst);
+                                    self.connected.store(true, Ordering::Relaxed);
                                     metrics::counter!("rabbitmq_reconnections_total").increment(1);
                                 }
                                 Err(rebuild_err) => {
@@ -374,10 +419,15 @@ impl QueueProducer {
     pub async fn health_check_active(&self) -> bool {
         let snapshot = self.state.read().await.clone();
         if snapshot.channels.is_empty() {
-            self.connected.store(false, Ordering::SeqCst);
+            self.connected.store(false, Ordering::Relaxed);
             return false;
         }
-        let cc = snapshot.channels[0].clone();
+        // Rotate the probe across channels so an individually-wedged
+        // channel (e.g. broker-side close on a specific channel id)
+        // surfaces in subsequent probes — pinning to channels[0]
+        // would mask 1..N being dead.
+        let idx = self.rr.fetch_add(1, Ordering::Relaxed) % snapshot.channels.len();
+        let cc = snapshot.channels[idx].clone();
         let properties = BasicProperties::default()
             .with_content_type("application/octet-stream")
             .finish();
@@ -386,14 +436,23 @@ impl QueueProducer {
         let ok = publish_with_confirm(&cc, properties, Vec::new(), args)
             .await
             .is_ok();
-        self.connected.store(ok, Ordering::SeqCst);
+        self.connected.store(ok, Ordering::Relaxed);
         ok
     }
 }
 
-/// Publish + await broker confirm. Per-channel `publish_lock`
-/// serialises so our internal tag matches broker's tag (which
-/// starts at 1 after `confirm_select` and increments per publish).
+/// Publish + await broker confirm. Per-channel `publish_lock` is
+/// held across the entire publish-and-confirm sequence so a
+/// channel has at most one pending confirm at a time — required
+/// for `mandatory=true`, where the broker's `basic.return` for an
+/// unrouteable message arrives just before its `basic.ack` and
+/// must be unambiguously associated with that publish (see
+/// `ConfirmRegistry::returned_tag`). Tag matching is preserved as
+/// a side benefit (broker tag starts at 1 after `confirm_select`
+/// and increments per publish).
+///
+/// Throughput cost: one in-flight publish per channel; the pool
+/// rotates round-robin across `CHANNEL_POOL_SIZE` channels.
 async fn publish_with_confirm(
     cc: &Arc<ConfirmingChannel>,
     properties: BasicProperties,
@@ -401,12 +460,13 @@ async fn publish_with_confirm(
     args: BasicPublishArguments,
 ) -> Result<(), AppError> {
     const CONFIRM_TIMEOUT_SECS: u64 = 5;
-    let _guard = cc.publish_lock.lock().await;
-    let tag = cc.next_tag.fetch_add(1, Ordering::SeqCst) + 1;
+    let _publish_guard = cc.publish_lock.lock().await;
+    // `next_tag` is incremented only while `publish_lock` is held,
+    // so Relaxed is sufficient — there is no concurrent reader.
+    let tag = cc.next_tag.fetch_add(1, Ordering::Relaxed) + 1;
     let (tx, rx) = oneshot::channel();
     cc.registry.register(tag, tx).await;
     let publish_res = cc.channel.basic_publish(properties, payload, args).await;
-    drop(_guard);
     if let Err(e) = publish_res {
         cc.registry.drop_tag(tag).await;
         return Err(AppError::Internal(format!("basic_publish: {}", e)));
@@ -415,8 +475,14 @@ async fn publish_with_confirm(
         Ok(Ok(ConfirmResult::Ack)) => Ok(()),
         Ok(Ok(ConfirmResult::Nack)) => {
             // Tag was already removed from the registry on resolve;
-            // no extra cleanup needed.
-            Err(AppError::Internal("publish nacked by broker".into()))
+            // no extra cleanup needed. Reaches here for both
+            // broker-originated nacks and `basic.return`-translated
+            // nacks (unrouteable mandatory publishes).
+            metrics::counter!("amqp_publish_failed_total", "kind" => "nack_or_returned")
+                .increment(1);
+            Err(AppError::Internal(
+                "publish nacked or returned by broker".into(),
+            ))
         }
         Ok(Err(_)) => {
             // The oneshot sender side was dropped without ever
@@ -426,7 +492,15 @@ async fn publish_with_confirm(
             Err(AppError::Internal("confirm sender dropped".into()))
         }
         Err(_) => {
-            cc.registry.drop_tag(tag).await;
+            // Deliberately leave the tag in `pending`. The broker may
+            // still send `basic.return` + `basic.ack` for this publish
+            // after our timeout; removing the tag now would let the
+            // late return be misattributed to the next publisher's
+            // tag (which `note_returned` reads as the singular
+            // pending entry) and silently downgrade their ack to Nack.
+            // The orphan oneshot send-into-dropped-rx is harmless;
+            // `resolve` removes the entry when the late frames land,
+            // and reconnect drops the whole registry anyway.
             Err(AppError::Internal("publish confirm timeout".into()))
         }
     }

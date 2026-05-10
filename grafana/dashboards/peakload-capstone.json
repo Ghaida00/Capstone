@@ -1069,12 +1069,12 @@
       "collapsed": false
     },
     {
-      "title": "Cross-Shard Credit Failures (cumulative)",
-      "description": "Receiver-shard UPDATEs that failed AFTER the sender's tx already committed. Each occurrence is money mid-air requiring manual reconciliation. Should be 0.",
+      "title": "Cross-Shard Step Failures (cumulative)",
+      "description": "Cross-shard outbox step failures by `step` label: `credit` = receiver UPDATE failed AFTER sender's tx committed (money mid-air); `refund` = compensating refund failed (sender debited, no compensation). Both are money-safety events and should stay flat at 0.",
       "type": "stat",
       "gridPos": {"h": 5, "w": 8, "x": 0, "y": 58},
       "targets": [
-        {"expr": "sum(cross_shard_credit_failures_total)", "refId": "A"}
+        {"expr": "sum(cross_shard_step_failures_total)", "refId": "A"}
       ],
       "fieldConfig": {
         "defaults": {
@@ -1089,12 +1089,12 @@
       }
     },
     {
-      "title": "Cross-Shard Credit Failure Rate",
-      "description": "Receiver-shard credit UPDATE failures per second. A non-zero line is a money-mid-air event stream — investigate the receiver shard and reconcile balances.",
+      "title": "Cross-Shard Step Failure Rate",
+      "description": "Cross-shard outbox step failures per second, split by `step` label. `credit` failures point to receiver-shard issues; `refund` failures point to a sender-shard refund path that cannot complete. Either is a money-mid-air event stream.",
       "type": "timeseries",
       "gridPos": {"h": 5, "w": 16, "x": 8, "y": 58},
       "targets": [
-        {"expr": "sum(rate(cross_shard_credit_failures_total[$__rate_interval]))", "legendFormat": "Failures /s", "refId": "A"}
+        {"expr": "sum by (step) (rate(cross_shard_step_failures_total[$__rate_interval]))", "legendFormat": "{{step}} /s", "refId": "A"}
       ],
       "fieldConfig": {
         "defaults": {

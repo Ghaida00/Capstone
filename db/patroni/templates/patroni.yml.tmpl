@@ -64,6 +64,29 @@ bootstrap:
     # replication volume.
     maximum_lag_on_failover: 1048576
 
+    # ── Synchronous replication ──────────────────────────
+    # Patroni publishes `synchronous_standby_names` (one
+    # FIRST replica picked from the live members), which is
+    # what `postgresql.parameters.synchronous_commit =
+    # "remote_write"` needs to actually engage. Without
+    # this, PG sees no sync candidate and silently falls
+    # back to `local`, paying the local-fsync cost for none
+    # of the cross-node durability.
+    synchronous_mode: true
+    # Default; written explicitly to lock in availability
+    # over strict durability. When the sync replica is
+    # unreachable, PG temporarily clears
+    # `synchronous_standby_names` so writes keep
+    # succeeding. With `true` instead, the primary would
+    # block writes until a sync replica returns — safer for
+    # zero-loss durability claims but unsuitable for the
+    # capstone's spike-load resilience target.
+    synchronous_mode_strict: false
+    # Default; one sync replica is enough at our 2-node
+    # per-shard topology. Setting >1 with only 2 nodes
+    # would degenerate to strict-mode semantics.
+    synchronous_node_count: 1
+
     postgresql:
       use_pg_rewind: true
       use_slots: true
@@ -115,21 +138,28 @@ bootstrap:
         autovacuum_vacuum_insert_scale_factor: 0.05
 
         # --- Write-path latency knobs ---------------------
-        # Defaults assume durability matters more than commit
-        # latency. The capstone trades the other way: an
-        # idempotency-row write losing the last few ms of
-        # committed transactions on power-loss is acceptable
-        # because Redis still holds the accepted-payload
-        # cache for 24 h and the producer is idempotent on
-        # retry. `synchronous_commit=off` keeps fsync out of
-        # the request path — biggest single p95 win on the
-        # write side. Streaming replication is unaffected;
-        # only the WAL fsync to local disk is skipped.
-        synchronous_commit: "off"
-        # Group nearby commits into the same WAL flush so
-        # batches of inserts ride one fsync. Tiny because we
-        # care about latency, not throughput-at-cost-of-tail.
-        commit_delay: 100
+        # `remote_write` waits for the synchronous replica to
+        # receive the WAL in memory before returning success on
+        # COMMIT — replica disk fsync is NOT awaited. The
+        # `bootstrap.dcs.synchronous_mode: true` setting above
+        # publishes `synchronous_standby_names` so this engages.
+        # If the sync replica is unreachable PG drops back to
+        # async (writes keep succeeding) because
+        # `synchronous_mode_strict: false`; promotion is still
+        # safe because Patroni only promotes nodes that were
+        # synchronously replicating at the moment of failover.
+        synchronous_commit: "remote_write"
+        # `commit_delay` was tuned for the previous
+        # `synchronous_commit: "off"` configuration where the
+        # primary's local fsync was the dominant commit cost and
+        # batching siblings into one fsync was a net win. Under
+        # `remote_write` the bottleneck is the network round-trip
+        # to the sync replica, which `commit_delay` cannot batch —
+        # so the 100 µs nap on every commit is pure latency for
+        # no fsync-amortisation benefit. Set to 0 to disable.
+        # `commit_siblings` is left at its prior value but is a
+        # no-op while `commit_delay = 0`.
+        commit_delay: 0
         commit_siblings: 5
         # Tell PG the underlying disk can handle some
         # parallel I/O. Default (1) underestimates the
