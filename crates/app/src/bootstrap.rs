@@ -68,6 +68,10 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
     // SLO-straddling buckets (the exporter defaults histograms to summary;
     // `histogram_quantile()` is impossible without buckets). Boundaries
     // straddle the stated 500 ms P95 SLO and the observed sub-10 ms baseline.
+    // Scope is intentionally `Matcher::Full` (exact name): other
+    // histograms (e.g. `transactions_batch_size`) remain summaries —
+    // broadening to `Matcher::Prefix`/`Suffix` would change their
+    // exposition shape silently.
     let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full("http_request_duration_seconds".to_string()),
