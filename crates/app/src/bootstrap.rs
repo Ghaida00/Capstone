@@ -428,9 +428,6 @@ pub fn build_router(
         .layer(axum_middleware::from_fn(
             crate::middleware::request_id::request_id_middleware,
         ))
-        .layer(axum_middleware::from_fn(
-            crate::middleware::metrics::metrics_middleware,
-        ))
         .layer(
             ServiceBuilder::new()
                 .layer(HandleErrorLayer::new(|err: BoxError| async move {
@@ -481,6 +478,9 @@ where
     S: Clone + Send + Sync + 'static,
 {
     router
+        .layer(axum_middleware::from_fn(
+            crate::middleware::metrics::metrics_middleware,
+        ))
         .layer(axum_middleware::from_fn_with_state(
             auth_state,
             crate::middleware::auth::auth_middleware,
