@@ -64,7 +64,18 @@ pub fn init_tracing() {
 /// Install the Prometheus recorder and pre-register every metric so
 /// they appear in `/metrics` from the very first scrape.
 pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
+    // O-4: render http_request_duration_seconds as a real histogram with
+    // SLO-straddling buckets (the exporter defaults histograms to summary;
+    // `histogram_quantile()` is impossible without buckets). Boundaries
+    // straddle the stated 500 ms P95 SLO and the observed sub-10 ms baseline.
     let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full("http_request_duration_seconds".to_string()),
+            &[
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ],
+        )
+        .expect("set_buckets_for_metric")
         .install_recorder()
         .expect("Failed to install Prometheus recorder");
 
