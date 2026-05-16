@@ -5,7 +5,7 @@ groups:
       - record: peakload:http_requests:rate5m
         expr: sum(rate(http_requests_total[5m]))
       - record: peakload:http_errors:rate5m
-        expr: sum(rate(http_requests_total{http_response_status_code=~"5.."}[5m]))
+        expr: sum(rate(http_requests_total{http_response_status_code=~"5.."}[5m])) or vector(0)
       - record: peakload:http_availability:ratio_rate5m
         expr: 1 - (peakload:http_errors:rate5m / clamp_min(peakload:http_requests:rate5m, 1))
       - record: peakload:http_latency_under_slo:ratio_rate5m
