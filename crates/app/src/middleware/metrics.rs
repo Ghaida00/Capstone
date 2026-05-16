@@ -52,11 +52,17 @@ mod tests {
     use metrics_exporter_prometheus::PrometheusBuilder;
     use tower::ServiceExt;
 
-    /// Guards the O-NEW-cardinality fix: with the metrics layer on the
-    /// inner sub-router (the production wiring after bootstrap.rs), the
-    /// rendered `url_path` label is the full bounded route TEMPLATE,
-    /// never the per-id path. Empirically verified that `MatchedPath`
-    /// resolves to the full prefixed template at this layer position.
+    /// Guards `metrics_middleware`'s body and the inner-router topology:
+    /// when the middleware runs on a sub-router under `nest_service`,
+    /// `MatchedPath` resolves to the full prefixed template and the
+    /// rendered `url_path` label is bounded.
+    ///
+    /// Note: this does NOT guard the *placement* of the layer in
+    /// `bootstrap.rs::apply_protection_stack` — a regression that
+    /// moves the layer back to the outer router would compile clean
+    /// and this test would still pass. Live `/metrics` per-account
+    /// series count is the placement guard (and is verified on the
+    /// real stack during WP2 verification).
     #[tokio::test]
     async fn inner_layer_yields_bounded_template_label() {
         let handle = PrometheusBuilder::new()

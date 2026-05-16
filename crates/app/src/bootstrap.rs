@@ -454,10 +454,13 @@ pub fn build_router(
 /// Apply the standard request-protection stack to a router.
 ///
 /// Order matters: `.layer` wraps outside-in, so the call sequence below
-/// produces this request flow at runtime:
+/// produces this request flow at runtime. The metrics layer is placed
+/// outermost so it observes the FINAL response status — including
+/// 429/503 short-circuits emitted by rate-limit / circuit-breaker /
+/// backpressure inside the protection stack.
 ///
 /// ```text
-///   request → backpressure → circuit_breaker → rate_limit → auth → handler
+///   request → metrics → backpressure → circuit_breaker → rate_limit → auth → handler
 /// ```
 ///
 /// Applied to every `/api/v2/{accounts,transactions,notifications}/*`
