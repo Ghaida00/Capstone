@@ -53,7 +53,6 @@ SHOWN=$($PSQL -c "SHOW statement_timeout" | tr -d '[:space:]')
 echo "statement_timeout through pgBouncer = '$SHOWN'"
 [ "$SHOWN" != "0" ] || { echo "FAIL: statement_timeout is 0 through pgBouncer"; exit 1; }
 
-$PSQL -c "BEGIN; SELECT 1; COMMIT;" >/dev/null 2>&1 || true
 OUT=$($PSQL -c "SELECT pg_sleep(2)" 2>&1 || true)
 echo "$OUT" | grep -q "canceling statement due to statement timeout" \
   || { echo "FAIL: pg_sleep(2) not cancelled through pgBouncer; got: $OUT"; exit 1; }
