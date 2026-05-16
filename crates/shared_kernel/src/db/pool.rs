@@ -1,6 +1,5 @@
 use sqlx::postgres::PgConnectOptions;
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::ConnectOptions;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -63,7 +62,7 @@ impl PoolTimeouts {
                 ("lock_timeout", lock.as_str()),
                 ("idle_in_transaction_session_timeout", idle.as_str()),
             ]);
-        Ok(opts.log_statements(tracing::log::LevelFilter::Debug))
+        Ok(opts)
     }
 }
 
