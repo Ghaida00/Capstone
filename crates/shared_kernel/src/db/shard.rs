@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::AppError;
 
 use super::pool::DatabasePool;
+use super::pool::PoolTimeouts;
 
 /// Runtime shard count, set on `ShardRouter::new` from config.
 /// Default 2 mirrors the historical const so single-binary tests
@@ -31,6 +32,7 @@ pub struct ShardRouterConfig {
     pub write_pool_size: u32,
     pub read_pool_size: u32,
     pub health_check_interval_secs: u64,
+    pub timeouts: PoolTimeouts,
 }
 
 /// Application-level shard router.
@@ -68,6 +70,7 @@ impl ShardRouter {
                 &shard_urls.read_urls,
                 config.write_pool_size,
                 config.read_pool_size,
+                config.timeouts,
             )
             .await
             .map_err(|e| AppError::Internal(format!("Failed to connect to shard {}: {}", i, e)))?;

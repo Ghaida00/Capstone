@@ -20,6 +20,7 @@ use crate::middleware::circuit_breaker::CircuitBreaker;
 use crate::middleware::rate_limit::RateLimiter;
 use crate::AppState;
 use shared_kernel::cache::redis::{RedisCache, RedisCacheConfig};
+use shared_kernel::db::pool::PoolTimeouts;
 use shared_kernel::db::shard::{ShardRouter, ShardRouterConfig, ShardUrls};
 use shared_kernel::events::EventSubscriber;
 use shared_kernel::queue::producer::QueueProducer;
@@ -277,6 +278,11 @@ pub async fn init_infrastructure(
         write_pool_size: config.db_write_pool_size,
         read_pool_size: config.db_read_pool_size,
         health_check_interval_secs: config.db_health_check_interval_secs,
+        timeouts: PoolTimeouts {
+            statement_ms: config.db_query_timeout_secs * 1000,
+            lock_ms: 500,
+            idle_in_tx_ms: 5_000,
+        },
     };
     let shard_router = ShardRouter::new(&shard_config, cancel.child_token()).await?;
 
