@@ -1,0 +1,26 @@
+groups:
+  - name: peakload-slo-burn
+    rules:
+      - alert: PeakloadAvailabilityFastBurn
+        expr: |
+          (1 - peakload:http_availability:ratio_rate5m) > (14.4 * 0.001)
+          and (1 - avg_over_time(peakload:http_availability:ratio_rate5m[1h])) > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Availability fast-burn: ~2% 30d budget in 1h"
+      - alert: PeakloadAvailabilitySlowBurn
+        expr: (1 - avg_over_time(peakload:http_availability:ratio_rate5m[6h])) > (6 * 0.001)
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Availability slow-burn: 10% 30d budget over 6h"
+      - alert: PeakloadLatencySLOBreach
+        expr: peakload:http_latency_under_slo:ratio_rate5m < 0.95
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "P95 latency SLO (<500ms for 95%) breached 10m"
