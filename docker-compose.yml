@@ -700,6 +700,12 @@ services:
       PG_HAPROXY_HOST:   pg-haproxy
       # Shard 2 disabled — was "5000 5001 5002".
       PG_HAPROXY_PORTS:  "5000 5001"
+      # D-1/R-3: server-side statement/lock/idle-in-tx timeouts,
+      # applied per shard primary as ALTER DATABASE defaults.
+      # ms. Tunable per deploy; defaults match the audit prescription.
+      DB_STATEMENT_TIMEOUT_MS:   "2000"
+      DB_LOCK_TIMEOUT_MS:        "500"
+      DB_IDLE_IN_TX_TIMEOUT_MS:  "5000"
     volumes:
       - ./db/bootstrap/bootstrap-schema.sh:/opt/bootstrap-schema.sh:ro
       - ./db/init.sql:/sql/init.sql:ro

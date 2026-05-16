@@ -96,6 +96,39 @@ apply_schema() {
 }
 
 # ------------------------------------------------------------
+# Server-side statement/lock/idle-in-tx timeouts (D-1/R-3).
+#
+# Set as DATABASE-level defaults via ALTER DATABASE so they are
+# inherited by every backend the app opens — including via
+# pgBouncer in transaction pooling mode, where libpq startup
+# `options` are rejected and session `SET` is wiped by
+# DISCARD ALL between transactions. RESET ALL returns a GUC to
+# its default, and ALTER DATABASE IS that default, so the
+# timeout survives pooling. Replicated to standbys via WAL, so
+# the direct-connected read replicas inherit it too.
+#
+# Runs UNCONDITIONALLY every bootstrap pass (NOT gated by the
+# canary like the schema) because ALTER DATABASE ... SET is
+# naturally idempotent and must take effect on already-populated
+# clusters where apply_schema is skipped.
+# ------------------------------------------------------------
+: "${DB_STATEMENT_TIMEOUT_MS:=2000}"
+: "${DB_LOCK_TIMEOUT_MS:=500}"
+: "${DB_IDLE_IN_TX_TIMEOUT_MS:=5000}"
+
+apply_db_timeouts() {
+    port=$1
+    echo "[bootstrap-schema] Applying DB timeout defaults to ${PG_HAPROXY_HOST}:${port} (statement=${DB_STATEMENT_TIMEOUT_MS}ms lock=${DB_LOCK_TIMEOUT_MS}ms idle_in_tx=${DB_IDLE_IN_TX_TIMEOUT_MS}ms)..."
+    psql -h "$PG_HAPROXY_HOST" -p "$port" \
+         -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+         -v ON_ERROR_STOP=1 -w \
+         -c "ALTER DATABASE \"${POSTGRES_DB}\" SET statement_timeout = '${DB_STATEMENT_TIMEOUT_MS}'" \
+         -c "ALTER DATABASE \"${POSTGRES_DB}\" SET lock_timeout = '${DB_LOCK_TIMEOUT_MS}'" \
+         -c "ALTER DATABASE \"${POSTGRES_DB}\" SET idle_in_transaction_session_timeout = '${DB_IDLE_IN_TX_TIMEOUT_MS}'"
+    echo "[bootstrap-schema] DB timeout defaults applied on port ${port}."
+}
+
+# ------------------------------------------------------------
 # Main loop — one pass per shard.
 # ------------------------------------------------------------
 for port in $PG_HAPROXY_PORTS; do
@@ -106,6 +139,10 @@ for port in $PG_HAPROXY_PORTS; do
     else
         apply_schema "$port"
     fi
+
+    # Always (re)assert the DB-level timeout defaults — idempotent,
+    # and must run even when the schema step is skipped.
+    apply_db_timeouts "$port"
 done
 
 echo "[bootstrap-schema] All shards ready."

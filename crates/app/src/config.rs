@@ -26,6 +26,13 @@ pub struct Config {
     pub db_read_pool_size: u32,
 
     // Timeouts (seconds)
+    /// Advisory only. The Postgres statement timeout is enforced
+    /// **server-side** as an `ALTER DATABASE` default by
+    /// `db/bootstrap/bootstrap-schema.sh` (D-1/R-3) — required because
+    /// the write path is pooled by pgBouncer in transaction mode,
+    /// which rejects client-supplied connection options. This field
+    /// is retained for the validation that it stays `< api_timeout_secs`;
+    /// removing it is tracked as a WP10 cleanup candidate.
     pub db_query_timeout_secs: u64,
     pub redis_command_timeout_secs: u64,
     pub api_timeout_secs: u64,
