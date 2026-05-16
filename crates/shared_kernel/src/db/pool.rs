@@ -1,7 +1,4 @@
-use sqlx::postgres::PgConnectOptions;
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::ConnectOptions;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,42 +28,6 @@ pub struct DatabasePool {
     read_index: Arc<AtomicUsize>,
 }
 
-/// Per-connection Postgres timeout budget, applied as session GUCs at
-/// connect time so every checked-out connection enforces them without
-/// touching individual query sites.
-///
-/// * `statement_ms`  — a single statement may run this long, then
-///   Postgres cancels it (SQLSTATE 57014). Driven by
-///   `Config::db_query_timeout_secs`.
-/// * `lock_ms`       — max wait for a row/table lock before erroring
-///   (SQLSTATE 55P03), so a hot-row pile-up fails fast instead of
-///   blocking a pool slot.
-/// * `idle_in_tx_ms` — a transaction left open with no work (leaked
-///   `BEGIN`, cancelled mid-tx) is terminated after this long instead
-///   of stranding the connection until `idle_timeout`.
-#[derive(Debug, Clone, Copy)]
-pub struct PoolTimeouts {
-    pub statement_ms: u64,
-    pub lock_ms: u64,
-    pub idle_in_tx_ms: u64,
-}
-
-impl PoolTimeouts {
-    fn connect_opts(&self, url: &str) -> Result<PgConnectOptions, AppError> {
-        let stmt = self.statement_ms.to_string();
-        let lock = self.lock_ms.to_string();
-        let idle = self.idle_in_tx_ms.to_string();
-        let opts = PgConnectOptions::from_str(url)
-            .map_err(|e| AppError::Internal(format!("parse pg url: {e}")))?
-            .options([
-                ("statement_timeout", stmt.as_str()),
-                ("lock_timeout", lock.as_str()),
-                ("idle_in_transaction_session_timeout", idle.as_str()),
-            ]);
-        Ok(opts.log_statements(tracing::log::LevelFilter::Debug))
-    }
-}
-
 impl DatabasePool {
     /// Create a new shard pool with write + multiple read replicas.
     pub async fn new_shard(
@@ -74,7 +35,6 @@ impl DatabasePool {
         read_urls: &[String],
         write_pool_size: u32,
         read_pool_size: u32,
-        timeouts: PoolTimeouts,
     ) -> Result<Self, AppError> {
         // Aggressive acquire timeout (1s) keeps a saturated pool from
         // gluing thousands of axum tasks to the connection queue —
@@ -89,7 +49,7 @@ impl DatabasePool {
             .idle_timeout(Duration::from_secs(300))
             .max_lifetime(Duration::from_secs(1800))
             .test_before_acquire(false)
-            .connect_with(timeouts.connect_opts(write_url)?)
+            .connect(write_url)
             .await
             .map_err(|e| AppError::Internal(format!("Write pool error: {}", e)))?;
 
@@ -105,13 +65,6 @@ impl DatabasePool {
 
         let read_min = (per_replica_size / 2).max(3);
         for url in read_urls {
-            let read_opts = match timeouts.connect_opts(url) {
-                Ok(o) => o,
-                Err(e) => {
-                    tracing::warn!(url = url, error = %e, "Failed to parse read replica url");
-                    continue;
-                }
-            };
             match PgPoolOptions::new()
                 .max_connections(per_replica_size)
                 .min_connections(read_min)
@@ -119,7 +72,7 @@ impl DatabasePool {
                 .idle_timeout(Duration::from_secs(300))
                 .max_lifetime(Duration::from_secs(1800))
                 .test_before_acquire(false)
-                .connect_with(read_opts)
+                .connect(url)
                 .await
             {
                 Ok(pool) => {
