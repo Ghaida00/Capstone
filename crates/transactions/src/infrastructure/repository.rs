@@ -127,23 +127,23 @@ impl TransactionRepository for SqlxTransactionRepository {
 
     async fn list(&self, filter: &ListFilter) -> Result<Vec<Transaction>, String> {
         let limit = filter.limit.min(100) as i64;
-        // Per-shard fetch budget = `limit + ceil(limit / num_shards)`,
-        // floored at `limit + 2`.
+        // Two-phase cross-shard pagination. Each shard fetches its top
+        // `limit + 1` rows. The `(limit+1)`th row (if present) is a
+        // "tail probe" — the OLDEST row on that shard's slice that we
+        // would have dropped on truncate. Across shards, the MAX of
+        // those probes is the *safe cursor*: the oldest `(created_at,
+        // id)` for which every shard's slice still has full coverage
+        // newer than it. Any row in the merged page OLDER than the
+        // safe cursor is in a range where at least one shard's
+        // coverage is incomplete — drop it so the client's next-page
+        // cursor (derived from the last returned row) is safe.
         //
-        // Each shard returns its top `per_shard_limit` rows; the
-        // caller merges and truncates the union to `limit`. The
-        // slack term absorbs ordinary inter-shard skew so the
-        // merge step does not drop a row whose `created_at` lands
-        // older than another shard's tail. Pages that bunch
-        // entirely on one shard can still lose a tail row at the
-        // page boundary; the next page's cursor recovers it on
-        // the following call.
-        //
-        // Invariant: `per_shard_limit >= limit` so a single-shard
-        // result set is never under-fetched.
-        let num_shards = self.shards.num_shards() as i64;
-        let per_shard_slack = (limit / num_shards.max(1)).max(2);
-        let per_shard_limit = limit.saturating_add(per_shard_slack);
+        // Replaces the prior slack-based heuristic (`per_shard_limit =
+        // limit + ceil(limit/N)`) that silently dropped tail rows
+        // when a page bunched lopsidedly (D-3). Shards that exhaust
+        // (return fewer than `limit + 1` rows) do not contribute a
+        // probe — they cannot have more rows than they returned.
+        let per_shard_limit = limit.saturating_add(1);
         let cursor = filter.before;
         let cursor_id = filter.before_id;
 
@@ -191,15 +191,39 @@ impl TransactionRepository for SqlxTransactionRepository {
             }));
         }
 
-        let mut rows: Vec<Transaction> = Vec::new();
+        let mut per_shard_slices: Vec<Vec<TransactionRowSlim>> =
+            Vec::with_capacity(self.shards.num_shards());
         let mut last_err: Option<String> = None;
         for h in handles {
             match h.await {
-                Ok(Ok(rs)) => rows.extend(rs.into_iter().map(Into::into)),
+                Ok(Ok(rs)) => per_shard_slices.push(rs),
                 Ok(Err(e)) => last_err = Some(e.to_string()),
                 Err(e) => last_err = Some(format!("join: {}", e)),
             }
         }
+
+        // MAX (created_at, id) over the (limit+1)th row of each shard
+        // that returned a full `limit + 1`. Tuple Ord is lexicographic
+        // — matches our DESC sort key, so larger = newer.
+        let safe_cursor: Option<(chrono::DateTime<Utc>, Uuid)> = per_shard_slices
+            .iter()
+            .filter_map(|slice| slice.get(limit as usize))
+            .map(|row| (row.created_at, row.id))
+            .max();
+
+        // Each slice contributes its first `limit` rows (drop the
+        // `+1` probe row). The probe was a tail signal, not page data.
+        let mut rows: Vec<Transaction> = per_shard_slices
+            .into_iter()
+            .flat_map(|slice| {
+                slice
+                    .into_iter()
+                    .take(limit as usize)
+                    .map(Into::into)
+                    .collect::<Vec<Transaction>>()
+            })
+            .collect();
+
         // Surface infra errors only when zero shards answered —
         // a partial result is still useful and the error is logged.
         if rows.is_empty() {
@@ -209,10 +233,26 @@ impl TransactionRepository for SqlxTransactionRepository {
         } else if let Some(err) = last_err {
             tracing::warn!(err = %err, "list: partial shard failure");
         }
+
         // Stable order: created_at DESC, id DESC (matches per-shard
         // ORDER BY so merging is consistent).
         rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
         rows.truncate(limit as usize);
+
+        // Drop rows older than the safe cursor — at least one shard
+        // has un-fetched coverage there. When `safe_cursor` is None
+        // (no shard returned a full `limit + 1`), the global result
+        // fits within `limit` and no rows are unsafe.
+        if let Some((sc_at, sc_id)) = safe_cursor {
+            let pre_drop = rows.len();
+            rows.retain(|r| (r.created_at, r.id) > (sc_at, sc_id));
+            let dropped = pre_drop - rows.len();
+            if dropped > 0 {
+                metrics::counter!("transactions_list_tail_skew_dropped_total")
+                    .increment(dropped as u64);
+            }
+        }
+
         Ok(rows)
     }
 

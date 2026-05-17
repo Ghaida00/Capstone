@@ -146,6 +146,10 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics::describe_histogram!("transactions_batch_size", "Batch sizes");
     metrics::describe_counter!("dlq_messages_total", "Dead letter queue messages");
     metrics::describe_counter!(
+        "transactions_list_tail_skew_dropped_total",
+        "Rows dropped from a transactions-list page because at least one shard's coverage did not reach them (D-3 safe-cursor truncation)"
+    );
+    metrics::describe_counter!(
         "cross_shard_step_failures_total",
         "Cross-shard outbox step failures (label `step`: `credit` or `refund`) — credit failures stranded a sender debit; refund failures left a sender un-compensated"
     );
