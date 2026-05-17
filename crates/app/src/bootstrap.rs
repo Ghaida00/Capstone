@@ -28,25 +28,18 @@ use shared_kernel::queue::producer::QueueProducer;
 
 /// Initialise the global `tracing` subscriber.
 ///
-/// Default: EnvFilter (RUST_LOG, default `warn`) + compact line format
-/// to stdout. The previous build wired an OpenTelemetry `SimpleExporter`
-/// which calls `write!(stdout)` synchronously on every span exit — under
-/// 500–1000 VU load that pegged the hot path with blocking I/O. JSON
-/// fmt also serialises every event; compact is ~3× cheaper.
-///
-/// To re-enable structured / OTel output, set `LOG_FORMAT=json` or
-/// `OTEL_ENABLED=1` (OTel uses the batch exporter, not simple).
+/// Default level is `info`; `RUST_LOG` overrides it (e.g. `RUST_LOG=debug`).
+/// Default output is JSON on stdout — one event per line, structured fields
+/// preserved.
+/// Plain compact format is used when `RUST_LOG_PRETTY` is set or the binary
+/// is built with `debug_assertions` (i.e. `cargo run` / `cargo test`).
 pub fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let json = std::env::var("LOG_FORMAT").ok().as_deref() == Some("json");
+    let pretty = std::env::var("RUST_LOG_PRETTY").is_ok() || cfg!(debug_assertions);
     let registry = tracing_subscriber::registry().with(filter);
 
-    if json {
-        registry
-            .with(tracing_subscriber::fmt::layer().json())
-            .init();
-    } else {
+    if pretty {
         registry
             .with(
                 tracing_subscriber::fmt::layer()
@@ -55,6 +48,10 @@ pub fn init_tracing() {
                     .with_thread_ids(false)
                     .with_thread_names(false),
             )
+            .init();
+    } else {
+        registry
+            .with(tracing_subscriber::fmt::layer().json())
             .init();
     }
 }
