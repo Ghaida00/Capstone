@@ -12,7 +12,14 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use std::time::Duration;
 use uuid::Uuid;
+
+/// Per-shard wall-clock budget for the `find_by_id` fan-out. Single-row
+/// PK lookups are sub-10 ms on healthy shards; 500 ms gives ~50× buffer
+/// while bounding the tail when one shard is degraded so the call does
+/// not pin the API-timeout (D-4).
+const FIND_BY_ID_PER_SHARD_TIMEOUT: Duration = Duration::from_millis(500);
 
 use shared_kernel::cache::redis::RedisCache;
 use shared_kernel::db::shard::ShardRouter;
@@ -77,36 +84,54 @@ impl SqlxTransactionRepository {
 #[async_trait]
 impl TransactionRepository for SqlxTransactionRepository {
     async fn find_by_id(&self, id: TransactionId) -> Result<Option<Transaction>, String> {
-        // Cross-shard fan-out: spawn one query per shard, await
-        // ALL of them. Surfacing infra errors (one shard down) is
-        // important — silently swallowing them would return 404
-        // for rows that genuinely live on the unavailable shard.
-        // Awaiting all handles also avoids the leak the
-        // first-hit-wins variant produced.
+        // Cross-shard fan-out: spawn one query per shard, each wrapped
+        // in `tokio::time::timeout(FIND_BY_ID_PER_SHARD_TIMEOUT, _)`
+        // so a degraded shard turns into a per-shard error rather than
+        // pinning the API-wide wall-clock (D-4). Surfacing infra errors
+        // (one shard down) still matters — silently swallowing them
+        // would return 404 for rows that genuinely live on the
+        // unavailable shard. Awaiting all handles still applies; it
+        // avoids the leak the first-hit-wins variant produced.
         let mut handles = Vec::with_capacity(self.shards.num_shards());
         for shard_idx in 0..self.shards.num_shards() {
             let pool = self.shards.reader(shard_idx).clone();
             let id = id.as_uuid();
             handles.push(tokio::spawn(async move {
-                sqlx::query_as::<_, TransactionRowSlim>(
-                    "SELECT id, from_account, to_account, amount, currency, status, reference_id, description, created_at, updated_at, processed_at FROM transactions WHERE id = $1",
-                )
-                .bind(id)
-                .fetch_optional(&pool)
-                .await
+                let res = tokio::time::timeout(FIND_BY_ID_PER_SHARD_TIMEOUT, async {
+                    sqlx::query_as::<_, TransactionRowSlim>(
+                        "SELECT id, from_account, to_account, amount, currency, status, reference_id, description, created_at, updated_at, processed_at FROM transactions WHERE id = $1",
+                    )
+                    .bind(id)
+                    .fetch_optional(&pool)
+                    .await
+                })
+                .await;
+                (shard_idx, res)
             }));
         }
         let mut found: Option<Transaction> = None;
         let mut last_err: Option<String> = None;
         for h in handles {
             match h.await {
-                Ok(Ok(Some(row))) => {
+                Ok((_, Ok(Ok(Some(row))))) => {
                     if found.is_none() {
                         found = Some(row.into());
                     }
                 }
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => last_err = Some(e.to_string()),
+                Ok((_, Ok(Ok(None)))) => {}
+                Ok((_, Ok(Err(e)))) => last_err = Some(e.to_string()),
+                Ok((shard_idx, Err(_elapsed))) => {
+                    metrics::counter!(
+                        "transactions_find_by_id_shard_timeout_total",
+                        "shard" => shard_idx.to_string()
+                    )
+                    .increment(1);
+                    last_err = Some(format!(
+                        "shard {} exceeded {}ms find_by_id budget",
+                        shard_idx,
+                        FIND_BY_ID_PER_SHARD_TIMEOUT.as_millis()
+                    ));
+                }
                 Err(e) => last_err = Some(format!("join: {}", e)),
             }
         }
