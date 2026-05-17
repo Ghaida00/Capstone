@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tower::timeout::TimeoutLayer;
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
@@ -45,8 +45,15 @@ use shared_kernel::queue::producer::QueueProducer;
 /// tracer provider. `OTEL_SERVICE_NAME` (default `peakload-capstone`) is
 /// attached as the `service.name` resource attribute. With the endpoint
 /// unset, no OTLP pipeline runs and the subscriber behaves as above.
+///
+/// Per-layer filtering: the stdout fmt layer is gated by `RUST_LOG`
+/// (default `info`). The OTel layer is gated by the same directives plus
+/// an appended `tower_http=debug` so `TraceLayer`'s per-request spans
+/// reach the collector regardless of operator log level — the fmt layer
+/// still does not see those spans, so stdout stays at the configured
+/// noise floor.
 pub fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let log_directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     let pretty = std::env::var("RUST_LOG_PRETTY").is_ok() || cfg!(debug_assertions);
 
     let otel_layer = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -68,24 +75,35 @@ pub fn init_tracing() {
                 .build();
             let tracer = provider.tracer("peakload-capstone");
             opentelemetry::global::set_tracer_provider(provider);
-            tracing_opentelemetry::layer().with_tracer(tracer)
+            let otel_filter = EnvFilter::try_new(format!("{},tower_http=debug", log_directives))
+                .unwrap_or_else(|_| EnvFilter::new("info,tower_http=debug"));
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer)
+                .with_filter(otel_filter)
         });
 
-    let registry = tracing_subscriber::registry().with(filter).with(otel_layer);
+    let fmt_filter = EnvFilter::try_new(&log_directives).unwrap_or_else(|_| EnvFilter::new("info"));
 
     if pretty {
-        registry
+        tracing_subscriber::registry()
+            .with(otel_layer)
             .with(
                 tracing_subscriber::fmt::layer()
                     .compact()
                     .with_target(false)
                     .with_thread_ids(false)
-                    .with_thread_names(false),
+                    .with_thread_names(false)
+                    .with_filter(fmt_filter),
             )
             .init();
     } else {
-        registry
-            .with(tracing_subscriber::fmt::layer().json())
+        tracing_subscriber::registry()
+            .with(otel_layer)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_filter(fmt_filter),
+            )
             .init();
     }
 }
