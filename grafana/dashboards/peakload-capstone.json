@@ -70,7 +70,7 @@
     },
     {
       "title": "Response Time (p50 / p90 / p99)",
-      "description": "Worst-replica HTTP latency percentiles. Uses max() not avg() — averaging summary quantiles across replicas is mathematically invalid and hides tails.",
+      "description": "Fleet-aggregate HTTP request latency percentiles via histogram_quantile() over the cross-replica bucket sum. This is the correct way to combine histogram quantiles across replicas (summing buckets is associative; averaging quantiles is not).",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -81,17 +81,17 @@
       "targets": [
         {
           "expr": "histogram_quantile(0.5, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))",
-          "legendFormat": "p50 (worst replica)",
+          "legendFormat": "p50",
           "refId": "A"
         },
         {
           "expr": "histogram_quantile(0.9, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))",
-          "legendFormat": "p90 (worst replica)",
+          "legendFormat": "p90",
           "refId": "B"
         },
         {
           "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))",
-          "legendFormat": "p99 (worst replica)",
+          "legendFormat": "p99",
           "refId": "C"
         }
       ],
@@ -1110,7 +1110,6 @@
       }
     },
     {
-      "id": 9999,
       "type": "stat",
       "title": "Error budget remaining (30d)",
       "gridPos": {"h": 4, "w": 6, "x": 0, "y": 63},
