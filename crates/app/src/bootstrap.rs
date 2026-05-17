@@ -47,11 +47,16 @@ use shared_kernel::queue::producer::QueueProducer;
 /// unset, no OTLP pipeline runs and the subscriber behaves as above.
 ///
 /// Per-layer filtering: the stdout fmt layer is gated by `RUST_LOG`
-/// (default `info`). The OTel layer is gated by the same directives plus
-/// an appended `tower_http=debug` so `TraceLayer`'s per-request spans
-/// reach the collector regardless of operator log level — the fmt layer
-/// still does not see those spans, so stdout stays at the configured
-/// noise floor.
+/// (default `info`). The OTel layer is **decoupled** from `RUST_LOG` and
+/// uses a fixed `debug`-baseline policy (chatty infra targets quieted to
+/// `info`). Trace verbosity and stdout-log verbosity are independent
+/// concerns; additionally, an `EnvFilter` whose default directive is
+/// `info` does not reliably deliver dynamically-filtered spans to the
+/// `tracing-opentelemetry` layer (a `debug` default does — an `info`
+/// default fails even with the span's own target set to `=debug`), so a
+/// `debug` baseline is required for the OTel layer to export the
+/// per-request span. The fmt layer keeps the operator's `RUST_LOG`
+/// noise floor on stdout.
 pub fn init_tracing() {
     let log_directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     let pretty = std::env::var("RUST_LOG_PRETTY").is_ok() || cfg!(debug_assertions);
@@ -75,8 +80,11 @@ pub fn init_tracing() {
                 .build();
             let tracer = provider.tracer("peakload-capstone");
             opentelemetry::global::set_tracer_provider(provider);
-            let otel_filter = EnvFilter::try_new(format!("{},tower_http=debug", log_directives))
-                .unwrap_or_else(|_| EnvFilter::new("info,tower_http=debug"));
+            let otel_filter = EnvFilter::try_new(
+                "debug,sqlx=info,hyper=info,h2=info,tower=info,tonic=info,\
+                 tokio_util=info,opentelemetry=info,tonic::transport=info",
+            )
+            .expect("static otel trace filter");
             tracing_opentelemetry::layer()
                 .with_tracer(tracer)
                 .with_filter(otel_filter)
