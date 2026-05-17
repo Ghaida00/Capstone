@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tower::timeout::TimeoutLayer;
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
@@ -46,18 +46,22 @@ use shared_kernel::queue::producer::QueueProducer;
 /// attached as the `service.name` resource attribute. With the endpoint
 /// unset, no OTLP pipeline runs and the subscriber behaves as above.
 ///
-/// Layer composition: the stdout fmt layer is filtered by `RUST_LOG`
-/// (default `info`). The OTel layer is **unfiltered** — wrapping it in
-/// `Filtered<_,_>` (per-layer EnvFilter) prevents
-/// `tracing_opentelemetry::OpenTelemetrySpanExt::context()` from finding
-/// the OTel `WithContext` via subscriber downcast through the `Filtered`
-/// wrapper, which returns an empty `Context` and breaks
-/// `traceparent` injection at the publish boundary. Trace volume is
-/// controlled by the OTel SDK sampler and by where the app emits spans.
-/// The fmt layer keeps the operator's `RUST_LOG` noise floor on stdout.
+/// Filter composition: a single `EnvFilter` from `RUST_LOG` (default
+/// `info`) is applied as a Layer on the Registry. Both the OTel and fmt
+/// layers see only events that pass that filter — h2/hyper/sqlx DEBUG
+/// noise is dropped at the registry, never reaching the OTel hot path.
+/// The OTel layer is NOT wrapped in `Filtered<_,_>` (per-layer
+/// `.with_filter()`), because that wrapper hides the OTel layer's
+/// `WithContext` from `subscriber.downcast_ref::<WithContext>()`,
+/// breaking `tracing_opentelemetry::OpenTelemetrySpanExt::context()`
+/// at the publish boundary (traceparent injection silently writes
+/// nothing). This is the canonical `tracing-opentelemetry` pattern.
 pub fn init_tracing() {
     let log_directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     let pretty = std::env::var("RUST_LOG_PRETTY").is_ok() || cfg!(debug_assertions);
+
+    let global_filter =
+        EnvFilter::try_new(&log_directives).unwrap_or_else(|_| EnvFilter::new("info"));
 
     let otel_layer = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .ok()
@@ -81,28 +85,23 @@ pub fn init_tracing() {
             tracing_opentelemetry::layer().with_tracer(tracer)
         });
 
-    let fmt_filter = EnvFilter::try_new(&log_directives).unwrap_or_else(|_| EnvFilter::new("info"));
-
     if pretty {
         tracing_subscriber::registry()
+            .with(global_filter)
             .with(otel_layer)
             .with(
                 tracing_subscriber::fmt::layer()
                     .compact()
                     .with_target(false)
                     .with_thread_ids(false)
-                    .with_thread_names(false)
-                    .with_filter(fmt_filter),
+                    .with_thread_names(false),
             )
             .init();
     } else {
         tracing_subscriber::registry()
+            .with(global_filter)
             .with(otel_layer)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .json()
-                    .with_filter(fmt_filter),
-            )
+            .with(tracing_subscriber::fmt::layer().json())
             .init();
     }
 }
