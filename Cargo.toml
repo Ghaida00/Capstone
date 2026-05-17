@@ -56,7 +56,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
 # ── OpenTelemetry ──
 opentelemetry = "0.31.0"
 opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
-opentelemetry-stdout = { version = "0.31.0", features = ["trace"] }
+opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.32.1"
 
 # ── Prometheus ──

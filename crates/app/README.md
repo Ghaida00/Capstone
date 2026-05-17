@@ -94,6 +94,10 @@ never publishes any of its own.
   to exit promptly when it fires. If you add a new background task,
   thread the token through `init_infrastructure` rather than spawning
   with `tokio::spawn` directly.
-- **Tracing exporter is `stdout` by default.** To send traces to a
-  collector, swap `opentelemetry_stdout` for `opentelemetry-otlp` in
-  [`bootstrap.rs::init_tracing`](./src/bootstrap.rs).
+- **Tracing.** Structured JSON logs go to stdout via `tracing-subscriber`
+  (one event per line; `RUST_LOG_PRETTY=1` or `cargo run` falls back to
+  compact text). Spans are exported via OTLP/gRPC to the `otel-collector`
+  sidecar when `OTEL_EXPORTER_OTLP_ENDPOINT` is set — the compose stack
+  sets it to `http://otel-collector:4317`, so spans are visible in
+  `docker logs peakload-otel-collector`. Unset the env to disable the
+  OTel pipeline without code changes.

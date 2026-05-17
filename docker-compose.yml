@@ -330,6 +330,9 @@ services:
       # here only for experimentation.
       DB_WRITE_RETRY_MAX_ATTEMPTS: "6"
       DB_WRITE_RETRY_BACKOFF_MS: "200"
+      # ── OpenTelemetry ────────────────────────────────────
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_SERVICE_NAME: "peakload-capstone"
     expose:
       - "3000"
     depends_on:
@@ -348,6 +351,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      otel-collector:
+        condition: service_started
     healthcheck:
       test: [ "CMD", "/app/peakload-capstone", "--health-check" ]
       interval: 10s
@@ -861,6 +866,35 @@ services:
         limits:
           memory: 256M
           cpus: "0.5"
+
+  # ============================================================
+  # OpenTelemetry Collector — receives OTLP traces from app
+  # ============================================================
+  # Receives OTLP/gRPC on 4317; emits span detail to stdout via the
+  # debug exporter (verbosity: detailed). No persistent back-end in
+  # this stack — `docker logs peakload-otel-collector` is the
+  # observation surface. Scope is intentionally tight; swap the
+  # exporter for OTLP-HTTP → Tempo/Jaeger if persistence is needed.
+  # No healthcheck (image is upstream-distroless: no shell). App
+  # depends on `service_started`, mirroring the prometheus pattern.
+  # ============================================================
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.117.0
+    container_name: peakload-otel-collector
+    volumes:
+      - ./otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    expose:
+      - "4317"
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - peakload-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.3"
 
   # ============================================================
   # Grafana — Metrics Visualization

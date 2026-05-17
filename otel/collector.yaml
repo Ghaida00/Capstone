@@ -1,0 +1,25 @@
+# OTel Collector — Peakload Capstone
+#
+# Receives OTLP/gRPC from app instances, batches, and prints span detail
+# to stdout (visible via `docker logs peakload-otel-collector`). No
+# Jaeger/Tempo/persistent backend — the debug exporter is the
+# observation surface for this stack.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

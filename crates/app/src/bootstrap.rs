@@ -14,6 +14,12 @@ use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::Resource;
+
 use crate::config::Config;
 use crate::middleware::backpressure::BackpressureController;
 use crate::middleware::circuit_breaker::CircuitBreaker;
@@ -33,11 +39,39 @@ use shared_kernel::queue::producer::QueueProducer;
 /// preserved.
 /// Plain compact format is used when `RUST_LOG_PRETTY` is set or the binary
 /// is built with `debug_assertions` (i.e. `cargo run` / `cargo test`).
+///
+/// When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, an OTLP/gRPC batch span
+/// exporter is layered onto the subscriber and registered as the global
+/// tracer provider. `OTEL_SERVICE_NAME` (default `peakload-capstone`) is
+/// attached as the `service.name` resource attribute. With the endpoint
+/// unset, no OTLP pipeline runs and the subscriber behaves as above.
 pub fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
     let pretty = std::env::var("RUST_LOG_PRETTY").is_ok() || cfg!(debug_assertions);
-    let registry = tracing_subscriber::registry().with(filter);
+
+    let otel_layer = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .ok()
+        .map(|endpoint| {
+            let exporter = SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint)
+                .build()
+                .expect("OTLP SpanExporter build");
+            let service_name = std::env::var("OTEL_SERVICE_NAME")
+                .unwrap_or_else(|_| "peakload-capstone".to_string());
+            let resource = Resource::builder()
+                .with_attribute(KeyValue::new("service.name", service_name))
+                .build();
+            let provider = SdkTracerProvider::builder()
+                .with_batch_exporter(exporter)
+                .with_resource(resource)
+                .build();
+            let tracer = provider.tracer("peakload-capstone");
+            opentelemetry::global::set_tracer_provider(provider);
+            tracing_opentelemetry::layer().with_tracer(tracer)
+        });
+
+    let registry = tracing_subscriber::registry().with(filter).with(otel_layer);
 
     if pretty {
         registry
