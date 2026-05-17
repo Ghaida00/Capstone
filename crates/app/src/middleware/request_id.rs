@@ -7,11 +7,11 @@ use axum::{
 use uuid::Uuid;
 
 /// Middleware that extracts or generates a unique request ID and
-/// echoes it back on the response. Reads `X-Request-ID` from the
-/// inbound request (set by Nginx when present) or generates a
-/// UUID v4. The legacy v1 handlers used to read it from request
-/// extensions; the v2 modules don't, so the extension insert was
-/// dropped at the v1 cull.
+/// echoes it back on the response. Reads `X-Request-Id` from the
+/// inbound request (Nginx sets it when present) or generates a
+/// UUID v4. Records the id onto the current `http.request` span so
+/// generated ids — not just inbound ones — are correlatable in
+/// traces.
 pub async fn request_id_middleware(req: Request, next: Next) -> Response {
     let request_id = req
         .headers()
@@ -19,6 +19,8 @@ pub async fn request_id_middleware(req: Request, next: Next) -> Response {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    tracing::Span::current().record("request_id", request_id.as_str());
 
     let mut response = next.run(req).await;
 

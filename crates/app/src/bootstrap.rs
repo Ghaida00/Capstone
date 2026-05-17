@@ -511,7 +511,25 @@ pub fn build_router(
                     config.api_timeout_secs,
                 ))),
         )
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|req: &axum::http::Request<_>| {
+                    tracing::info_span!(
+                        "http.request",
+                        http.request.method = %req.method(),
+                        url.path = %req.uri().path(),
+                        request_id = tracing::field::Empty,
+                        http.response.status_code = tracing::field::Empty,
+                    )
+                })
+                .on_response(
+                    |res: &axum::http::Response<_>,
+                     _latency: std::time::Duration,
+                     span: &tracing::Span| {
+                        span.record("http.response.status_code", res.status().as_u16());
+                    },
+                ),
+        )
         .layer(cors)
 }
 
