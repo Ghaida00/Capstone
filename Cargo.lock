@@ -3276,6 +3276,8 @@ dependencies = [
  "deadpool-redis",
  "fnv",
  "metrics",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "proptest",
  "redis",
  "rust_decimal",
@@ -3287,6 +3289,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-opentelemetry",
  "url",
  "uuid",
 ]
@@ -4132,6 +4135,7 @@ dependencies = [
  "fnv",
  "metrics",
  "notifications",
+ "opentelemetry",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -4144,6 +4148,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-opentelemetry",
  "uuid",
 ]
 

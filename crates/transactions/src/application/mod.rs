@@ -353,7 +353,7 @@ impl TransactionService for TransactionsService {
         // consumer expects; the publish-outbox worker forwards
         // this JSONB column to the broker as-is.
         let request_id = input.request_id.clone().unwrap_or_default();
-        let outbox_payload = serde_json::json!({
+        let mut outbox_payload = serde_json::json!({
             "from_account":    input.from_account,
             "to_account":      input.to_account,
             "amount":          amount_str,
@@ -365,6 +365,12 @@ impl TransactionService for TransactionsService {
             "idempotency_key": idempotency_key,
             "request_hash":    request_hash,
         });
+        // `traceparent` travels with `request_id` so the consumer can
+        // parent its span under the originating HTTP request. Present
+        // only when the HTTP span had an OTel context.
+        if let Some(tp) = &input.traceparent {
+            outbox_payload["traceparent"] = serde_json::Value::String(tp.clone());
+        }
 
         // Reserve commits the response and the outbox payload in a
         // single Postgres transaction. After this returns

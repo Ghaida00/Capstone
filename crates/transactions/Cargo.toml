@@ -28,6 +28,8 @@ fnv = { workspace = true }
 sha2 = { workspace = true }
 
 tracing = { workspace = true }
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 metrics = { workspace = true }
 
 thiserror = { workspace = true }

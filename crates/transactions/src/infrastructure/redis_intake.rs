@@ -301,7 +301,11 @@ async fn process_one(
     //    pick the row up on its next IDLE_TICK rather than waiting
     //    `LEASE_SECS` for our stamp to age out — the PG row is
     //    durable, only the broker round-trip is missing.
-    if let Err(e) = queue.publish(&entry.outbox_payload).await {
+    let tp = entry
+        .outbox_payload
+        .get("traceparent")
+        .and_then(|v| v.as_str());
+    if let Err(e) = queue.publish_traced(&entry.outbox_payload, tp).await {
         tracing::warn!(
             shard = shard_idx,
             idempotency_key = %idempotency_key,

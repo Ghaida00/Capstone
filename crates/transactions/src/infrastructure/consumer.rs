@@ -38,6 +38,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use shared_kernel::db::shard::ShardRouter;
@@ -108,6 +109,13 @@ struct QueuePayload {
     description: Option<String>,
     #[serde(default)]
     request_id: String,
+    /// W3C `traceparent` also rides the JSON payload (it crosses the
+    /// storage hop there). The active parent context is reconstructed
+    /// from the AMQP headers in `consume`, so this field is accepted
+    /// for wire-shape completeness but not read directly.
+    #[serde(default)]
+    #[allow(dead_code)]
+    traceparent: Option<String>,
 }
 
 /// Per-batch ACK/NACK ledger returned by `flush_batch_to_shards`.
@@ -424,10 +432,28 @@ impl AsyncConsumer for BatchTransactionConsumer {
         &mut self,
         _channel: &amqprs::channel::Channel,
         deliver: Deliver,
-        _basic_properties: BasicProperties,
+        basic_properties: BasicProperties,
         content: Vec<u8>,
     ) {
         let delivery_tag = deliver.delivery_tag();
+
+        // Reconstruct the originating HTTP request's trace context
+        // from the AMQP headers (set by `publish_traced`) so this
+        // span is parented under it — one trace spans HTTP -> storage
+        // -> worker -> AMQP -> consumer. Absent header => a fresh
+        // (root) context, preserving prior behaviour.
+        let parent_cx = basic_properties
+            .headers()
+            .map(shared_kernel::queue::trace_propagation::extract_parent_context)
+            .unwrap_or_default();
+        let span = tracing::info_span!(
+            "amqp.consume",
+            messaging.system = "rabbitmq",
+            messaging.destination = %deliver.routing_key(),
+            request_id = tracing::field::Empty,
+        );
+        let _ = span.set_parent(parent_cx);
+        let _span_guard = span.enter();
 
         let payload: QueuePayload = match serde_json::from_slice(&content) {
             Ok(p) => p,
@@ -441,6 +467,8 @@ impl AsyncConsumer for BatchTransactionConsumer {
                 return;
             }
         };
+
+        tracing::Span::current().record("request_id", payload.request_id.as_str());
 
         // Defense-in-depth: the producer always supplies a
         // reference_id (UUID fallback). A NULL on the wire would

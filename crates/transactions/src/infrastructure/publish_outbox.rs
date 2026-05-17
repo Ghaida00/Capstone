@@ -207,7 +207,11 @@ async fn drain_once(
     // publish failure leaves the row's `claimed_at` stamped;
     // re-claim resumes naturally after `LEASE_SECS`.
     for row in rows {
-        match queue.publish(&row.outbox_payload).await {
+        let tp = row
+            .outbox_payload
+            .get("traceparent")
+            .and_then(|v| v.as_str());
+        match queue.publish_traced(&row.outbox_payload, tp).await {
             Ok(()) => {
                 sqlx::query(
                     "UPDATE idempotency_keys

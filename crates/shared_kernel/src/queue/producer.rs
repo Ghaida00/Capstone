@@ -310,12 +310,32 @@ impl QueueProducer {
     /// transient errors / NACKs / timeouts; mandatory=true catches
     /// unrouteable messages.
     pub async fn publish<T: Serialize>(&self, message: &T) -> Result<(), AppError> {
+        self.publish_traced(message, None).await
+    }
+
+    /// `publish` with an optional W3C `traceparent` lifted into the
+    /// AMQP message headers so the consumer can reconstruct the
+    /// originating HTTP request's trace context. Behaviour is
+    /// identical to `publish` apart from the added header; the
+    /// dedupe / batching / ACK / shard-routing contract is unchanged.
+    pub async fn publish_traced<T: Serialize>(
+        &self,
+        message: &T,
+        traceparent: Option<&str>,
+    ) -> Result<(), AppError> {
         let payload = serde_json::to_vec(message)?;
 
-        let properties = BasicProperties::default()
-            .with_content_type("application/json")
-            .with_delivery_mode(2)
-            .finish();
+        let properties = {
+            let mut p = BasicProperties::default();
+            p.with_content_type("application/json")
+                .with_delivery_mode(2);
+            if let Some(tp) = traceparent {
+                let mut ft = amqprs::FieldTable::new();
+                crate::queue::trace_propagation::inject_traceparent(&mut ft, tp);
+                p.with_headers(ft);
+            }
+            p.finish()
+        };
 
         let mut args = BasicPublishArguments::new(EXCHANGE_NAME, ROUTING_KEY);
         args.mandatory = true;

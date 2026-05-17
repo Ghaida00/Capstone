@@ -43,6 +43,10 @@ pub struct CreateTransactionInput {
     pub description: Option<String>,
     /// Carried through for tracing — not used by domain logic.
     pub request_id: Option<String>,
+    /// W3C `traceparent` of the originating HTTP span. Rides the
+    /// outbox payload so the consumer can parent its span under the
+    /// HTTP request. Not used by domain logic.
+    pub traceparent: Option<String>,
 }
 
 /// What the create use case returns. Mirrors the legacy

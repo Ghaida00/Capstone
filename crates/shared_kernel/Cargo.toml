@@ -42,6 +42,11 @@ url = { workspace = true }
 # Logging
 tracing = { workspace = true }
 
+# OpenTelemetry — W3C trace-context propagation across the AMQP boundary
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
 # Metrics (failover counters live in db/)
 metrics = { workspace = true }
 
