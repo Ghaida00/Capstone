@@ -345,6 +345,8 @@ services:
       #   condition: service_healthy
       db-bootstrap-schema:
         condition: service_completed_successfully
+      db-migrator:
+        condition: service_completed_successfully
       redis-master:
         condition: service_healthy
       redis-sentinel-1:
@@ -724,6 +726,50 @@ services:
         limits:
           memory: 64M
           cpus: "0.1"
+
+  # ============================================================
+  # DB migrator — one-shot sqlx::migrate! runner (D-7)
+  # ============================================================
+  # Runs the existing app image with `--migrate`, which connects
+  # directly to each shard primary via HAProxy (NOT pgBouncer —
+  # pgBouncer's transaction-pool mode rejects the startup options
+  # the connection-level lock_timeout/statement_timeout overrides
+  # would need; and the bypass also avoids racing the two app
+  # instances over the ACCESS EXCLUSIVE lock). Migrations are
+  # idempotent (`IF NOT EXISTS` everywhere); re-runs are no-ops
+  # recorded in `_sqlx_migrations`.
+  #
+  # Gated on `db-bootstrap-schema` (the baseline init.sql must
+  # exist first) and on `pg-haproxy: service_healthy` so the
+  # primary route is up. The app's `depends_on` waits on this
+  # service `service_completed_successfully` so the app cannot
+  # boot against an un-migrated schema.
+  # ============================================================
+  db-migrator:
+    image: peakload-app
+    container_name: peakload-db-migrator
+    command: ["/app/peakload-capstone", "--migrate"]
+    environment:
+      # Direct-to-primary URLs via HAProxy ports (5000=shard0, 5001=shard1).
+      # Uses the superuser so DDL (ALTER TABLE, CREATE INDEX) is permitted.
+      MIGRATE_SHARD_URLS: "postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@pg-haproxy:5000/${POSTGRES_DB:?},postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@pg-haproxy:5001/${POSTGRES_DB:?}"
+      # The migrator only needs sqlx + dotenv; suppress noisy app-startup
+      # env to keep the log output focused on migration progress.
+      RUST_LOG: "info,sqlx::query=warn"
+    depends_on:
+      pg-haproxy:
+        condition: service_healthy
+      db-bootstrap-schema:
+        condition: service_completed_successfully
+    restart: "no"
+    logging: *default-logging
+    networks:
+      - peakload-network
+    deploy:
+      resources:
+        limits:
+          memory: 96M
+          cpus: "0.2"
 
   # ============================================================
   # Redis HA — Master + Replica + Sentinel

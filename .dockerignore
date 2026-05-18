@@ -33,6 +33,11 @@ Makefile
 # Orchestration & infra configs (not needed for the Rust binary build context;
 # each one has its own build/mount path in docker-compose.yml).
 db/
+# Except db/migrations/ — embedded into the binary at compile time by the
+# `sqlx::migrate!` macro for the --migrate one-shot mode (D-7). The bulk
+# init.sql seed file stays excluded (mounted via db-bootstrap-schema).
+!db/migrations/
+!db/migrations/**
 nginx/
 haproxy/
 redis/

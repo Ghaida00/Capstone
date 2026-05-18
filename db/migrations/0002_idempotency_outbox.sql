@@ -40,7 +40,11 @@ UPDATE idempotency_keys
        published_at = COALESCE(published_at, now())
  WHERE NOT published;
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_idempotency_keys_unpublished
+-- `CONCURRENTLY` omitted: incompatible with the default `sqlx::migrate!`
+-- transaction wrap. `IF NOT EXISTS` makes the statement a no-op on a
+-- cluster where `init.sql` already provisioned the index, so the brief
+-- `AccessExclusiveLock` is acceptable here.
+CREATE INDEX IF NOT EXISTS idx_idempotency_keys_unpublished
     ON idempotency_keys (created_at)
     WHERE NOT published;
 
