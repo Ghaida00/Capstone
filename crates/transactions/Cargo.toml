@@ -39,3 +39,6 @@ notifications = { path = "../notifications" }
 axum-test = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+
+[lints]
+workspace = true

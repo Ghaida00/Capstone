@@ -82,3 +82,21 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# A-4: workspace-wide lint policy. Each crate opts in via
+# `[lints]\nworkspace = true`. Conservative high-signal set —
+# pedantic-grade lints (`clippy::pedantic = "warn"`) intentionally
+# NOT enabled here; they would produce ~100s of warnings on
+# existing code and need a separate clean-up sweep. Ratchet up
+# incrementally as the codebase is cleaned.
+[workspace.lints.rust]
+# 0 unsafe blocks in workspace today (grep-verified) — lock it.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Real-bug lints, not style.
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+let_underscore_future = "warn"
+mutex_atomic = "warn"
+result_large_err = "warn"
