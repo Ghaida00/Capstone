@@ -397,7 +397,11 @@ fn record_batch_metrics(report: &FlushReport) {
     let acked = report.ack_count();
     if acked > 0 {
         metrics::counter!("transactions_processed_total").increment(acked as u64);
-        metrics::histogram!("transactions_batch_size").record(acked as f64);
+        // transactions_batch_size moved to flush_batch_to_shards
+        // (O-10): it now carries a `shard` label and is recorded
+        // per shard, so a summed/aggregate distribution is still
+        // recoverable in PromQL (`histogram_quantile` without the
+        // shard label) while a per-shard P95 also becomes plottable.
     }
     if !report.failed_tags.is_empty() {
         metrics::counter!("transactions_failed_total").increment(report.failed_tags.len() as u64);
@@ -589,6 +593,21 @@ async fn flush_batch_to_shards(batch: &[PendingMessage], router: &ShardRouter) -
                     failed_tags,
                     skipped_tags,
                 } = outcome;
+                // O-10: per-shard batch-size distribution. Recorded
+                // here (not in record_batch_metrics) because the
+                // aggregated FlushReport has already merged every
+                // shard's outcome — the `shard` label can only be
+                // attached while the per-shard ShardOutcome is still
+                // in hand. Ack count mirrors FlushReport::ack_count
+                // (completed + failed + skipped are all ACKed).
+                let shard_acked = completed.len() + failed_tags.len() + skipped_tags.len();
+                if shard_acked > 0 {
+                    metrics::histogram!(
+                        "transactions_batch_size",
+                        "shard" => sender_shard.to_string()
+                    )
+                    .record(shard_acked as f64);
+                }
                 report
                     .successful_tags
                     .extend(completed.iter().map(|m| m.delivery_tag));
@@ -607,6 +626,19 @@ async fn flush_batch_to_shards(batch: &[PendingMessage], router: &ShardRouter) -
                 let pool = router.writer(sender_shard).clone();
                 let split =
                     process_messages_individually(&pool, sender_shard, &messages, router).await;
+                // O-10: poison-fallback path still ACKs the
+                // completed/failed/skipped split — record its
+                // per-shard size too so the histogram is not
+                // silently missing the fallback batches.
+                let split_acked =
+                    split.completed.len() + split.failed_tags.len() + split.skipped_tags.len();
+                if split_acked > 0 {
+                    metrics::histogram!(
+                        "transactions_batch_size",
+                        "shard" => sender_shard.to_string()
+                    )
+                    .record(split_acked as f64);
+                }
                 report
                     .successful_tags
                     .extend(split.completed.iter().map(|m| m.delivery_tag));

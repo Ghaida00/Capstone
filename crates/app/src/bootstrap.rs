@@ -143,7 +143,10 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics::describe_gauge!("circuit_breaker_state", "Circuit breaker state");
     metrics::describe_counter!("idempotency_hits_total", "Idempotency hits");
     metrics::describe_counter!("rabbitmq_reconnections_total", "RabbitMQ reconnections");
-    metrics::describe_histogram!("transactions_batch_size", "Batch sizes");
+    metrics::describe_histogram!(
+        "transactions_batch_size",
+        "Per-shard consumer batch sizes (label `shard`: sender-shard index). ACK count per shard per flush (completed + failed + skipped). Aggregate distribution = histogram_quantile without the shard label; per-shard fault-domain view = by (shard) (O-10)."
+    );
     metrics::describe_counter!("dlq_messages_total", "Dead letter queue messages");
     metrics::describe_counter!(
         "transactions_list_tail_skew_dropped_total",
