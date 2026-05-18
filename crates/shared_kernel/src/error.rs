@@ -36,6 +36,14 @@ pub enum AppError {
     #[error("Service overloaded")]
     ServiceOverloaded,
 
+    /// A-2: Redis Sentinel resolution failure (all sentinels
+    /// unreachable / malformed reply / timeout). Consistent with
+    /// every other shared_kernel infra error being an `AppError`
+    /// variant — was `anyhow::Result` in two private helpers,
+    /// migrated for consistency.
+    #[error("Sentinel error: {0}")]
+    SentinelError(String),
+
     /// R-7: a specific upstream dependency's per-dependency
     /// breaker is open. Distinct from `CircuitBreakerOpen` (the
     /// coarse HTTP-edge breaker) — this names WHICH dependency
@@ -107,6 +115,14 @@ impl IntoResponse for AppError {
                     StatusCode::SERVICE_UNAVAILABLE,
                     "dependency_down",
                     format!("Dependency '{name}' is temporarily unavailable, please retry"),
+                )
+            }
+            AppError::SentinelError(msg) => {
+                tracing::error!(error = %msg, "Sentinel error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "sentinel_error",
+                    "Redis Sentinel resolution failed".to_string(),
                 )
             }
             AppError::Internal(msg) => {

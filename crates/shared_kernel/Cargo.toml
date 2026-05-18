@@ -52,7 +52,11 @@ metrics = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
-anyhow = { workspace = true }
+# A-2: anyhow removed — the two Sentinel helpers that used it now
+# return Result<_, AppError>. anyhow stays a workspace dep for the
+# binary's anyhow::Result<()> at the app::run boundary, but no
+# library crate depends on it. `thiserror` for libraries, `anyhow`
+# for applications — community convention.
 
 [dev-dependencies]
 proptest = { workspace = true }

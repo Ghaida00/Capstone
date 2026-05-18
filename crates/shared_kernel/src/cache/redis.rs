@@ -111,12 +111,12 @@ impl RedisCache {
         // ignore `config.master_url`; otherwise use the URL directly.
         let (initial_write_url, sentinel) = if !config.sentinel_nodes.is_empty() {
             let master_password = parse_password_from_url(&config.master_url);
+            // A-2: error is already AppError::SentinelError after the
+            // anyhow → AppError migration; propagate it directly
+            // rather than wrapping it in Internal.
             let master_addr =
                 resolve_master_via_sentinel(&config.sentinel_nodes, &config.sentinel_master_name)
-                    .await
-                    .map_err(|e| {
-                        AppError::Internal(format!("Sentinel master resolution failed: {}", e))
-                    })?;
+                    .await?;
             let url = build_redis_url(&master_addr, master_password.as_deref());
             tracing::info!(master = %master_addr, "Resolved Redis master via Sentinel");
 
@@ -471,7 +471,7 @@ fn build_pool(url: &str, pool_size: usize) -> Result<Pool, AppError> {
 async fn resolve_master_via_sentinel(
     sentinel_urls: &[String],
     master_name: &str,
-) -> anyhow::Result<String> {
+) -> Result<String, AppError> {
     let mut last_err: Option<String> = None;
     for url in sentinel_urls {
         match query_one_sentinel(url, master_name).await {
@@ -481,19 +481,22 @@ async fn resolve_master_via_sentinel(
             }
         }
     }
-    Err(anyhow::anyhow!(
+    Err(AppError::SentinelError(format!(
         "All sentinels failed: {}",
         last_err.unwrap_or_else(|| "no sentinels configured".into())
-    ))
+    )))
 }
 
-async fn query_one_sentinel(url: &str, master_name: &str) -> anyhow::Result<String> {
+async fn query_one_sentinel(url: &str, master_name: &str) -> Result<String, AppError> {
+    // `redis::Client::open` -> Result<_, RedisError>: From<RedisError>
+    // already exists on AppError, so `?` does the work.
     let client = ::redis::Client::open(url)?;
     let mut conn = tokio::time::timeout(
         Duration::from_secs(2),
         client.get_multiplexed_async_connection(),
     )
-    .await??;
+    .await
+    .map_err(|_| AppError::SentinelError(format!("connect timeout to {url}")))??;
 
     let result: Vec<String> = tokio::time::timeout(
         Duration::from_secs(2),
@@ -502,10 +505,15 @@ async fn query_one_sentinel(url: &str, master_name: &str) -> anyhow::Result<Stri
             .arg(master_name)
             .query_async(&mut conn),
     )
-    .await??;
+    .await
+    .map_err(|_| {
+        AppError::SentinelError(format!("SENTINEL command timeout for {master_name}"))
+    })??;
 
     if result.len() < 2 {
-        anyhow::bail!("Sentinel returned malformed reply for {}", master_name);
+        return Err(AppError::SentinelError(format!(
+            "Sentinel returned malformed reply for {master_name}"
+        )));
     }
     Ok(format!("{}:{}", result[0], result[1]))
 }
