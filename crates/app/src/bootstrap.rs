@@ -157,6 +157,14 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
         "dependency_breaker_trips_total",
         "R-7 per-dependency breaker open transitions (label `dep`). Each increment = that upstream's error class crossed the failure threshold (or a half-open probe failed) and calls now fail fast with 503 + Retry-After until the recovery timeout."
     );
+    metrics::describe_counter!(
+        "background_task_panics_total",
+        "A-3 background-task panic count (label `task`: which background spawn class panicked). Increments under panic=unwind when a JoinSet-tracked task panics — previously such panics were observed only by the default panic hook (silent). Alert on any non-zero rate."
+    );
+    metrics::describe_counter!(
+        "idempotency_cache_set_attempts_total",
+        "A-3 idempotency cache-set attempts (one per replay-write attempt; failures are tolerated by design — the next replay re-populates from the DB)."
+    );
     metrics::describe_counter!("idempotency_hits_total", "Idempotency hits");
     metrics::describe_counter!("rabbitmq_reconnections_total", "RabbitMQ reconnections");
     metrics::describe_histogram!(

@@ -401,10 +401,24 @@ impl SqlxIdempotencyWriter {
     /// round-trip earlier. A dropped SET is not a correctness
     /// issue: the next replay falls through to the DB SELECT and
     /// repopulates from there.
+    ///
+    /// A-3: lower-stakes than the consumer size-flush spawn (no
+    /// ACK durability hinges on it), so the lighter wrapper is
+    /// sufficient — a `tracing::Instrument` span carries task
+    /// identity through panics, and the attempt counter makes the
+    /// path observable on the cache-write panel even when every
+    /// SET succeeds. JoinSet wrap unnecessary because the result
+    /// of the spawn does not influence any external state the
+    /// caller awaits.
     fn spawn_cache_set(cache: RedisCache, key: String, entry: IdempotencyCacheEntry) {
-        tokio::spawn(async move {
-            let _ = cache.set(&key, &entry, IDEMPOTENCY_TTL_SECS).await;
-        });
+        use tracing::Instrument;
+        tokio::spawn(
+            async move {
+                metrics::counter!("idempotency_cache_set_attempts_total").increment(1);
+                let _ = cache.set(&key, &entry, IDEMPOTENCY_TTL_SECS).await;
+            }
+            .instrument(tracing::info_span!("idempotency_cache_set")),
+        );
     }
 }
 

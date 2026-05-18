@@ -36,7 +36,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
@@ -251,6 +251,7 @@ pub async fn start_consumer(
         buffer: Arc::new(Mutex::new(Vec::with_capacity(BATCH_SIZE))),
         channel: shared_channel.clone(),
         events: events.clone(),
+        spawned: Arc::new(Mutex::new(JoinSet::new())),
     };
 
     // Spawn flush timer — respects the cancellation token, drains
@@ -428,6 +429,15 @@ struct BatchTransactionConsumer {
     /// row so subscribers (`notifications`, future `analytics`) can
     /// react without coupling to this module.
     events: Arc<dyn EventPublisher>,
+    /// A-3: holds the JoinHandles of size-flush tasks the consumer
+    /// fires off. `consume()` cannot await flush directly (amqprs
+    /// serialises the per-consumer call, so awaiting would wedge
+    /// the AMQP read loop) — but dropping the JoinHandle silently
+    /// loses panic observability and gives the orchestrator no
+    /// way to know about leaked work. The JoinSet keeps panics
+    /// visible (`background_task_panics_total`) and lets shutdown
+    /// drain by `join_all`-ing.
+    spawned: Arc<Mutex<JoinSet<()>>>,
 }
 
 #[async_trait]
@@ -534,12 +544,33 @@ impl AsyncConsumer for BatchTransactionConsumer {
             let router = self.shard_router.clone();
             let channel = self.channel.clone();
             let events = self.events.clone();
-            tokio::spawn(async move {
+            // A-3: track every size-flush spawn in the JoinSet so a
+            // panic is observable (counter + log) rather than
+            // silently dropped by the default panic hook. Drain
+            // completed tasks each call so the JoinSet does not
+            // grow unbounded.
+            let mut spawned = self.spawned.lock().await;
+            spawned.spawn(async move {
                 let report = flush_batch_to_shards(&batch, &router).await;
                 apply_acks(&channel, &report, "size-flush").await;
                 record_batch_metrics(&report);
                 publish_committed_events(&report.successful, &events);
             });
+            while let Some(res) = spawned.try_join_next() {
+                if let Err(e) = res {
+                    if e.is_panic() {
+                        metrics::counter!(
+                            "background_task_panics_total",
+                            "task" => "consumer_size_flush"
+                        )
+                        .increment(1);
+                        tracing::error!(
+                            error = ?e,
+                            "consumer size-flush task panicked (A-3 made this observable)"
+                        );
+                    }
+                }
+            }
         }
         // No individual ACK here — messages stay unacknowledged
         // until the batch is flushed (either by size threshold above
