@@ -80,8 +80,30 @@ testcontainers-modules = { version = "0.15.0", features = ["postgres", "redis"] 
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
-strip = true
+# A-5: panic = "unwind" (the Rust default, made explicit). Task
+# panics surface as `JoinError::is_panic()` instead of aborting
+# the process — the consumer's existing JoinError requeue branch
+# at consumer.rs (process_shard_batch) is now LIVE code rather
+# than dead-under-abort. A panicking spawned task kills only
+# that task; the orchestrator keeps serving.
+panic = "unwind"
+# A-5: line-tables-only carries function names + line numbers
+# in backtraces at ~5% binary-size cost. A coredump or
+# JoinError::is_panic() reaches operators with named frames
+# instead of bare addresses. For image-size-sensitive builds
+# use `--profile release-stripped` below.
+debug = "line-tables-only"
+strip = "none"
+
+# A-5: image-size-optimised variant — same codegen as release,
+# but strips symbols. Use for the runtime container layer when
+# binary size is the constraint; use `release` (above) for any
+# build where backtrace quality matters (single-tenant on-call
+# testing, local development).
+[profile.release-stripped]
+inherits = "release"
+debug = false
+strip = "symbols"
 
 # A-4: workspace-wide lint policy. Each crate opts in via
 # `[lints]\nworkspace = true`. Conservative high-signal set —
