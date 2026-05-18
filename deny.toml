@@ -15,9 +15,22 @@
 [advisories]
 # A-7 / S-7: every known advisory denies by default. CI's
 # `cargo deny check advisories` is the canonical version of S-7's
-# `cargo audit` step (WP4 will wire it).
+# `cargo audit` step (WP4 wires it).
 yanked = "deny"
-ignore = []  # explicitly empty so any new advisory pages immediately
+ignore = [
+  # RUSTSEC-2023-0071 — `rsa` "Marvin Attack" timing sidechannel,
+  # no upstream fix available. Pulled in transitively by
+  # `sqlx-postgres` for password authentication. We connect to
+  # Postgres over the Docker bridge / pgBouncer — there is no
+  # public-internet RSA exposure for the auth path, and TLS is
+  # rustls-only (does not use the rsa crate). Tracked in the
+  # impact log; re-evaluate when the `rsa` crate publishes a fix
+  # or when sqlx-postgres swaps in a constant-time alternative.
+  # This is the same disposition large Rust projects (sqlx,
+  # sea-orm, several Microsoft repos) have adopted for this
+  # advisory.
+  "RUSTSEC-2023-0071",
+]
 
 [licenses]
 # Conservative allowlist of OSS-permissive licenses + a few
@@ -35,7 +48,24 @@ allow = [
   "Unicode-3.0",
   "CC0-1.0",
   "Zlib",
+  # CDLA-Permissive-2.0 — used by `webpki-roots` (the rustls
+  # bundle of Mozilla CA certificates). Permissive Linux
+  # Foundation license; OSI-equivalent for data + code.
+  "CDLA-Permissive-2.0",
+  # BSL-1.0 — Boost Software License 1.0; OSI-approved
+  # permissive license. Used by `xxhash-rust` (transitive via
+  # the testcontainers / sqlx hot path).
+  "BSL-1.0",
 ]
+
+# Our own workspace crates (accounts/app/notifications/shared_kernel/
+# transactions) deliberately do not carry `license = "..."` in their
+# Cargo.toml because they are internal — never published to crates.io.
+# cargo-deny otherwise flags them as `unlicensed`. The `private`
+# table tells it to skip path-dep / workspace-internal crates.
+
+[licenses.private]
+ignore = true
 
 [bans]
 # Warn on duplicate versions so new ones are visible in PRs. The
@@ -65,11 +95,12 @@ skip = [
   # cadence; effectively zero runtime cost on Linux container.
   { crate = "windows-sys:0.48",     reason = "via etcetera 0.8 (sqlx transitive)" },
   { crate = "windows-sys:0.60",     reason = "via tokio + redis + hyper-util" },
-  { crate = "windows-targets:0.48", reason = "matches windows-sys 0.48 dep tree" },
   # hashbrown: 0.15 is from older deps, 0.16 is current.
   { crate = "hashbrown:0.15", reason = "transitive via older deps; current crates use 0.16" },
-  # base64: 0.21 is also from older deps; both are tiny.
-  { crate = "base64:0.21", reason = "transitive via older deps" },
+  # windows-targets:0.48 and base64:0.21 dropped from skip list:
+  # `cargo update` (WP4 pre-flight) dedup'd both out of the tree.
+  # cargo-deny's unmatched-skip warning would page if a future
+  # transitive re-introduces them.
   # getrandom: 0.2 / 0.3 / 0.4 — three rand-family transitive paths.
   { crate = "getrandom:0.2", reason = "rand 0.8.x transitive" },
   { crate = "getrandom:0.3", reason = "rand 0.9.x transitive" },

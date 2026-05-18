@@ -3,6 +3,9 @@ name = "shared_kernel"
 version = "0.1.0"
 edition = "2021"
 description = "Cross-cutting infrastructure (DB, cache, queue, errors, events) shared by every business module."
+# Internal workspace crate — never published. Marks this for
+# cargo-deny's `[licenses.private] ignore = true` rule (WP4).
+publish = false
 
 [lib]
 path = "src/lib.rs"
