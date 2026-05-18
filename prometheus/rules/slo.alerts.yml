@@ -91,3 +91,18 @@ groups:
           severity: page
         annotations:
           summary: "Rate-limiter Redis sync failing (kind={{ $labels.kind }}): global ceiling degraded to per-replica (effective limit = N x per_replica). Edge limiter is the backstop; investigate Redis/Sentinel."
+
+  # R-9: degradation posture. Usually operator-initiated (a
+  # maintenance/incident read-only window) so this is a ticket,
+  # not a page — but it MUST be visible: a degraded mode left on
+  # by accident silently 503s every write. for=5m rides out a
+  # brief deliberate flip during a controlled procedure.
+  - name: peakload-degradation
+    rules:
+      - alert: PeakloadDegradationModeActive
+        expr: max(degradation_mode) > 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Degradation mode active (writes are being 503'd). If this was not a deliberate maintenance window, an operator flip leaked — GET /api/v2/admin/degradation to inspect, PUT mode=normal to clear."

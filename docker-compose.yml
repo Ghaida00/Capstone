@@ -345,6 +345,11 @@ services:
       # here only for experimentation.
       DB_WRITE_RETRY_MAX_ATTEMPTS: "6"
       DB_WRITE_RETRY_BACKOFF_MS: "200"
+      # ── R-9: degradation posture seed ────────────────────
+      # Safe default = normal. Flip a maintenance window by
+      # exporting DEGRADATION_MODE=read_only before `up`, or
+      # (preferred, no restart) PUT /api/v2/admin/degradation.
+      DEGRADATION_MODE: "${DEGRADATION_MODE:-normal}"
       # ── OpenTelemetry ────────────────────────────────────
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
       OTEL_SERVICE_NAME: "peakload-capstone"

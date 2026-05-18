@@ -15,6 +15,7 @@ mod admin;
 mod app;
 mod bootstrap;
 mod config;
+mod degradation;
 mod health;
 mod middleware;
 
@@ -33,6 +34,10 @@ pub struct AppState {
     pub cache: RedisCache,
     pub queue_producer: QueueProducer,
     pub metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    /// R-9: operator-controlled degradation posture. Cloned into
+    /// the write-path middleware and read/written by the admin
+    /// `/api/v2/admin/degradation` endpoints.
+    pub degradation: degradation::DegradationFlag,
 }
 
 #[tokio::main]

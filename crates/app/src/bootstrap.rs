@@ -145,6 +145,10 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics::describe_counter!("backpressure_shed_total", "Backpressure shed requests");
     metrics::describe_gauge!("backpressure_in_flight", "In-flight requests");
     metrics::describe_gauge!("circuit_breaker_state", "Circuit breaker state");
+    metrics::describe_gauge!(
+        "degradation_mode",
+        "R-9 operator-controlled degradation posture: 0 normal, 1 read_only (writes 503'd, reads served), 2 essential_only. Monotonic in severity — alert on > 0."
+    );
     metrics::describe_counter!("idempotency_hits_total", "Idempotency hits");
     metrics::describe_counter!("rabbitmq_reconnections_total", "RabbitMQ reconnections");
     metrics::describe_histogram!(
@@ -444,6 +448,12 @@ pub fn build_router(
     // policy does not silently relax the admin gate.
     let auth_state_admin = auth_state.clone();
 
+    // R-9: the degradation flag is shared by the write-path
+    // middleware (every v2 sub-router) and the admin flip
+    // endpoints (via AppState). Clone the handle out before the
+    // sub-routers consume `state`.
+    let degradation = state.degradation.clone();
+
     // Fix #10: Build CORS layer from configuration
     let cors = build_cors_layer(config);
 
@@ -462,6 +472,7 @@ pub fn build_router(
         rate_limiter.clone(),
         circuit_breaker.clone(),
         backpressure.clone(),
+        degradation.clone(),
     );
 
     // Phase 2: transactions module wired with the cross-module
@@ -481,6 +492,7 @@ pub fn build_router(
         rate_limiter.clone(),
         circuit_breaker.clone(),
         backpressure.clone(),
+        degradation.clone(),
     );
 
     // ─── Phase 3 modular-monolith: mount `/api/v2/notifications/*` ───
@@ -502,6 +514,7 @@ pub fn build_router(
         rate_limiter,
         circuit_breaker,
         backpressure,
+        degradation,
     );
 
     // `nest_service` (rather than `nest`) because each module
@@ -602,6 +615,7 @@ fn apply_protection_stack<S>(
     rate_limiter: RateLimiter,
     circuit_breaker: CircuitBreaker,
     backpressure: BackpressureController,
+    degradation: crate::degradation::DegradationFlag,
 ) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -609,6 +623,14 @@ where
     router
         .layer(axum_middleware::from_fn(
             crate::middleware::metrics::metrics_middleware,
+        ))
+        // R-9: write-path degradation gate. Placed just inside the
+        // metrics layer so a degraded-mode 503 is still RED-counted,
+        // but outside auth/rate-limit/breaker so a read-only window
+        // sheds writes before they consume any of those budgets.
+        .layer(axum_middleware::from_fn_with_state(
+            degradation,
+            crate::degradation::degradation_middleware,
         ))
         .layer(axum_middleware::from_fn_with_state(
             auth_state,

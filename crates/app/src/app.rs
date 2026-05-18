@@ -47,11 +47,20 @@ impl App {
         // Fix #16: pass cancel token so rate limiter tasks can shut down
         let infra = bootstrap::init_infrastructure(&config, cancel.child_token()).await?;
 
+        // R-9: seed the degradation posture from validated config
+        // (validate() above already rejected an unrecognised value,
+        // so the unwrap_or is unreachable defence-in-depth).
+        let degradation = crate::degradation::DegradationFlag::new(
+            crate::degradation::DegradationMode::parse(&config.degradation_mode)
+                .unwrap_or(crate::degradation::DegradationMode::Normal),
+        );
+
         let state = AppState {
             shard_router: infra.shard_router,
             cache: infra.cache,
             queue_producer: infra.queue_producer,
             metrics_handle,
+            degradation,
         };
 
         // Single in-process bus, two trait-object views handed

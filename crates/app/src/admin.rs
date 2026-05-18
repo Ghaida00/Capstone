@@ -42,6 +42,41 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/outbox", get(list_outbox))
         .route("/stuck-transactions", get(list_stuck_transactions))
+        .route(
+            "/degradation",
+            get(get_degradation).put(put_degradation),
+        )
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetDegradationBody {
+    /// `normal` | `read_only` | `essential_only`.
+    pub mode: String,
+}
+
+/// R-9: read the current degradation posture. Gauge-equivalent in
+/// JSON form for an operator who is on the box, not in Grafana.
+async fn get_degradation(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "mode": state.degradation.mode().as_str() }))
+}
+
+/// R-9: flip the degradation posture at runtime (no restart).
+/// Admin-gated by `require_admin_middleware` at mount time.
+async fn put_degradation(
+    State(state): State<AppState>,
+    Json(body): Json<SetDegradationBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let mode = crate::degradation::DegradationMode::parse(&body.mode).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_mode",
+                "message": "mode must be one of: normal | read_only | essential_only",
+            })),
+        )
+    })?;
+    let set = state.degradation.set(mode);
+    Ok(Json(serde_json::json!({ "mode": set.as_str() })))
 }
 
 #[derive(Debug, Deserialize)]

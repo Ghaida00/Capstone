@@ -68,6 +68,11 @@ pub struct Config {
     // CORS
     pub cors_allowed_origins: Vec<String>,
 
+    // R-9: startup degradation posture. One of normal |
+    // read_only | essential_only. Runtime-flippable via
+    // `PUT /api/v2/admin/degradation`; this is only the seed.
+    pub degradation_mode: String,
+
     // Authentication (disabled by default for load testing)
     pub enable_auth: bool,
     pub auth_secret: Option<String>,
@@ -285,6 +290,8 @@ impl Config {
 
             cors_allowed_origins: parse_csv_env("CORS_ALLOWED_ORIGINS", "*"),
 
+            degradation_mode: env_or("DEGRADATION_MODE", "normal"),
+
             enable_auth: env_or("ENABLE_AUTH", "false")
                 .parse()
                 .unwrap_or(false),
@@ -354,6 +361,16 @@ impl Config {
         ensure!(
             self.max_concurrent_requests >= 1,
             "MAX_CONCURRENT_REQUESTS must be >= 1"
+        );
+
+        // R-9: degradation posture must be a recognised value, or
+        // the process would silently fall back to Normal and an
+        // operator who set DEGRADATION_MODE=read_only for a
+        // maintenance window would be serving writes anyway.
+        ensure!(
+            crate::degradation::DegradationMode::parse(&self.degradation_mode).is_some(),
+            "DEGRADATION_MODE must be one of: normal | read_only | essential_only (got {:?})",
+            self.degradation_mode
         );
 
         // Rate limiting
@@ -469,6 +486,11 @@ impl fmt::Display for Config {
             "  cors_allowed_origins:         {:?}",
             self.cors_allowed_origins
         )?;
+        writeln!(
+            f,
+            "  degradation_mode:             {}",
+            self.degradation_mode
+        )?;
         writeln!(f, "  enable_auth:                  {}", self.enable_auth)?;
         writeln!(
             f,
@@ -568,6 +590,7 @@ mod tests {
             circuit_breaker_recovery_timeout_secs: 10,
             max_concurrent_requests: 20000,
             cors_allowed_origins: vec!["*".to_string()],
+            degradation_mode: "normal".to_string(),
             enable_auth: false,
             auth_secret: None,
             verify_from_account_exists: false,
