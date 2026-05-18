@@ -7,6 +7,16 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
+use crate::resilience::DependencyBreaker;
+
+/// R-7 Redis-breaker tuning. Threshold = 10 transient failures
+/// (covers a Sentinel-promotion blip without tripping — the app
+/// rebuilds the master pool within ~5 s per the
+/// `REDIS_SENTINEL_MONITOR_INTERVAL_SECS=5` default); recovery =
+/// 30 s. Hardcoded; promote to `RedisCacheConfig` when an operator
+/// actually wants to tune them.
+const REDIS_BREAKER_FAILURE_THRESHOLD: u32 = 10;
+const REDIS_BREAKER_RECOVERY_SECS: u64 = 30;
 
 /// Cache-key version prefix. Bump on incompatible struct shape
 /// changes so old cached entries miss instead of mis-deserialising.
@@ -47,6 +57,11 @@ pub struct RedisCache {
     read_pool: Pool,
     /// Sentinel settings; `Some(..)` enables background re-resolution.
     sentinel: Option<Arc<SentinelSettings>>,
+    /// R-7: single per-dependency breaker covering both pool
+    /// acquisition AND command execution (the two failure kinds R-6
+    /// surfaces as `rate_limiter_redis_sync_failures_total{kind=
+    /// pool_get|pipeline}`). Cloned with the cache (cheap Arc).
+    redis_breaker: DependencyBreaker,
 }
 
 /// Clonable handle to the Sentinel-aware Redis master pool.
@@ -133,10 +148,22 @@ impl RedisCache {
             "Redis cache pools initialized (read/write split)"
         );
 
+        let redis_breaker = DependencyBreaker::new(
+            "redis",
+            REDIS_BREAKER_FAILURE_THRESHOLD,
+            REDIS_BREAKER_RECOVERY_SECS,
+        );
+        tracing::info!(
+            redis_breaker_threshold = REDIS_BREAKER_FAILURE_THRESHOLD,
+            redis_breaker_recovery_secs = REDIS_BREAKER_RECOVERY_SECS,
+            "RedisCache initialized (R-7 redis breaker registered)"
+        );
+
         let cache = Self {
             write_pool: Arc::new(RwLock::new(write_pool)),
             read_pool,
             sentinel,
+            redis_breaker,
         };
 
         // Warm-up — non-fatal, tolerates temporary unavailability
@@ -223,15 +250,63 @@ impl RedisCache {
         });
     }
 
-    /// Get a read connection from the replica pool.
+    /// R-7: handle to the Redis dependency breaker.
+    pub fn breaker(&self) -> &DependencyBreaker {
+        &self.redis_breaker
+    }
+
+    /// R-7: fold a raw Redis command result into the breaker
+    /// accounting. A command success records success (clears the
+    /// failure tally); a command error counts as a dep failure
+    /// (the command got to the server and the server errored on
+    /// the network/connection layer, or the conn died mid-flight
+    /// — both are "redis is unhealthy" classes). Logic-shaped
+    /// `RedisError`s (WRONGTYPE etc.) are rare and operator-visible
+    /// — recording them is acceptable conservatism.
+    fn map_redis<T>(&self, res: Result<T, ::redis::RedisError>) -> Result<T, AppError> {
+        match res {
+            Ok(v) => {
+                self.redis_breaker.record_success();
+                Ok(v)
+            }
+            Err(e) => {
+                self.redis_breaker.record_failure();
+                Err(AppError::Redis(e))
+            }
+        }
+    }
+
+    /// Get a read connection from the replica pool. R-7: gated by
+    /// the breaker (fails fast on a known-down Redis with
+    /// `AppError::DependencyDown{name:"redis"}` → 503 + Retry-After)
+    /// and records pool-acquire failures as the dep's fault.
     async fn read_conn(&self) -> Result<Connection, AppError> {
-        self.read_pool.get().await.map_err(AppError::RedisPool)
+        if !self.redis_breaker.allow() {
+            return Err(AppError::DependencyDown { name: "redis" });
+        }
+        match self.read_pool.get().await {
+            Ok(c) => Ok(c),
+            Err(e) => {
+                self.redis_breaker.record_failure();
+                Err(AppError::RedisPool(e))
+            }
+        }
     }
 
     /// Get a write connection from the current master pool.
+    /// Breaker-gated and breaker-recording — see `read_conn`.
     async fn write_conn(&self) -> Result<Connection, AppError> {
+        if !self.redis_breaker.allow() {
+            return Err(AppError::DependencyDown { name: "redis" });
+        }
         let pool = self.write_pool.read().await.clone();
-        pool.get().await.map_err(AppError::RedisPool)
+        match pool.get().await {
+            Ok(c) => Ok(c),
+            Err(e) => {
+                self.redis_breaker.record_failure();
+                Err(AppError::RedisPool(e))
+            }
+        }
     }
 
     /// Get a cached value by key (reads from replica).
@@ -243,7 +318,7 @@ impl RedisCache {
     /// they cannot influence.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, AppError> {
         let mut conn = self.read_conn().await?;
-        let value: Option<String> = conn.get(key).await.map_err(AppError::Redis)?;
+        let value: Option<String> = self.map_redis(conn.get(key).await)?;
 
         match value {
             Some(json) => match serde_json::from_str(&json) {
@@ -271,17 +346,14 @@ impl RedisCache {
     ) -> Result<(), AppError> {
         let mut conn = self.write_conn().await?;
         let json = serde_json::to_string(value)?;
-        let _: () = conn
-            .set_ex(key, &json, ttl_secs)
-            .await
-            .map_err(AppError::Redis)?;
+        let _: () = self.map_redis(conn.set_ex(key, &json, ttl_secs).await)?;
         Ok(())
     }
 
     /// Delete a cached value (writes to master).
     pub async fn delete(&self, key: &str) -> Result<(), AppError> {
         let mut conn = self.write_conn().await?;
-        let _: () = conn.del(key).await.map_err(AppError::Redis)?;
+        let _: () = self.map_redis(conn.del(key).await)?;
         Ok(())
     }
 
@@ -296,22 +368,23 @@ impl RedisCache {
     ) -> Result<bool, AppError> {
         let json = serde_json::to_string(value)?;
         let mut conn = self.write_conn().await?;
-        let res: Option<String> = ::redis::cmd("SET")
-            .arg(key)
-            .arg(json)
-            .arg("NX")
-            .arg("EX")
-            .arg(ttl_secs)
-            .query_async(&mut *conn)
-            .await
-            .map_err(AppError::Redis)?;
+        let res: Option<String> = self.map_redis(
+            ::redis::cmd("SET")
+                .arg(key)
+                .arg(json)
+                .arg("NX")
+                .arg("EX")
+                .arg(ttl_secs)
+                .query_async(&mut *conn)
+                .await,
+        )?;
         Ok(res.is_some())
     }
 
     /// `LPUSH list value`. Returns the new list length.
     pub async fn lpush(&self, list: &str, value: &str) -> Result<i64, AppError> {
         let mut conn = self.write_conn().await?;
-        let len: i64 = conn.lpush(list, value).await.map_err(AppError::Redis)?;
+        let len: i64 = self.map_redis(conn.lpush(list, value).await)?;
         Ok(len)
     }
 
@@ -327,12 +400,13 @@ impl RedisCache {
         dst: &str,
     ) -> Result<Option<String>, AppError> {
         let mut conn = self.write_conn().await?;
-        let res: Option<String> = ::redis::cmd("RPOPLPUSH")
-            .arg(src)
-            .arg(dst)
-            .query_async(&mut *conn)
-            .await
-            .map_err(AppError::Redis)?;
+        let res: Option<String> = self.map_redis(
+            ::redis::cmd("RPOPLPUSH")
+                .arg(src)
+                .arg(dst)
+                .query_async(&mut *conn)
+                .await,
+        )?;
         Ok(res)
     }
 
@@ -341,10 +415,7 @@ impl RedisCache {
     /// match (left-to-right). Returns the number actually removed.
     pub async fn lrem(&self, list: &str, count: isize, value: &str) -> Result<i64, AppError> {
         let mut conn = self.write_conn().await?;
-        let removed: i64 = conn
-            .lrem(list, count, value)
-            .await
-            .map_err(AppError::Redis)?;
+        let removed: i64 = self.map_redis(conn.lrem(list, count, value).await)?;
         Ok(removed)
     }
 
@@ -357,23 +428,19 @@ impl RedisCache {
     /// miss" semantics.
     pub async fn get_master_raw(&self, key: &str) -> Result<Option<String>, AppError> {
         let mut conn = self.write_conn().await?;
-        let value: Option<String> = conn.get(key).await.map_err(AppError::Redis)?;
+        let value: Option<String> = self.map_redis(conn.get(key).await)?;
         Ok(value)
     }
 
     /// Check if Redis is healthy — pings BOTH master and replica pools.
     pub async fn health_check(&self) -> Result<bool, AppError> {
         let mut write_conn = self.write_conn().await?;
-        let write_result: String = ::redis::cmd("PING")
-            .query_async(&mut *write_conn)
-            .await
-            .map_err(AppError::Redis)?;
+        let write_result: String =
+            self.map_redis(::redis::cmd("PING").query_async(&mut *write_conn).await)?;
 
         let mut read_conn = self.read_conn().await?;
-        let read_result: String = ::redis::cmd("PING")
-            .query_async(&mut *read_conn)
-            .await
-            .map_err(AppError::Redis)?;
+        let read_result: String =
+            self.map_redis(::redis::cmd("PING").query_async(&mut *read_conn).await)?;
 
         Ok(write_result == "PONG" && read_result == "PONG")
     }
