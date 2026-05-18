@@ -22,4 +22,4 @@ pub(crate) mod domain;
 pub(crate) mod infrastructure;
 
 pub use api::router;
-pub use infrastructure::init;
+pub use infrastructure::{init, NotificationsDeps};
