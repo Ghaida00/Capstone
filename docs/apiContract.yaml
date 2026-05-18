@@ -162,11 +162,36 @@ components:
             rabbitmq:
               type: boolean
 
+  # S-8: securitySchemes declares the auth mechanism the runtime
+  # actually enforces (when ENABLE_AUTH=true) so the contract
+  # itself — not the Rust source — is the answer to "is this
+  # endpoint authenticated?".
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        HS256-signed JWT (S-1: algorithm pinned in the validator).
+        Required claims: `sub`, `exp`, `iss`, `aud` (S-2). Optional:
+        `nbf`, `role` (`role=admin` is required for `/api/v2/admin/*`).
+        Expected `iss` / `aud` are deploy-controlled via
+        `AUTH_EXPECTED_ISSUER` / `AUTH_EXPECTED_AUDIENCE`. Validator
+        leeway is `AUTH_LEEWAY_SECS` (30 s default).
+        See `crates/app/src/middleware/auth.rs`.
+
+# S-8: global default — every operation requires a bearer token
+# unless it overrides with `security: []` to be explicitly
+# anonymous (currently `/health` and `/metrics`).
+security:
+  - bearerAuth: []
+
 paths:
   /health:
     get:
       summary: Health Check
       description: Mengecek status kesehatan database, redis, dan rabbitmq di semua shard.
+      security: []  # S-8: explicitly anonymous — infrastructure probe
       responses:
         '200':
           description: OK
@@ -179,6 +204,7 @@ paths:
     get:
       summary: Prometheus Metrics
       description: Mengambil data metrik internal aplikasi untuk dimonitor oleh Prometheus.
+      security: []  # S-8: explicitly anonymous — Prometheus scrape endpoint
       responses:
         '200':
           description: OK
