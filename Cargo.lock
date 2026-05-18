@@ -3268,7 +3268,6 @@ name = "shared_kernel"
 version = "0.1.0"
 dependencies = [
  "amqprs",
- "anyhow",
  "async-trait",
  "axum",
  "bigdecimal",
