@@ -1,27 +1,33 @@
 //! RabbitMQ batch consumer for the `transactions` write path.
 //!
-//! Phase-2 follow-up (Step A in `docs/architecture/cutover-readiness.md`):
-//! the consumer was moved out of `crates/app/src/queue/consumer.rs` so the
-//! `transactions` crate now owns its full write path
-//! (HTTP handler → service → producer → consumer → DB write).
+//! Owns the consumer side of `HTTP handler → service → producer
+//! → consumer → DB write`. The consumer pulls messages from
+//! `transactions.process`, buffers them up to `BATCH_SIZE`, and
+//! flushes either when the buffer fills or when `BATCH_FLUSH_MS`
+//! elapses — whichever comes first.
 //!
-//! Idempotency-key shape (`txn:{shard}:{reference_id}`) and the
-//! `transactions.committed` event contract are preserved from the
-//! pre-move implementation — v1-published in-flight messages still
-//! match v2-reserved keys.
+//! Idempotency key shape: `txn:{shard}:{reference_id}`. The
+//! `transactions.committed` event contract is the same shape the
+//! notifications module consumes via the shared-kernel event bus.
 //!
-//! Bleed-stop bundle (this rewrite): restored in-tx idempotency
-//! check, re-derives the destination shard from `from_account`
-//! (drops trust in the wire-supplied `shard` field), bulk INSERTs
-//! moved INTO the same tx as debit/credit (atomic), `processed_at`
-//! set on failed rows, same-shard credit failures roll back via
-//! atomic refund within the tx, ACKs are per-tag (`multiple=false`)
-//! to prevent cumulative-tag races between concurrent flushes,
-//! empty-batch ACK guarded against `delivery_tag=0`, cross-shard
-//! credits run in parallel post-commit.
+//! Money-safety invariants:
 //!
-//! Cross-shard credit failure remains best-effort + metric; the
-//! outbox-table fix lives in a follow-up bundle.
+//!   * The shard for a message is derived from `from_account`
+//!     locally; the wire-supplied `shard` field (if any) is
+//!     ignored — preventing a buggy or malicious producer from
+//!     routing a debit to the wrong shard.
+//!   * Idempotency check, debit, credit, and audit-row insert
+//!     all run inside ONE per-shard transaction. A same-shard
+//!     credit failure rolls back the debit atomically.
+//!   * Failed rows carry `processed_at` so dashboards can
+//!     measure end-to-end-to-terminal latency.
+//!   * ACKs are per-tag (`multiple=false`) — cumulative-tag
+//!     races between concurrent flushes can't lose a tag.
+//!   * Empty-batch ACK is guarded against `delivery_tag=0`
+//!     (an AMQP protocol error).
+//!   * Cross-shard credits run in parallel post-commit and use
+//!     the durable-outbox pattern (`cross_shard_outbox` table)
+//!     for retries; see `cross_shard_processor.rs`.
 
 use amqprs::{
     callbacks::DefaultConnectionCallback,

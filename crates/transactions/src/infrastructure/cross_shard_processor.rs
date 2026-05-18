@@ -23,10 +23,15 @@
 //!     that update having matched, so a redelivered refund is
 //!     also a no-op.
 //!
-//! When a row exhausts `MAX_ATTEMPTS` it is marked 'failed' so it
-//! drops out of the working set; previously it stuck at status
-//! 'pending' forever and the recipient never got their money
-//! (and, after this rewrite, the sender never got their refund).
+//! When a row exhausts `MAX_ATTEMPTS` it terminal-marks 'failed'
+//! on the credit path so it drops out of the working set, and
+//! (R-8) the sender audit row transitions 'processing' → 'failed'
+//! with `failure_reason` populated. The refund path never
+//! terminal-fails by design — the sender is debited and only a
+//! successful refund restores correctness; it instead holds
+//! `attempts` at the cap and defers `lease_until` by
+//! `REFUND_STUCK_BACKOFF_SECS` so the row stays claimable on a
+//! sane cadence rather than at every poll tick.
 
 use std::time::Duration;
 

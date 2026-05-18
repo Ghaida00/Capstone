@@ -12,11 +12,11 @@ use super::ports::{ListFilter, TransactionId};
 
 // ─── Entities ────────────────────────────────────────────────
 //
-// `DomainError` lived here through Phase 4 but never had a
-// constructor — every error path goes through `TransactionError`
-// at the port boundary. It was removed to keep the surface
-// honest; reintroduce when a real domain-layer rule needs to
-// signal failure independently of infrastructure.
+// No `DomainError` here on purpose: every error path leaves the
+// module through `TransactionError` at the port boundary
+// (crates/transactions/src/ports.rs). Add a domain-local error
+// type only when a real business-rule violation needs to surface
+// independently of infrastructure (none today).
 
 #[derive(Debug, Clone)]
 pub(crate) struct Transaction {

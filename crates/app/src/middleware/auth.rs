@@ -157,20 +157,19 @@ pub async fn auth_middleware(
 
 /// Admin-only middleware for the `/api/v2/admin/*` operator surface.
 ///
-/// Stricter than `auth_middleware` in two ways:
-///   1. Refuses with 403 when `AuthState.enabled == false`. Admin
-///      endpoints would otherwise be wide open in any environment
-///      that has not flipped `ENABLE_AUTH=true` — a foot-gun that
-///      defeats the whole point of gating them.
-///   2. Requires the JWT to carry `role = "admin"`. A regular
-///      user token authenticates but cannot enumerate stuck
-///      outbox rows or in-flight customer transactions.
+/// Stricter than `auth_middleware` in two ways. First, it refuses
+/// with 403 when `AuthState.enabled == false` — admin endpoints
+/// would otherwise be wide open in any environment that has not
+/// flipped `ENABLE_AUTH=true`, defeating the whole point of
+/// gating them. Second, it requires the JWT to carry
+/// `role = "admin"`; a regular user token authenticates but
+/// cannot enumerate stuck outbox rows or in-flight customer
+/// transactions.
 ///
-/// Does its own decode (rather than chaining to `auth_middleware`
-/// + reading shared state) so the admin router can wire a single
-/// middleware layer; the cost is one extra HMAC verify per admin
-/// request, which is negligible given the low traffic shape of
-/// an operator surface.
+/// Does its own decode rather than chaining to `auth_middleware`
+/// plus reading shared state, so the admin router wires a single
+/// middleware layer. Cost: one extra HMAC verify per admin
+/// request, negligible at operator-surface traffic levels.
 pub async fn require_admin_middleware(
     axum::extract::State(state): axum::extract::State<AuthState>,
     req: Request,

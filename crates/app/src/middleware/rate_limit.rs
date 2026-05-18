@@ -26,12 +26,11 @@ struct CounterEntry {
 /// load. Power of two so the modulo compiles to an `&`.
 const SHARDS: usize = 64;
 
-/// Sharded local-counter map. The previous implementation used a single
-/// `tokio::sync::RwLock<HashMap>` taken in WRITE mode for every request
-/// — every VU serialised through one async lock, blowing latency past
-/// 1 s under 500–1000 concurrent VUs. With 64 shards of `std::sync::Mutex`
-/// the critical section (hash + insert + cmp + increment) stays inside
-/// the synchronous fast path and almost never contends.
+/// Sharded local-counter map. Each request hashes its IP to one
+/// of 64 `std::sync::Mutex<HashMap>` shards; the critical section
+/// (hash + insert + cmp + increment) runs synchronously and never
+/// holds the lock across `.await`. Contention is `1/SHARDS` of a
+/// single global lock under uniform load.
 type Shard = Mutex<HashMap<IpAddr, CounterEntry>>;
 
 /// Redis-based rate limiter with local in-memory cache.
