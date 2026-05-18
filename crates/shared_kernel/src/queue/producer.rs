@@ -17,6 +17,15 @@ use tokio::sync::RwLock;
 
 use crate::error::AppError;
 use crate::queue::callback::{ConfirmRegistry, ConfirmResult, LoggingChannelCallback};
+use crate::resilience::DependencyBreaker;
+
+/// R-7 RabbitMQ-breaker tuning. Threshold = 10 transient publish
+/// failures (well past the internal `MAX_PUBLISH_ATTEMPTS=3` retry
+/// budget so a single hiccup-rebuild cycle does not trip);
+/// recovery = 30 s. Hardcoded; promote to config when an operator
+/// wants to tune them.
+const RABBITMQ_BREAKER_FAILURE_THRESHOLD: u32 = 10;
+const RABBITMQ_BREAKER_RECOVERY_SECS: u64 = 30;
 
 const EXCHANGE_NAME: &str = "peakload.transactions";
 const QUEUE_NAME: &str = "transactions.process";
@@ -75,6 +84,13 @@ pub struct QueueProducer {
     /// RAII guard releases it even on panic.
     rebuild_in_progress: Arc<AtomicBool>,
     config: Arc<ProducerConfig>,
+    /// R-7 RabbitMQ breaker. Wraps `publish_traced` / `publish` —
+    /// the audit-prescribed seam ("RabbitMQBreaker around
+    /// `publish_confirm`"). Distinct from the in-built internal
+    /// retry budget: that absorbs a single hiccup; the breaker
+    /// fails fast once that budget has been exceeded enough times
+    /// to indicate the broker is genuinely down.
+    rabbitmq_breaker: DependencyBreaker,
 }
 
 /// RAII guard that flips `rebuild_in_progress` back to `false` on
@@ -137,11 +153,19 @@ impl QueueProducer {
         )
         .await?;
 
+        let rabbitmq_breaker = DependencyBreaker::new(
+            "rabbitmq",
+            RABBITMQ_BREAKER_FAILURE_THRESHOLD,
+            RABBITMQ_BREAKER_RECOVERY_SECS,
+        );
+
         tracing::info!(
             exchange = EXCHANGE_NAME,
             queue = QUEUE_NAME,
             channels = CHANNEL_POOL_SIZE,
-            "RabbitMQ producer initialized (amqprs, channel pool)"
+            rabbitmq_breaker_threshold = RABBITMQ_BREAKER_FAILURE_THRESHOLD,
+            rabbitmq_breaker_recovery_secs = RABBITMQ_BREAKER_RECOVERY_SECS,
+            "RabbitMQ producer initialized (amqprs, channel pool; R-7 rabbitmq breaker registered)"
         );
 
         Ok(Self {
@@ -150,7 +174,13 @@ impl QueueProducer {
             connected: Arc::new(AtomicBool::new(true)),
             rebuild_in_progress: Arc::new(AtomicBool::new(false)),
             config: producer_config,
+            rabbitmq_breaker,
         })
+    }
+
+    /// R-7: handle to the RabbitMQ dependency breaker.
+    pub fn breaker(&self) -> &DependencyBreaker {
+        &self.rabbitmq_breaker
     }
 
     async fn connect_and_setup(
@@ -340,6 +370,17 @@ impl QueueProducer {
         let mut args = BasicPublishArguments::new(EXCHANGE_NAME, ROUTING_KEY);
         args.mandatory = true;
 
+        // R-7: gate the whole publish flow on the RabbitMQ breaker.
+        // A known-down broker fails fast with
+        // `AppError::DependencyDown{name:"rabbitmq"}` → 503 +
+        // Retry-After WITHOUT consuming the internal retry budget
+        // or triggering the connection-rebuild path (which is
+        // expensive and pointless when the broker is genuinely
+        // gone).
+        if !self.rabbitmq_breaker.allow() {
+            return Err(AppError::DependencyDown { name: "rabbitmq" });
+        }
+
         let mut last_err: Option<String> = None;
         for attempt in 1..=MAX_PUBLISH_ATTEMPTS {
             let snapshot = self.state.read().await.clone();
@@ -348,8 +389,24 @@ impl QueueProducer {
 
             match publish_with_confirm(&cc, properties.clone(), payload.clone(), args.clone()).await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    self.rabbitmq_breaker.record_success();
+                    return Ok(());
+                }
                 Err(e) => {
+                    self.rabbitmq_breaker.record_failure();
+                    // NOTE: deliberately do NOT short-circuit on a
+                    // mid-loop breaker check here. The entry check
+                    // already fails fast for callers when the
+                    // breaker is Open, and the inner retry loop must
+                    // still be allowed to run the rebuild path — on
+                    // recovery the half-open probe arrives with a
+                    // stale connection state and needs the rebuild
+                    // path to succeed to actually heal. Adding a
+                    // mid-loop fail-fast here re-tripped the breaker
+                    // on every half-open probe and prevented
+                    // reconnect (empirically caught in R-7d
+                    // verification).
                     let err_msg = e.to_string();
                     tracing::warn!(
                         error = %err_msg,
