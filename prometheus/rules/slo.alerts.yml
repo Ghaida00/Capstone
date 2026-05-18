@@ -37,3 +37,38 @@ groups:
           severity: ticket
         annotations:
           summary: "Shard {{ $labels.shard }}: read fallback to primary sustained 1m (replica health probes failing)"
+
+  # R-2: cross-shard outbox operator-visibility. Both counters
+  # already exist on the metric side; nothing was watching them
+  # until now, so the well-engineered "drop out and require
+  # manual reconciliation" semantics became "silently lose money".
+  - name: peakload-cross-shard-outbox
+    rules:
+      # Any credit terminal-fail is a money-stranded event: sender
+      # is debited, recipient never got their money, retries are
+      # exhausted. The R-8 audit-row transition makes the customer
+      # see 'failed' — but the operator still has to reconcile.
+      # for=1m to ride out a single benign transient that ticks
+      # the counter once on the very last attempt; sustained >=1m
+      # means a real terminal failure has occurred.
+      - alert: PeakloadCrossShardCreditTerminalFailure
+        expr: sum by (step) (rate(cross_shard_outbox_terminal_failures_total{step="credit"}[5m])) > 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "Cross-shard credit terminally failed (step={{ $labels.step }}): sender debited, recipient un-credited, audit row 'failed' with failure_reason populated. Run docs/runbooks/cross-shard-outbox-reconciliation.md."
+      # Refund-stuck counter increments every REFUND_STUCK_BACKOFF_SECS=300s
+      # per stuck row → one stuck row = 1/300 ≈ 0.0033 increments/sec.
+      # Threshold 0.003 catches "at least one stuck row sustained";
+      # for=30m matches the audit's "stuck for 30+ min" prescription
+      # and avoids paging on the very first re-claim tick (which is
+      # at most one increment 5 minutes after the row first hit
+      # MAX_ATTEMPTS — too short to be reliable signal yet).
+      - alert: PeakloadCrossShardRefundStuck
+        expr: rate(cross_shard_refund_stuck_total[15m]) > 0.003
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Cross-shard refund path stuck past MAX_ATTEMPTS for 30+ min: sender debited, no compensation. Run docs/runbooks/cross-shard-outbox-reconciliation.md (refund branch)."

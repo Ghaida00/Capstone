@@ -161,6 +161,14 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
         "cross_shard_step_failures_total",
         "Cross-shard outbox step failures (label `step`: `credit` or `refund`) — credit failures stranded a sender debit; refund failures left a sender un-compensated"
     );
+    metrics::describe_counter!(
+        "cross_shard_outbox_terminal_failures_total",
+        "Cross-shard outbox terminal failures after MAX_ATTEMPTS retries (label `step`: `credit` only — refund path never terminal-fails by design). Each increment means a sender's audit row was transitioned 'processing' → 'failed' with `failure_reason` populated; the funds have been debited and the recipient credit never landed. Page on any non-zero rate (R-2). Reconciliation procedure: docs/runbooks/cross-shard-outbox-reconciliation.md."
+    );
+    metrics::describe_counter!(
+        "cross_shard_refund_stuck_total",
+        "Refund-path retry attempts while past MAX_ATTEMPTS (label-less). Sender is debited; the compensating refund has failed at least 10 times and the row is in a 5min defer-lease loop. Reads as 'retry attempts per stuck row × time' — not a count of distinct stuck rows. Ticket on sustained non-zero rate for 30+ min (R-2)."
+    );
 
     // Failover metrics
     metrics::describe_counter!(
