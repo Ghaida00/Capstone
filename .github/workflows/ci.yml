@@ -1,0 +1,144 @@
+# WP4 — closes T-1 / OPS-6 (no CI pipeline; gates were human
+# discipline) plus S-7 (cargo audit) and A-7 (cargo-deny policy
+# gate). Runs on every push to the long-lived branches and on
+# every PR targeting `main`.
+#
+# Jobs are split so a fast feedback signal (lint + unit tests)
+# returns within ~2-3 minutes while the slower
+# real-Docker-container integration tests run in parallel and
+# usually finish within ~10 minutes. The split makes it obvious
+# which class of test broke when something does.
+
+name: CI
+
+on:
+  push:
+    branches: [main, Ghaida]
+  pull_request:
+    branches: [main]
+
+# Cancel older runs of the same workflow on the same ref when a
+# new push arrives — saves Actions minutes on rapid push cycles.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── 1. Lint: fmt + clippy ────────────────────────────────
+  # The two zero-cost gates the Makefile already encodes. CI
+  # makes them a refusal-to-merge property instead of a "hope
+  # the author ran `make check`" property.
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (matches rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ── 2. Unit tests: lib + bins only ───────────────────────
+  # Sub-minute path: every #[cfg(test)] mod tests block in
+  # src/, plus the inline bin tests under crates/app/src/. No
+  # testcontainers, no Docker, no network. Closing T-3 / T-2 /
+  # T-4-existing all land here.
+  unit-test:
+    name: unit tests (lib + bins)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --lib --bins
+        run: cargo test --workspace --lib --bins --locked
+
+  # ── 3. Integration tests: testcontainers ─────────────────
+  # The crates/*/tests/*.rs files spin up real Postgres / Redis
+  # / RabbitMQ containers via testcontainers. They are slower
+  # (5-15 minutes) but they catch the regression classes a unit
+  # test cannot — schema drift, sqlx prepared-statement drift,
+  # real-broker idempotency contract (T-6), cross-shard
+  # terminal states (T-9), full event flow.
+  integration-test:
+    name: integration tests (testcontainers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --test '*'
+        # Run each integration-test binary under the workspace.
+        # `--test '*'` matches every file under tests/ across
+        # every crate. Docker is pre-installed on ubuntu-latest;
+        # testcontainers uses DOCKER_HOST defaults out of the
+        # box.
+        run: cargo test --workspace --tests --locked
+
+  # ── 4. cargo audit (S-7) ─────────────────────────────────
+  # RustSec advisory check against the dependency tree. The
+  # action posts the result as a PR comment when a CVE lands.
+  # The single ignored advisory is documented in audit.toml +
+  # deny.toml with rationale (Postgres password-auth path on a
+  # trusted Docker network; no public-internet RSA exposure;
+  # no upstream fix yet for RUSTSEC-2023-0071).
+  audit:
+    name: cargo audit (S-7)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2023-0071
+
+  # ── 5. cargo deny (A-7) ──────────────────────────────────
+  # Reads the deny.toml policy artefact (banned crates, license
+  # allowlist, yanked-version refusal, crates.io-only sources).
+  # Fails the build if any policy is violated.
+  deny:
+    name: cargo deny (A-7)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          log-level: warn
+          command: check
+          arguments: --all-features
+
+  # ── 6. Docker build sanity ───────────────────────────────
+  # Just `docker build` — does not push. Catches Dockerfile
+  # rot (broken cargo-chef cache step, missing apt package,
+  # bad COPY path) before it surfaces at deploy time.
+  docker-build:
+    name: docker build (sanity)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: false
+          tags: peakload-capstone:ci
+          # Per-workflow BuildKit cache so the second run reuses
+          # cargo-chef recipe / dep layers.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
