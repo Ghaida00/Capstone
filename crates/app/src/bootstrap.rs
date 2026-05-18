@@ -314,10 +314,7 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
         "amqp_publish_failed_total",
         "Outbox publish failed terminally (label `kind`: nack_or_returned, etc.)"
     );
-    metrics::describe_counter!(
-        "amqp_publish_nack_total",
-        "Broker NACKed a publish confirm"
-    );
+    metrics::describe_counter!("amqp_publish_nack_total", "Broker NACKed a publish confirm");
     metrics::describe_counter!(
         "amqp_publish_return_total",
         "Broker returned a mandatory publish as unrouteable"

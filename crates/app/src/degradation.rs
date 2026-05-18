@@ -125,10 +125,7 @@ pub async fn degradation_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let is_write = !matches!(
-        *req.method(),
-        Method::GET | Method::HEAD | Method::OPTIONS
-    );
+    let is_write = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
     let mode = flag.mode();
     if is_write && mode.writes_blocked() {
         return (

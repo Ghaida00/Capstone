@@ -278,14 +278,13 @@ async fn process_one(
     //    The remaining duplicate-publish window — crash AFTER broker
     //    confirm but BEFORE the UPDATE in step 4 — is absorbed by
     //    the consumer's `(reference_id, from_account)` UNIQUE.
-    let already_published: bool = sqlx::query_scalar(
-        "SELECT published FROM idempotency_keys WHERE idempotency_key = $1",
-    )
-    .bind(idempotency_key)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| format!("PG SELECT published: {}", e))?
-    .unwrap_or(false);
+    let already_published: bool =
+        sqlx::query_scalar("SELECT published FROM idempotency_keys WHERE idempotency_key = $1")
+            .bind(idempotency_key)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("PG SELECT published: {}", e))?
+            .unwrap_or(false);
 
     if already_published {
         cache

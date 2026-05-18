@@ -262,7 +262,11 @@ impl TransactionRepository for SqlxTransactionRepository {
 
         // Stable order: created_at DESC, id DESC (matches per-shard
         // ORDER BY so merging is consistent).
-        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        rows.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         rows.truncate(limit as usize);
 
         // Drop rows older than the safe cursor — at least one shard
@@ -457,8 +461,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         .bind(accepted_payload)
         .bind(outbox_payload)
         .execute(writer)
-        .await
-?;
+        .await?;
 
         if inserted.rows_affected() > 0 {
             Self::spawn_cache_set(
@@ -509,8 +512,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         )
         .bind(idempotency_key)
         .fetch_optional(writer)
-        .await
-?;
+        .await?;
 
         let Some(existing) = existing else {
             // Row vanished between INSERT and SELECT (cleanup race).
@@ -568,8 +570,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         .bind(accepted_payload)
         .bind(outbox_payload)
         .execute(writer)
-        .await
-?;
+        .await?;
 
         if revived.rows_affected() > 0 {
             Self::spawn_cache_set(
@@ -596,8 +597,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         )
         .bind(idempotency_key)
         .fetch_optional(writer)
-        .await
-?;
+        .await?;
         let payload = winner
             .and_then(|w| w.response_payload)
             .unwrap_or_else(|| accepted_payload.clone());

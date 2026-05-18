@@ -182,7 +182,11 @@ async fn idempotency_replay_returns_same_response_for_identical_payload() {
     let fx = setup().await;
     let reference_id = "ref-replay-001";
 
-    let first: TestResponse = fx.server.post("/").json(&body_for(reference_id, "12.34")).await;
+    let first: TestResponse = fx
+        .server
+        .post("/")
+        .json(&body_for(reference_id, "12.34"))
+        .await;
     assert_eq!(first.status_code(), StatusCode::ACCEPTED);
     let first_body: serde_json::Value = first.json();
     let first_message = first_body["data"]["message"].as_str().unwrap().to_owned();
@@ -216,7 +220,11 @@ async fn idempotency_conflict_rejects_same_key_with_different_payload() {
     let fx = setup().await;
     let reference_id = "ref-conflict-001";
 
-    let first: TestResponse = fx.server.post("/").json(&body_for(reference_id, "12.34")).await;
+    let first: TestResponse = fx
+        .server
+        .post("/")
+        .json(&body_for(reference_id, "12.34"))
+        .await;
     assert_eq!(first.status_code(), StatusCode::ACCEPTED);
 
     // Same reference_id, DIFFERENT amount → the SHA-256

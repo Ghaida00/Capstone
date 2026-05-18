@@ -407,11 +407,7 @@ impl RedisCache {
     /// `BRPOPLPUSH` so callers can sleep+loop on their own cadence
     /// without racing the deadpool/redis-crate connection timeout
     /// that would otherwise fire mid-block on idle queues.
-    pub async fn rpoplpush(
-        &self,
-        src: &str,
-        dst: &str,
-    ) -> Result<Option<String>, AppError> {
+    pub async fn rpoplpush(&self, src: &str, dst: &str) -> Result<Option<String>, AppError> {
         let mut conn = self.write_conn().await?;
         let res: Option<String> = self.map_redis(
             ::redis::cmd("RPOPLPUSH")

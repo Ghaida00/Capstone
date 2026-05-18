@@ -72,11 +72,7 @@ struct Inner {
 }
 
 impl DependencyBreaker {
-    pub fn new(
-        name: &'static str,
-        failure_threshold: u32,
-        recovery_timeout_secs: u64,
-    ) -> Self {
+    pub fn new(name: &'static str, failure_threshold: u32, recovery_timeout_secs: u64) -> Self {
         let b = Self {
             inner: Arc::new(Inner {
                 name,
@@ -151,9 +147,7 @@ impl DependencyBreaker {
             BreakerState::HalfOpen => {
                 // Admit a bounded number of probes; the rest fail
                 // fast until one resolves the trial.
-                let n = inner
-                    .half_open_request_count
-                    .fetch_add(1, Ordering::AcqRel);
+                let n = inner.half_open_request_count.fetch_add(1, Ordering::AcqRel);
                 n < inner.half_open_max_requests
             }
         }
@@ -250,7 +244,11 @@ mod tests {
         assert!(b.allow());
         b.record_failure();
         b.record_failure();
-        assert_eq!(b.state(), BreakerState::Closed, "below threshold stays closed");
+        assert_eq!(
+            b.state(),
+            BreakerState::Closed,
+            "below threshold stays closed"
+        );
         b.record_failure(); // 3rd → trips
         assert_eq!(b.state(), BreakerState::Open);
         assert!(!b.allow(), "open breaker fails fast");
@@ -282,7 +280,11 @@ mod tests {
         assert!(b.allow(), "after timeout, one probe is admitted");
         assert_eq!(b.state(), BreakerState::HalfOpen);
         b.record_success();
-        assert_eq!(b.state(), BreakerState::Closed, "successful probe closes it");
+        assert_eq!(
+            b.state(),
+            BreakerState::Closed,
+            "successful probe closes it"
+        );
     }
 
     #[test]
@@ -308,6 +310,9 @@ mod tests {
                 admitted += 1;
             }
         }
-        assert_eq!(admitted, 5, "half-open admits exactly half_open_max_requests");
+        assert_eq!(
+            admitted, 5,
+            "half-open admits exactly half_open_max_requests"
+        );
     }
 }

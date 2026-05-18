@@ -118,7 +118,9 @@ where
     Fut: Future<Output = Result<T, sqlx::Error>>,
 {
     if !breaker.allow() {
-        return Err(AppError::DependencyDown { name: breaker.name() });
+        return Err(AppError::DependencyDown {
+            name: breaker.name(),
+        });
     }
 
     let mut attempt = 0u32;
@@ -148,7 +150,9 @@ where
                 // the full backoff sleep while the dependency is
                 // known-down.
                 if !breaker.allow() {
-                    return Err(AppError::DependencyDown { name: breaker.name() });
+                    return Err(AppError::DependencyDown {
+                        name: breaker.name(),
+                    });
                 }
                 metrics::counter!("db_retry_attempt_total", "op" => op_name.to_string())
                     .increment(1);

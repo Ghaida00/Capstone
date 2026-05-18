@@ -204,7 +204,6 @@ impl CircuitBreaker {
             _ => {}
         }
     }
-
 }
 
 /// Axum middleware function for circuit breaker.

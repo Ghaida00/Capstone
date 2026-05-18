@@ -97,11 +97,8 @@ impl ShardRouter {
             shards.push(pool);
         }
 
-        let db_breaker = DependencyBreaker::new(
-            "db",
-            DB_BREAKER_FAILURE_THRESHOLD,
-            DB_BREAKER_RECOVERY_SECS,
-        );
+        let db_breaker =
+            DependencyBreaker::new("db", DB_BREAKER_FAILURE_THRESHOLD, DB_BREAKER_RECOVERY_SECS);
 
         tracing::info!(
             num_shards = shards.len(),

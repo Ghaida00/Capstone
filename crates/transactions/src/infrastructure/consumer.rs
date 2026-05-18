@@ -36,10 +36,10 @@ use amqprs::{
     consumer::AsyncConsumer,
     BasicProperties, Deliver,
 };
-use shared_kernel::queue::callback::ConsumerChannelCallback;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use shared_kernel::queue::callback::ConsumerChannelCallback;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};

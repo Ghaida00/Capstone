@@ -232,10 +232,7 @@ impl Config {
                 .expect("REDIS_POOL_SIZE must be a number"),
 
             redis_sentinel_nodes: parse_csv_env("REDIS_SENTINEL_NODES", ""),
-            redis_sentinel_master_name: env_or(
-                "REDIS_SENTINEL_MASTER_NAME",
-                "peakload-master",
-            ),
+            redis_sentinel_master_name: env_or("REDIS_SENTINEL_MASTER_NAME", "peakload-master"),
             redis_sentinel_monitor_interval_secs: env_or(
                 "REDIS_SENTINEL_MONITOR_INTERVAL_SECS",
                 "5",
@@ -311,9 +308,7 @@ impl Config {
 
             degradation_mode: env_or("DEGRADATION_MODE", "normal"),
 
-            enable_auth: env_or("ENABLE_AUTH", "false")
-                .parse()
-                .unwrap_or(false),
+            enable_auth: env_or("ENABLE_AUTH", "false").parse().unwrap_or(false),
             auth_secret: std::env::var("AUTH_SECRET").ok(),
             auth_expected_issuer: std::env::var("AUTH_EXPECTED_ISSUER")
                 .ok()

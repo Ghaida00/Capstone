@@ -42,10 +42,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/outbox", get(list_outbox))
         .route("/stuck-transactions", get(list_stuck_transactions))
-        .route(
-            "/degradation",
-            get(get_degradation).put(put_degradation),
-        )
+        .route("/degradation", get(get_degradation).put(put_degradation))
 }
 
 #[derive(Debug, Deserialize)]

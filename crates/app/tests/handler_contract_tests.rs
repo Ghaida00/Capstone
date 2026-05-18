@@ -49,10 +49,7 @@ enum Behavior {
 
 #[async_trait]
 impl NotificationLog for FakeNotificationLog {
-    async fn recent(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<NotificationEntry>, NotificationError> {
+    async fn recent(&self, limit: usize) -> Result<Vec<NotificationEntry>, NotificationError> {
         match &self.behavior {
             Behavior::Returns(v) => Ok(v.iter().take(limit).cloned().collect()),
             Behavior::Infra(msg) => Err(NotificationError::Infra((*msg).to_owned())),
