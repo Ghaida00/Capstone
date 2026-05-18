@@ -65,7 +65,7 @@ That writes to etcd and Patroni propagates it to the scope.
 | `bootstrap.dcs.ttl`          | 30 s    | Want faster failover (lower) vs. fewer false positives on network blips (higher). Pair with `retry_timeout` ≤ ttl/2. |
 | `maximum_lag_on_failover`    | 1 MiB   | Replicas lag more under load → raise; want stricter durability → lower. |
 | `shared_buffers`             | 64 MB   | Per-node memory limit raised in compose. Rule of thumb: 25% of container RAM. |
-| `max_connections`            | 120     | pgBouncer DEFAULT_POOL_SIZE × instances. Currently 40 × 3 = 120, the floor. |
+| `max_connections`            | 120     | Sized as `pgBouncer (DEFAULT_POOL_SIZE + RESERVE_POOL_SIZE) + headroom = (80 + 20) + 20 = 120`. The +20 headroom is for autovacuum / replication / admin. Pair with `DB_WRITE_POOL_SIZE` so `app_replicas × DB_WRITE_POOL_SIZE ≤ DEFAULT_POOL_SIZE` (now 2 × 40 = 80) — keeps pgBouncer from silently queueing the app (D-2). |
 | `basebackup.max-rate`        | 100 M   | Replica joins hurting primary traffic → lower; joins too slow → raise. |
 
 ## Caveats
