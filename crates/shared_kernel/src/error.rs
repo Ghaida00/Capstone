@@ -36,6 +36,15 @@ pub enum AppError {
     #[error("Service overloaded")]
     ServiceOverloaded,
 
+    /// R-7: a specific upstream dependency's per-dependency
+    /// breaker is open. Distinct from `CircuitBreakerOpen` (the
+    /// coarse HTTP-edge breaker) — this names WHICH dependency
+    /// (`db` | `redis` | `rabbitmq`) so one unhealthy dependency
+    /// fails fast without the global edge breaker rejecting every
+    /// route. Maps to 503 + `Retry-After`.
+    #[error("Dependency unavailable: {name}")]
+    DependencyDown { name: &'static str },
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -92,6 +101,14 @@ impl IntoResponse for AppError {
                 "service_overloaded",
                 "Service is currently overloaded, please try again later".to_string(),
             ),
+            AppError::DependencyDown { name } => {
+                tracing::warn!(dependency = name, "dependency breaker open — failing fast");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "dependency_down",
+                    format!("Dependency '{name}' is temporarily unavailable, please retry"),
+                )
+            }
             AppError::Internal(msg) => {
                 tracing::error!(error = %msg, "Internal error");
                 (
@@ -107,7 +124,16 @@ impl IntoResponse for AppError {
             "message": message,
         });
 
-        (status, Json(body)).into_response()
+        let mut resp = (status, Json(body)).into_response();
+        // R-7: tell the caller it is worth retrying a downed
+        // dependency shortly (the breaker half-opens on a timer).
+        if matches!(self, AppError::DependencyDown { .. }) {
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("3"),
+            );
+        }
+        resp
     }
 }
 

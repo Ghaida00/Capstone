@@ -149,6 +149,14 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
         "degradation_mode",
         "R-9 operator-controlled degradation posture: 0 normal, 1 read_only (writes 503'd, reads served), 2 essential_only. Monotonic in severity — alert on > 0."
     );
+    metrics::describe_gauge!(
+        "dependency_breaker_state",
+        "R-7 per-dependency circuit-breaker state (label `dep`: db|redis|rabbitmq): 0 closed, 1 open (failing fast), 2 half-open (probing recovery). Distinct from the coarse circuit_breaker_state HTTP-edge breaker."
+    );
+    metrics::describe_counter!(
+        "dependency_breaker_trips_total",
+        "R-7 per-dependency breaker open transitions (label `dep`). Each increment = that upstream's error class crossed the failure threshold (or a half-open probe failed) and calls now fail fast with 503 + Retry-After until the recovery timeout."
+    );
     metrics::describe_counter!("idempotency_hits_total", "Idempotency hits");
     metrics::describe_counter!("rabbitmq_reconnections_total", "RabbitMQ reconnections");
     metrics::describe_histogram!(
