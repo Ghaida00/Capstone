@@ -246,3 +246,75 @@ pub async fn rate_limit_middleware(
             .into_response()
     }
 }
+
+// ─── Integration tests for rate_limit_middleware (T-4) ───────
+//
+// The decision logic (`RateLimiter::check`) is in-memory; only
+// the background sync task touches Redis. Tests construct a real
+// `MasterPoolHandle` from a `deadpool` pool against an
+// unreachable port (deadpool builds lazily, so the pool exists
+// but every connection attempt fails). Background sync still
+// runs but its failures are recorded on the silent-degradation
+// counter (R-6) and do not affect the on-request `check` path.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{middleware::from_fn_with_state, routing::get, Router};
+    use axum_test::TestServer;
+    use deadpool_redis::Config as RedisConfig;
+    use shared_kernel::cache::redis::MasterPoolHandle;
+
+    fn limiter_with_burst(burst: u32) -> RateLimiter {
+        // Pool builds lazily against an unreachable port; the
+        // rate-limit decision never calls .get() so this is fine.
+        let pool = RedisConfig::from_url("redis://127.0.0.1:1/")
+            .create_pool(None)
+            .expect("deadpool builds pool lazily");
+        let handle = MasterPoolHandle::from_pool(pool);
+        RateLimiter::new(handle, 1000, burst, CancellationToken::new())
+    }
+
+    fn router_under_limit(limiter: RateLimiter) -> Router {
+        Router::new()
+            .route("/x", get(|| async { "ok" }))
+            .layer(from_fn_with_state(limiter, rate_limit_middleware))
+    }
+
+    #[tokio::test]
+    async fn under_burst_allows_requests() {
+        let limiter = limiter_with_burst(5);
+        let server = TestServer::new(router_under_limit(limiter));
+        for i in 0..5 {
+            let res = server.get("/x").add_header("x-real-ip", "1.2.3.4").await;
+            assert_eq!(
+                res.status_code(),
+                StatusCode::OK,
+                "request {i} under burst should be admitted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn over_burst_returns_429_with_retry_after() {
+        let limiter = limiter_with_burst(2);
+        let server = TestServer::new(router_under_limit(limiter));
+
+        // Exhaust the burst.
+        for _ in 0..2 {
+            let res = server.get("/x").add_header("x-real-ip", "9.9.9.9").await;
+            assert_eq!(res.status_code(), StatusCode::OK);
+        }
+        // Next request from the same IP is shed with 429 + the
+        // documented `retry-after` header and the documented body.
+        let res = server.get("/x").add_header("x-real-ip", "9.9.9.9").await;
+        assert_eq!(res.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(res.header("retry-after"), "1");
+        let body: serde_json::Value = res.json();
+        assert_eq!(body["error"], "rate_limited");
+
+        // A *different* IP is on its own counter and still admitted
+        // — the per-IP isolation contract.
+        let res = server.get("/x").add_header("x-real-ip", "1.1.1.1").await;
+        assert_eq!(res.status_code(), StatusCode::OK);
+    }
+}

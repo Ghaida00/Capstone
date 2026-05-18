@@ -83,6 +83,19 @@ impl MasterPoolHandle {
         let pool = self.pool.read().await.clone();
         pool.get().await.map_err(AppError::RedisPool)
     }
+
+    /// Construct a handle around a caller-owned pool, bypassing the
+    /// Sentinel resolution path. The non-Sentinel callers today are
+    /// the rate-limiter integration tests (T-4) which need a real
+    /// `MasterPoolHandle` for type-level compatibility with
+    /// `RateLimiter::new` but exercise no Redis I/O on the
+    /// rate-limiting hot path (the `check` method is in-memory). A
+    /// future direct-connection caller would also land here.
+    pub fn from_pool(pool: Pool) -> Self {
+        Self {
+            pool: Arc::new(RwLock::new(pool)),
+        }
+    }
 }
 
 struct SentinelSettings {
