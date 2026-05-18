@@ -28,6 +28,11 @@ CREATE TABLE transactions (
     -- Per-(account, ref) idempotency stays unique.
     reference_id    VARCHAR(100),
     description     TEXT,
+    -- Populated by the cross-shard outbox credit-terminal path
+    -- (handle_attempt_error) when retries are exhausted, so the
+    -- customer-facing GET endpoint surfaces a real failure reason
+    -- instead of indefinite 'processing'. NULL on every other row.
+    failure_reason  TEXT,
     CONSTRAINT uq_transactions_reference UNIQUE (reference_id, from_account),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),

@@ -1,0 +1,24 @@
+-- ============================================================
+-- 0004_transactions_failure_reason.sql
+--
+-- Adds `failure_reason TEXT` to `transactions` so the sender
+-- audit row can carry the terminal-failure cause when the
+-- cross-shard outbox credit path exhausts its retry budget.
+--
+-- Pairs with R-8: previously the sender audit row was left at
+-- `status = 'processing'` after credit terminal-fail, on the
+-- argument that ops triage could find it by querying for old
+-- 'processing' rows. The new contract is the opposite — the
+-- row transitions to 'failed' with `failure_reason` populated
+-- from `last_error`, so the customer-facing GET endpoint sees
+-- a real terminal state instead of indefinite 'processing'.
+--
+-- Nullable: only the credit-terminal-fail path writes it, and
+-- only against rows whose status moves to 'failed'. All other
+-- rows (the 99.99%-th case) leave the column NULL.
+--
+-- Idempotent — fresh clusters reach the same end state via
+-- `db/init.sql`.
+-- ============================================================
+
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS failure_reason TEXT;

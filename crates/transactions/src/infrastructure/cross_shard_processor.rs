@@ -225,9 +225,15 @@ async fn drain_shard(shards: &ShardRouter, sender_shard: usize) -> Result<(), sq
 /// terminally fail". Step semantics differ:
 ///
 /// * `step = "credit"` — bumps `attempts`; once `attempts + 1 >=
-///   MAX_ATTEMPTS` the row is marked 'failed' so it drops out of
-///   the working set. The sender's `transactions` audit row is
-///   left at 'processing' so ops triage can see what's stuck.
+///   MAX_ATTEMPTS` the outbox row is marked 'failed' AND the
+///   sender's `transactions` audit row is transitioned from
+///   'processing' to 'failed' with `failure_reason` populated
+///   from `last_error`. The customer's GET endpoint therefore
+///   sees a real terminal state instead of indefinite
+///   'processing'; ops triage queries on `status = 'failed' AND
+///   failure_reason LIKE 'max attempts at credit:%'` (see the
+///   admin endpoint and the cross-shard-outbox-reconciliation
+///   runbook for the standard procedure).
 /// * `step = "refund"` — NEVER terminal-fails. The sender is
 ///   already debited and only a successful refund can make them
 ///   whole; marking the outbox 'failed' here would strand funds
@@ -238,6 +244,9 @@ async fn drain_shard(shards: &ShardRouter, sender_shard: usize) -> Result<(), sq
 ///   `cross_shard_refund_stuck_total` counter therefore reads as
 ///   "refund retry attempts while stuck" (12/hour/row at the
 ///   default backoff), not as a count of distinct stuck rows.
+///   The audit row legitimately stays at 'processing' here —
+///   the transaction is still in flight from the customer's
+///   perspective until the compensating refund lands.
 async fn handle_attempt_error(
     pool: &sqlx::PgPool,
     row: &OutboxRow,
@@ -286,11 +295,25 @@ async fn handle_attempt_error(
             row.id,
             bump_attempt(pool, row.id, &err).await,
         );
+        let reason = format!("max attempts at {}: {}", step, err);
         best_effort(
             "mark_failed (max attempts)",
             row.id,
-            mark_failed(pool, row.id, &format!("max attempts at {}: {}", step, err)).await,
+            mark_failed(pool, row.id, &reason).await,
         );
+        // R-8: terminal credit failures must also transition the
+        // sender audit row from 'processing' to 'failed' so the
+        // customer-visible state stops claiming "in flight". Only
+        // the credit path takes this branch — the refund path
+        // returns above via the defer-lease arm and deliberately
+        // leaves the audit row at 'processing'.
+        if step == "credit" {
+            best_effort(
+                "mark_sender_failed (max attempts)",
+                row.id,
+                mark_sender_failed(pool, &row.reference_id, &row.from_account, &reason).await,
+            );
+        }
         metrics::counter!("cross_shard_outbox_terminal_failures_total", "step" => step)
             .increment(1);
     } else {
@@ -504,6 +527,32 @@ async fn mark_sender_completed(
     )
     .bind(reference_id)
     .bind(from_account)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Flip the sender-side `transactions` audit row from
+/// 'processing' to 'failed' once the cross-shard credit has
+/// exhausted its retry budget. Guarded on `status = 'processing'`
+/// so a redelivered terminal-fail does not stomp a row that some
+/// other code path already moved to a terminal state. `processed_at`
+/// is set so the dashboard "time in 'processing'" metric stops
+/// climbing for this row.
+async fn mark_sender_failed(
+    pool: &sqlx::PgPool,
+    reference_id: &str,
+    from_account: &str,
+    reason: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE transactions \
+         SET status = 'failed', failure_reason = $3, processed_at = NOW(), updated_at = NOW() \
+         WHERE reference_id = $1 AND from_account = $2 AND status = 'processing'",
+    )
+    .bind(reference_id)
+    .bind(from_account)
+    .bind(reason)
     .execute(pool)
     .await?;
     Ok(())
