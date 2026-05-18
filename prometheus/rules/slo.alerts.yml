@@ -24,3 +24,16 @@ groups:
           severity: page
         annotations:
           summary: "P95 latency SLO (<500ms for 95%) breached 10m"
+
+  # D-5: replica fallback signal. Every replica of a shard marked
+  # unhealthy → reads flow to the writer pool, amplifying primary
+  # load. Without this alert the only signal is a per-call WARN log.
+  - name: peakload-db-pool
+    rules:
+      - alert: PeakloadReadReplicaFallback
+        expr: sum by (shard) (rate(db_read_fallback_to_primary_total[1m])) > 0
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Shard {{ $labels.shard }}: read fallback to primary sustained 1m (replica health probes failing)"

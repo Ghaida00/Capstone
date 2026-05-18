@@ -154,6 +154,10 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
         "Per-shard find_by_id fan-out timeouts (label `shard`: index of the slow shard) — a slow shard turned into a per-shard error rather than pinning the API wall-clock (D-4)"
     );
     metrics::describe_counter!(
+        "db_read_fallback_to_primary_total",
+        "Per-shard read-pool fallback to primary because every replica was marked unhealthy (label `shard`: index of the affected shard). Rate signal for the silent-degradation case (D-5); alert on sustained non-zero rate to catch replica outages before they amplify load on the primary."
+    );
+    metrics::describe_counter!(
         "cross_shard_step_failures_total",
         "Cross-shard outbox step failures (label `step`: `credit` or `refund`) — credit failures stranded a sender debit; refund failures left a sender un-compensated"
     );

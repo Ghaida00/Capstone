@@ -26,15 +26,23 @@ pub struct DatabasePool {
     read_health: Arc<Vec<AtomicBool>>,
     /// Round-robin counter for read pool selection
     read_index: Arc<AtomicUsize>,
+    /// Shard index, used as the `shard` label on per-shard metrics
+    /// (e.g. `db_read_fallback_to_primary_total`).
+    shard_label: usize,
 }
 
 impl DatabasePool {
     /// Create a new shard pool with write + multiple read replicas.
+    ///
+    /// `shard_label` is recorded as the `shard` Prometheus label on
+    /// per-shard pool metrics emitted from this `DatabasePool`
+    /// (e.g. `db_read_fallback_to_primary_total{shard="0"}`).
     pub async fn new_shard(
         write_url: &str,
         read_urls: &[String],
         write_pool_size: u32,
         read_pool_size: u32,
+        shard_label: usize,
     ) -> Result<Self, AppError> {
         // Aggressive acquire timeout (1s) keeps a saturated pool from
         // gluing thousands of axum tasks to the connection queue —
@@ -97,6 +105,7 @@ impl DatabasePool {
             read_pools,
             read_health: Arc::new(read_health_vec),
             read_index: Arc::new(AtomicUsize::new(0)),
+            shard_label,
         };
 
         // Warm-up: eagerly establish minimum connections and verify connectivity.
@@ -127,6 +136,11 @@ impl DatabasePool {
     /// Skips replicas marked unhealthy by the background monitor.
     /// If every replica is unhealthy, falls back to the writer pool
     /// and logs a warning — reads keep working in degraded mode.
+    /// Increments `db_read_fallback_to_primary_total{shard}` on every
+    /// fallback so the silent-degradation case has a rate signal
+    /// (D-5); pair with a Prometheus alert rule on
+    /// `rate(db_read_fallback_to_primary_total[1m]) > 0` to page on
+    /// sustained fallback rather than relying on the per-call WARN log.
     pub fn reader(&self) -> &PgPool {
         let n = self.read_pools.len();
         for _ in 0..n {
@@ -136,7 +150,15 @@ impl DatabasePool {
             }
         }
         // All replicas marked unhealthy → degraded read on primary.
-        tracing::warn!("All read replicas unhealthy — falling back to writer pool for reads");
+        metrics::counter!(
+            "db_read_fallback_to_primary_total",
+            "shard" => self.shard_label.to_string()
+        )
+        .increment(1);
+        tracing::warn!(
+            shard = self.shard_label,
+            "All read replicas unhealthy — falling back to writer pool for reads"
+        );
         &self.write_pool
     }
 

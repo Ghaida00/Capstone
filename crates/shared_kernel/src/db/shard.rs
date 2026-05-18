@@ -68,6 +68,7 @@ impl ShardRouter {
                 &shard_urls.read_urls,
                 config.write_pool_size,
                 config.read_pool_size,
+                i,
             )
             .await
             .map_err(|e| AppError::Internal(format!("Failed to connect to shard {}: {}", i, e)))?;
