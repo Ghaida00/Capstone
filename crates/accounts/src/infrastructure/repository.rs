@@ -14,7 +14,7 @@ use sqlx::FromRow;
 use shared_kernel::db::failover::retry_transient_with_breaker;
 use shared_kernel::db::shard::ShardRouter;
 
-use super::super::domain::{Account, AccountRepository};
+use super::super::domain::{Account, AccountRepository, RepoError};
 use super::super::ports::{AccountId, AccountStatus};
 
 /// Minimal row projection — we only read what the port DTO
@@ -42,7 +42,7 @@ impl SqlxAccountRepository {
 
 #[async_trait]
 impl AccountRepository for SqlxAccountRepository {
-    async fn find_active_by_id(&self, id: &AccountId) -> Result<Option<Account>, String> {
+    async fn find_active_by_id(&self, id: &AccountId) -> Result<Option<Account>, RepoError> {
         let shard = self.shards.shard_for_account(id.as_str());
         let account_number = id.as_str().to_owned();
         let router = &self.shards;
@@ -77,7 +77,7 @@ impl AccountRepository for SqlxAccountRepository {
             "accounts.find_active_by_id",
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| RepoError::Other(e.to_string()))?;
 
         Ok(row.map(|r| {
             Account {

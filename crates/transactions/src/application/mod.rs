@@ -386,7 +386,7 @@ impl TransactionService for TransactionsService {
                 &outbox_payload,
             )
             .await
-            .map_err(TransactionError::Infra)?
+            .map_err(|e| TransactionError::Infra(e.to_string()))?
         {
             ReserveOutcome::Replay(stored) => {
                 let replayed: TransactionAccepted =
@@ -404,7 +404,10 @@ impl TransactionService for TransactionsService {
         match self.repo.find_by_id(id).await {
             Ok(Some(tx)) => Ok(tx_to_view(tx)),
             Ok(None) => Err(TransactionError::NotFound(id.as_uuid().to_string())),
-            Err(msg) => Err(TransactionError::Infra(msg)),
+            // A-1: RepoError flows out via Display; pattern-matching
+            // by variant (Sqlx, Join, Serialize, Other) is now
+            // possible here when a retry/escalate policy needs it.
+            Err(e) => Err(TransactionError::Infra(e.to_string())),
         }
     }
 
@@ -413,7 +416,7 @@ impl TransactionService for TransactionsService {
             .repo
             .list(&filter)
             .await
-            .map_err(TransactionError::Infra)?;
+            .map_err(|e| TransactionError::Infra(e.to_string()))?;
         Ok(rows.into_iter().map(tx_to_view).collect())
     }
 
@@ -435,7 +438,7 @@ impl TransactionService for TransactionsService {
                 processed_at: s.processed_at,
             }),
             Ok(None) => Err(TransactionError::NotFound(reference_id.to_owned())),
-            Err(msg) => Err(TransactionError::Infra(msg)),
+            Err(e) => Err(TransactionError::Infra(e.to_string())),
         }
     }
 }

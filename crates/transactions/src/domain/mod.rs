@@ -40,24 +40,53 @@ pub(crate) struct TransactionStatus {
     pub processed_at: Option<DateTime<Utc>>,
 }
 
+// ─── Repository error type (A-1) ────────────────────────────
+//
+// Typed error at the port boundary so callers can pattern-match
+// retryable / non-retryable / observable failure classes instead
+// of parsing strings. `RepoError::Sqlx` flows through
+// `shared_kernel::db::failover::is_transient` unchanged — the
+// application layer (or any future retry-wrapping caller) can
+// decide on retry policy by inspecting the variant.
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RepoError {
+    #[error("sqlx: {0}")]
+    Sqlx(#[from] sqlx::Error),
+    #[error("join: {0}")]
+    Join(#[from] tokio::task::JoinError),
+    #[error("serialize: {0}")]
+    Serialize(#[from] serde_json::Error),
+    /// Redis errors don't get a typed variant here because adding
+    /// `redis::RedisError` to a domain-layer enum would force a
+    /// direct `redis` dep on this crate (Redis is an infra detail
+    /// the domain doesn't know about). The redis-flavoured
+    /// implementor sites format their own context message into
+    /// this variant — preserving the typed-error-at-the-port
+    /// win for the SQL paths without leaking a layering violation
+    /// to keep one boundary tidy.
+    #[error("{0}")]
+    Other(String),
+}
+
 // ─── Repository trait (declared in domain, impl'd in infra) ─
 
 #[async_trait]
 pub(crate) trait TransactionRepository: Send + Sync + 'static {
     /// Cross-shard fan-out by id. Returns the first shard that
     /// has the row.
-    async fn find_by_id(&self, id: TransactionId) -> Result<Option<Transaction>, String>;
+    async fn find_by_id(&self, id: TransactionId) -> Result<Option<Transaction>, RepoError>;
 
     /// Cross-shard list with keyset cursor + per-shard limit.
     /// Caller is responsible for re-sorting / truncating across
     /// shards if needed (current impl does both).
-    async fn list(&self, filter: &ListFilter) -> Result<Vec<Transaction>, String>;
+    async fn list(&self, filter: &ListFilter) -> Result<Vec<Transaction>, RepoError>;
 
     /// Cross-shard fan-out by reference_id.
     async fn find_status_by_reference(
         &self,
         reference_id: &str,
-    ) -> Result<Option<TransactionStatus>, String>;
+    ) -> Result<Option<TransactionStatus>, RepoError>;
 }
 
 // ─── Idempotency-aware writer trait ─────────────────────────
@@ -78,7 +107,7 @@ pub(crate) trait IdempotencyAwareWriter: Send + Sync + 'static {
         request_hash: &str,
         accepted_payload: &serde_json::Value,
         outbox_payload: &serde_json::Value,
-    ) -> Result<ReserveOutcome, String>;
+    ) -> Result<ReserveOutcome, RepoError>;
 }
 
 #[derive(Debug)]

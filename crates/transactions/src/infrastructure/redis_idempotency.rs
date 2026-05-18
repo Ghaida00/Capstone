@@ -58,7 +58,7 @@ use serde::{Deserialize, Serialize};
 
 use shared_kernel::cache::redis::{RedisCache, CACHE_KEY_VERSION};
 
-use crate::domain::{IdempotencyAwareWriter, ReserveOutcome};
+use crate::domain::{IdempotencyAwareWriter, RepoError, ReserveOutcome};
 
 use super::repository::SqlxIdempotencyWriter;
 
@@ -145,7 +145,7 @@ impl IdempotencyAwareWriter for RedisIdempotencyWriter {
         request_hash: &str,
         accepted_payload: &serde_json::Value,
         outbox_payload: &serde_json::Value,
-    ) -> Result<ReserveOutcome, String> {
+    ) -> Result<ReserveOutcome, RepoError> {
         let entry = RedisReservation {
             request_hash: request_hash.to_string(),
             accepted_payload: accepted_payload.clone(),
@@ -158,7 +158,7 @@ impl IdempotencyAwareWriter for RedisIdempotencyWriter {
             .cache
             .set_nx_ex(&key, &entry, TTL_SECS)
             .await
-            .map_err(|e| format!("redis SET NX: {}", e))?;
+            .map_err(|e| RepoError::Other(format!("redis SET NX: {}", e)))?;
 
         if inserted {
             // Push onto the per-shard pending list so the intake
@@ -167,7 +167,7 @@ impl IdempotencyAwareWriter for RedisIdempotencyWriter {
             self.cache
                 .lpush(&pending_key(shard), idempotency_key)
                 .await
-                .map_err(|e| format!("redis LPUSH: {}", e))?;
+                .map_err(|e| RepoError::Other(format!("redis LPUSH: {}", e)))?;
             metrics::counter!("idempotency_redis_reserved_total").increment(1);
             return Ok(ReserveOutcome::Reserved);
         }
@@ -179,12 +179,12 @@ impl IdempotencyAwareWriter for RedisIdempotencyWriter {
             .cache
             .get_master_raw(&key)
             .await
-            .map_err(|e| format!("redis GET: {}", e))?;
+            .map_err(|e| RepoError::Other(format!("redis GET: {}", e)))?;
 
         match raw {
             Some(s) => {
                 let cached: RedisReservation = serde_json::from_str(&s)
-                    .map_err(|e| format!("deserialize reservation: {}", e))?;
+                    .map_err(|e| RepoError::Other(format!("deserialize reservation: {}", e)))?;
                 if cached.request_hash == request_hash {
                     metrics::counter!("idempotency_redis_replay_total").increment(1);
                     Ok(ReserveOutcome::Replay(cached.accepted_payload))
@@ -231,7 +231,7 @@ impl IdempotencyAwareWriter for HybridIdempotencyWriter {
         request_hash: &str,
         accepted_payload: &serde_json::Value,
         outbox_payload: &serde_json::Value,
-    ) -> Result<ReserveOutcome, String> {
+    ) -> Result<ReserveOutcome, RepoError> {
         match self
             .redis
             .reserve(

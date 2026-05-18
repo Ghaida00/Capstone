@@ -44,12 +44,18 @@ impl Account {
 /// `domain/` and implemented in `infrastructure/` — classic
 /// dependency inversion keeps `domain/` free of `sqlx`.
 ///
-/// The return type is `Result<Option<Account>, String>` where
-/// the `String` carries an infrastructure-level error message.
-/// We keep it opaque here (no sqlx::Error leak) because the
-/// application layer maps it into the port's
-/// `AccountError::Infra(...)` variant.
+/// A-1: returns `Result<_, RepoError>` so the application layer
+/// can pattern-match retryable / non-retryable / observable
+/// failure classes instead of parsing a stringified message.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RepoError {
+    #[error("sqlx: {0}")]
+    Sqlx(#[from] sqlx::Error),
+    #[error("{0}")]
+    Other(String),
+}
+
 #[async_trait]
 pub(crate) trait AccountRepository: Send + Sync + 'static {
-    async fn find_active_by_id(&self, id: &AccountId) -> Result<Option<Account>, String>;
+    async fn find_active_by_id(&self, id: &AccountId) -> Result<Option<Account>, RepoError>;
 }

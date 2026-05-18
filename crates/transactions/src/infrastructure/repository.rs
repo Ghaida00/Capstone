@@ -25,7 +25,8 @@ use shared_kernel::cache::redis::RedisCache;
 use shared_kernel::db::shard::ShardRouter;
 
 use super::super::domain::{
-    IdempotencyAwareWriter, ReserveOutcome, Transaction, TransactionRepository, TransactionStatus,
+    IdempotencyAwareWriter, RepoError, ReserveOutcome, Transaction, TransactionRepository,
+    TransactionStatus,
 };
 use super::super::ports::{ListFilter, TransactionId};
 
@@ -83,7 +84,7 @@ impl SqlxTransactionRepository {
 
 #[async_trait]
 impl TransactionRepository for SqlxTransactionRepository {
-    async fn find_by_id(&self, id: TransactionId) -> Result<Option<Transaction>, String> {
+    async fn find_by_id(&self, id: TransactionId) -> Result<Option<Transaction>, RepoError> {
         // Cross-shard fan-out: spawn one query per shard, each wrapped
         // in `tokio::time::timeout(FIND_BY_ID_PER_SHARD_TIMEOUT, _)`
         // so a degraded shard turns into a per-shard error rather than
@@ -145,12 +146,12 @@ impl TransactionRepository for SqlxTransactionRepository {
             return Ok(found);
         }
         if let Some(err) = last_err {
-            return Err(err);
+            return Err(RepoError::Other(err));
         }
         Ok(None)
     }
 
-    async fn list(&self, filter: &ListFilter) -> Result<Vec<Transaction>, String> {
+    async fn list(&self, filter: &ListFilter) -> Result<Vec<Transaction>, RepoError> {
         let limit = filter.limit.min(100) as i64;
         // Two-phase cross-shard pagination. Each shard fetches its top
         // `limit + 1` rows. The `(limit+1)`th row (if present) is a
@@ -253,7 +254,7 @@ impl TransactionRepository for SqlxTransactionRepository {
         // a partial result is still useful and the error is logged.
         if rows.is_empty() {
             if let Some(err) = last_err {
-                return Err(err);
+                return Err(RepoError::Other(err));
             }
         } else if let Some(err) = last_err {
             tracing::warn!(err = %err, "list: partial shard failure");
@@ -284,7 +285,7 @@ impl TransactionRepository for SqlxTransactionRepository {
     async fn find_status_by_reference(
         &self,
         reference_id: &str,
-    ) -> Result<Option<TransactionStatus>, String> {
+    ) -> Result<Option<TransactionStatus>, RepoError> {
         // Cross-shard transactions can produce TWO rows for the
         // same reference_id — one on the sender shard (consumer
         // bulk-insert) and one on the receiver shard (cross-shard
@@ -340,7 +341,7 @@ impl TransactionRepository for SqlxTransactionRepository {
             return Ok(candidates.into_iter().next());
         }
         if let Some(err) = last_err {
-            return Err(err);
+            return Err(RepoError::Other(err));
         }
         Ok(None)
     }
@@ -431,7 +432,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         request_hash: &str,
         accepted_payload: &serde_json::Value,
         outbox_payload: &serde_json::Value,
-    ) -> Result<ReserveOutcome, String> {
+    ) -> Result<ReserveOutcome, RepoError> {
         let writer = self.shards.writer(shard);
 
         // Optimistic INSERT first. The fresh path is ~95% of
@@ -457,7 +458,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         .bind(outbox_payload)
         .execute(writer)
         .await
-        .map_err(|e| e.to_string())?;
+?;
 
         if inserted.rows_affected() > 0 {
             Self::spawn_cache_set(
@@ -509,7 +510,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         .bind(idempotency_key)
         .fetch_optional(writer)
         .await
-        .map_err(|e| e.to_string())?;
+?;
 
         let Some(existing) = existing else {
             // Row vanished between INSERT and SELECT (cleanup race).
@@ -517,7 +518,9 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
             // this as a clean reservation would risk two concurrent
             // callers both writing outbox rows for the same logical
             // transaction.
-            return Err("idempotency row vanished after INSERT conflict".to_string());
+            return Err(RepoError::Other(
+                "idempotency row vanished after INSERT conflict".to_string(),
+            ));
         };
 
         if existing.request_hash != request_hash {
@@ -566,7 +569,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         .bind(outbox_payload)
         .execute(writer)
         .await
-        .map_err(|e| e.to_string())?;
+?;
 
         if revived.rows_affected() > 0 {
             Self::spawn_cache_set(
@@ -594,7 +597,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         .bind(idempotency_key)
         .fetch_optional(writer)
         .await
-        .map_err(|e| e.to_string())?;
+?;
         let payload = winner
             .and_then(|w| w.response_payload)
             .unwrap_or_else(|| accepted_payload.clone());

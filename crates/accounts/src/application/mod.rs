@@ -78,7 +78,8 @@ impl AccountService for GetBalanceService {
                 Ok(bal)
             }
             Ok(None) => Err(AccountError::NotFound(id.as_str().to_owned())),
-            Err(msg) => Err(AccountError::Infra(msg)),
+            // A-1: RepoError → AccountError::Infra via Display
+            Err(e) => Err(AccountError::Infra(e.to_string())),
         }
     }
 }
