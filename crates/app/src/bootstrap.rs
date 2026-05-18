@@ -439,12 +439,25 @@ pub fn build_router(
     // otherwise the middleware is still attached but in pass-through mode
     // so we have a single code path and tests never need to special-case.
     if config.enable_auth {
-        if let Some(secret) = config.auth_secret.as_deref() {
-            crate::middleware::auth::init_auth(secret);
-            tracing::info!("JWT auth middleware enabled");
-        } else {
-            tracing::error!("ENABLE_AUTH=true but AUTH_SECRET is missing — all requests will 500");
-        }
+        // S-1 / S-2: validate() already guarantees secret +
+        // expected_issuer + expected_audience are set when
+        // ENABLE_AUTH=true, so these unwraps are unreachable
+        // defence-in-depth.
+        let secret = config.auth_secret.as_deref().unwrap_or("");
+        let issuer = config.auth_expected_issuer.as_deref().unwrap_or("");
+        let audience = config.auth_expected_audience.as_deref().unwrap_or("");
+        crate::middleware::auth::init_auth(&crate::middleware::auth::AuthConfig {
+            secret,
+            expected_issuer: issuer,
+            expected_audience: audience,
+            leeway_secs: config.auth_leeway_secs,
+        });
+        tracing::info!(
+            expected_issuer = issuer,
+            expected_audience = audience,
+            leeway_secs = config.auth_leeway_secs,
+            "JWT auth middleware enabled (HS256-pinned; iss/aud/exp/sub required) [S-1/S-2]"
+        );
     } else {
         tracing::info!("JWT auth middleware disabled (ENABLE_AUTH=false)");
     }

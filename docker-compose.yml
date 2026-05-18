@@ -345,6 +345,12 @@ services:
       # here only for experimentation.
       DB_WRITE_RETRY_MAX_ATTEMPTS: "6"
       DB_WRITE_RETRY_BACKOFF_MS: "200"
+      # ── S-1 / S-2: JWT validator config ──────────────────
+      # Required when ENABLE_AUTH=true (validate() fails closed
+      # at boot if missing); ignored when auth is off.
+      AUTH_EXPECTED_ISSUER: "${AUTH_EXPECTED_ISSUER:-}"
+      AUTH_EXPECTED_AUDIENCE: "${AUTH_EXPECTED_AUDIENCE:-}"
+      AUTH_LEEWAY_SECS: "${AUTH_LEEWAY_SECS:-30}"
       # ── R-9: degradation posture seed ────────────────────
       # Safe default = normal. Flip a maintenance window by
       # exporting DEGRADATION_MODE=read_only before `up`, or

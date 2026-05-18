@@ -81,6 +81,17 @@ pub struct Config {
     // Authentication (disabled by default for load testing)
     pub enable_auth: bool,
     pub auth_secret: Option<String>,
+    /// S-2: required when ENABLE_AUTH=true — the validator rejects
+    /// tokens whose `iss` does not match. `None` allowed only when
+    /// auth is off (the validator is never constructed).
+    pub auth_expected_issuer: Option<String>,
+    /// S-2: same shape for the `aud` claim.
+    pub auth_expected_audience: Option<String>,
+    /// S-2: tunable JWT clock-skew leeway (the lib default is 60 s
+    /// — tuned down here to 30 s and made explicit so the choice
+    /// is reader-visible rather than a library implementation
+    /// detail).
+    pub auth_leeway_secs: u64,
 
     /// Toggle the cross-module `accounts.get_balance` check inside
     /// the transactions create hot path. Default OFF: every create
@@ -305,6 +316,15 @@ impl Config {
                 .parse()
                 .unwrap_or(false),
             auth_secret: std::env::var("AUTH_SECRET").ok(),
+            auth_expected_issuer: std::env::var("AUTH_EXPECTED_ISSUER")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            auth_expected_audience: std::env::var("AUTH_EXPECTED_AUDIENCE")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            auth_leeway_secs: env_or("AUTH_LEEWAY_SECS", "30")
+                .parse()
+                .expect("AUTH_LEEWAY_SECS must be a number"),
 
             verify_from_account_exists: env_or("TX_VERIFY_FROM_ACCOUNT", "false")
                 .parse()
@@ -371,6 +391,26 @@ impl Config {
             self.max_concurrent_requests >= 1,
             "MAX_CONCURRENT_REQUESTS must be >= 1"
         );
+
+        // S-2: when JWT enforcement is on, the validator REQUIRES
+        // expected issuer + audience values — without them every
+        // token's iss/aud check is implicitly skipped (or rejects
+        // every token, depending on lib defaults). Fail-closed at
+        // boot rather than discovering at first auth'd request.
+        if self.enable_auth {
+            ensure!(
+                self.auth_secret.as_deref().is_some_and(|s| !s.is_empty()),
+                "AUTH_SECRET must be set (and non-empty) when ENABLE_AUTH=true"
+            );
+            ensure!(
+                self.auth_expected_issuer.is_some(),
+                "AUTH_EXPECTED_ISSUER must be set (and non-empty) when ENABLE_AUTH=true (S-2)"
+            );
+            ensure!(
+                self.auth_expected_audience.is_some(),
+                "AUTH_EXPECTED_AUDIENCE must be set (and non-empty) when ENABLE_AUTH=true (S-2)"
+            );
+        }
 
         // S-3: CORS allowlist must be explicitly set. An empty
         // list is the unsafe-by-default state (would either reject
@@ -521,6 +561,21 @@ impl fmt::Display for Config {
         writeln!(f, "  enable_auth:                  {}", self.enable_auth)?;
         writeln!(
             f,
+            "  auth_expected_issuer:         {}",
+            self.auth_expected_issuer.as_deref().unwrap_or("(unset)")
+        )?;
+        writeln!(
+            f,
+            "  auth_expected_audience:       {}",
+            self.auth_expected_audience.as_deref().unwrap_or("(unset)")
+        )?;
+        writeln!(
+            f,
+            "  auth_leeway_secs:             {}",
+            self.auth_leeway_secs
+        )?;
+        writeln!(
+            f,
             "  idempotency_backend:          {}",
             self.idempotency_backend
         )?;
@@ -643,6 +698,9 @@ mod tests {
             degradation_mode: "normal".to_string(),
             enable_auth: false,
             auth_secret: None,
+            auth_expected_issuer: None,
+            auth_expected_audience: None,
+            auth_leeway_secs: 30,
             verify_from_account_exists: false,
             backpressure_wait_ms: 50,
             idempotency_backend: IdempotencyBackend::Pg,
