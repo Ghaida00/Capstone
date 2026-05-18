@@ -3,18 +3,38 @@
 # (04:00 UTC = 11:00 WIB, off-peak for the project's typical
 # work hours) and on workflow_dispatch for ad-hoc runs.
 #
+# IMPORTANT — which k6 script we run and why:
+#   * k6/load-test.js is the 6-scenario stress / spike / hotkey
+#     suite. It deliberately ramps to 2000 VUs in the spike
+#     phase and to 1000 VUs in the stress phase, with relaxed
+#     thresholds (p(95)<800 ms under spike). It is designed to
+#     run on a real production-class host with the budget the
+#     compose-comment names ("8 cores + 8 GB minimum"); on a
+#     GitHub-hosted ubuntu-latest runner (7 GB / 2 vCPU) the
+#     spike scenario would deliberately push past the runner's
+#     resource budget and produce noise, not signal.
+#   * k6/load-test-1m.js is the steady-state, constant-arrival-
+#     rate suite. Tight thresholds throughout (p(95)<50 ms POST,
+#     p(95)<10 ms balance) at a sustained arrival rate for 15
+#     minutes. This is the script the project's empirical
+#     verification rounds (WP7 through WP10) actually used to
+#     produce the green-bar SLO numbers; it is what "did the
+#     SLO hold under realistic sustained traffic" looks like
+#     in a single executable check, and it is the appropriate
+#     gate for nightly trend tracking.
+#
 # Strategy:
 #   1. `docker compose up -d --wait` brings the full stack up
 #      with healthcheck-gated start.
 #   2. `setup-probe.js` runs first — fails fast if the pipeline
 #      is wedged before VUs spin up (the existing
 #      end-to-end smoke probe).
-#   3. `load-test.js` runs the realistic 6-scenario suite. The
-#      `--summary-export` output is the small JSON artifact we
-#      retain for trend tracking (the per-data-point `--out
-#      json=` output is far too large to retain nightly — see
-#      the WP10 verification run where the per-point output
-#      was 2.4 GB for a single 15-minute run).
+#   3. `load-test-1m.js` runs the steady-state suite (see note
+#      above). `--summary-export` writes the small summary JSON
+#      that trend tracking actually needs; the per-data-point
+#      `--out json=` output was multi-GB on a 15-min run (the
+#      WP10 outliers.json file the project captured for the
+#      tail-latency investigation), too large to retain nightly.
 #   4. Compose teardown is unconditional so a workflow failure
 #      does not leak containers on a self-hosted runner.
 
@@ -77,8 +97,13 @@ jobs:
       # retention. Per-data-point JSON (`--out json=`) would be
       # multi-GB per run; the summary is ~5 KB and is what
       # historical trend panels actually need.
+      #
+      # load-test-1m.js: 15-minute constant-arrival-rate steady-
+      # state run. See the workflow header for why this is the
+      # right choice for CI vs. load-test.js's spike/stress
+      # suite (which is meant for a production-class host).
       - name: k6 load test
-        run: k6 run --quiet --summary-export=k6-summary.json k6/load-test.js
+        run: k6 run --quiet --summary-export=k6-summary.json k6/load-test-1m.js
 
       - name: Upload k6 summary
         if: always()
