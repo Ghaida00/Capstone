@@ -30,15 +30,16 @@ pub struct Config {
     pub db_write_pool_size: u32,
     pub db_read_pool_size: u32,
 
-    // Timeouts (seconds)
-    /// Advisory only. The Postgres statement timeout is enforced
-    /// **server-side** as an `ALTER DATABASE` default by
-    /// `db/bootstrap/bootstrap-schema.sh` (D-1/R-3) — required because
-    /// the write path is pooled by pgBouncer in transaction mode,
-    /// which rejects client-supplied connection options. This field
-    /// is retained for the validation that it stays `< api_timeout_secs`;
-    /// removing it is tracked as a WP10 cleanup candidate.
-    pub db_query_timeout_secs: u64,
+    // Timeouts (seconds). NOTE: `DB_QUERY_TIMEOUT_SECS` is NOT a
+    // field on this struct. The Postgres statement timeout is
+    // enforced server-side as an `ALTER DATABASE` default by
+    // `db/bootstrap/bootstrap-schema.sh` (D-1/R-3 in the audit) —
+    // required because the write path is pooled by pgBouncer in
+    // transaction mode, which rejects client-supplied connection
+    // options. The carried `db_query_timeout_secs` knob from the
+    // pre-WP1b design was removed in WP10 because it was dead
+    // config — never read by any pool constructor, but its
+    // presence implied a control surface that did not exist.
     pub redis_command_timeout_secs: u64,
     pub api_timeout_secs: u64,
 
@@ -215,10 +216,8 @@ impl Config {
 
             // Tighter outer→inner timeouts: under load we'd rather fail
             // fast (and let the client retry / get a 503) than block a
-            // request thread for 5–30 s.
-            db_query_timeout_secs: env_or("DB_QUERY_TIMEOUT_SECS", "2")
-                .parse()
-                .expect("DB_QUERY_TIMEOUT_SECS must be a number"),
+            // request thread for 5–30 s. (Postgres statement_timeout
+            // is server-side now — see field comment above.)
             redis_command_timeout_secs: env_or("REDIS_COMMAND_TIMEOUT_SECS", "1")
                 .parse()
                 .expect("REDIS_COMMAND_TIMEOUT_SECS must be a number"),
@@ -363,22 +362,15 @@ impl Config {
             self.redis_pool_size
         );
 
-        // Timeouts — downstream timeouts must be shorter than the API timeout
-        ensure!(
-            self.db_query_timeout_secs > 0,
-            "DB_QUERY_TIMEOUT_SECS must be > 0"
-        );
+        // Timeouts — downstream timeouts must be shorter than the
+        // API timeout. (Postgres statement_timeout is server-side
+        // now and not represented in this struct — see the field
+        // comment in the timeouts block.)
         ensure!(
             self.redis_command_timeout_secs > 0,
             "REDIS_COMMAND_TIMEOUT_SECS must be > 0"
         );
         ensure!(self.api_timeout_secs > 0, "API_TIMEOUT_SECS must be > 0");
-        ensure!(
-            self.db_query_timeout_secs < self.api_timeout_secs,
-            "DB_QUERY_TIMEOUT_SECS ({}) must be < API_TIMEOUT_SECS ({})",
-            self.db_query_timeout_secs,
-            self.api_timeout_secs
-        );
         ensure!(
             self.redis_command_timeout_secs < self.api_timeout_secs,
             "REDIS_COMMAND_TIMEOUT_SECS ({}) must be < API_TIMEOUT_SECS ({})",
@@ -502,11 +494,6 @@ impl fmt::Display for Config {
             f,
             "  db_read_pool_size:            {}",
             self.db_read_pool_size
-        )?;
-        writeln!(
-            f,
-            "  db_query_timeout_secs:        {}",
-            self.db_query_timeout_secs
         )?;
         writeln!(
             f,
@@ -677,7 +664,6 @@ mod tests {
             database_shard2_write_url: Some("postgres://user:pass@host:5432/db".to_string()),
             db_write_pool_size: 30,
             db_read_pool_size: 50,
-            db_query_timeout_secs: 5,
             redis_command_timeout_secs: 3,
             api_timeout_secs: 30,
             redis_url: "redis://127.0.0.1:6379".to_string(),
@@ -723,14 +709,6 @@ mod tests {
     fn pool_size_over_max_fails() {
         let mut cfg = test_config();
         cfg.db_read_pool_size = 501;
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn db_timeout_greater_than_api_timeout_fails() {
-        let mut cfg = test_config();
-        cfg.db_query_timeout_secs = 31;
-        cfg.api_timeout_secs = 30;
         assert!(cfg.validate().is_err());
     }
 
