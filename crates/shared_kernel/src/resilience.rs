@@ -48,11 +48,12 @@ fn state_from_u8(v: u8) -> BreakerState {
 /// double-flip but the call path never blocks. Cloning shares the
 /// same `Arc<Inner>` so every wiring site of a given dependency
 /// observes one breaker.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DependencyBreaker {
     inner: Arc<Inner>,
 }
 
+#[derive(Debug)]
 struct Inner {
     /// Stable dependency label (`db` | `redis` | `rabbitmq`) used
     /// for the typed error and the `dependency_breaker_state`

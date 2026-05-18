@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use sqlx::FromRow;
 
-use shared_kernel::db::failover::retry_transient;
+use shared_kernel::db::failover::retry_transient_with_breaker;
 use shared_kernel::db::shard::ShardRouter;
 
 use super::super::domain::{Account, AccountRepository};
@@ -50,8 +50,12 @@ impl AccountRepository for SqlxAccountRepository {
         // Reads are idempotent — retry transient connection
         // errors over the read-replica pool. Matches the
         // semantics of the legacy handler in
-        // src/api/handlers::get_balance.
-        let row: Option<UsersRow> = retry_transient(
+        // src/api/handlers::get_balance. R-7: routes through the
+        // ShardRouter's DB breaker so a known-down DB fails fast
+        // (`AppError::DependencyDown { name: "db" }` -> 503 +
+        // Retry-After) instead of consuming the retry budget.
+        let row: Option<UsersRow> = retry_transient_with_breaker(
+            router.db_breaker(),
             || {
                 let account_number = account_number.clone();
                 async move {
