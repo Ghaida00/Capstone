@@ -72,3 +72,22 @@ groups:
           severity: ticket
         annotations:
           summary: "Cross-shard refund path stuck past MAX_ATTEMPTS for 30+ min: sender debited, no compensation. Run docs/runbooks/cross-shard-outbox-reconciliation.md (refund branch)."
+
+  # R-6: rate-limiter Redis-sync degradation. When the sync fails,
+  # each replica silently falls back to enforcing only its LOCAL
+  # counter, so the effective global ceiling becomes N ×
+  # per_replica — the limiter claims a number it no longer
+  # enforces. The sync runs ~1/s, so sustained failure ≈ ~1/s
+  # increments; 0.1/s catches real degradation while ignoring a
+  # single self-healing blip. for=2m: a one-off Redis hiccup
+  # recovers on the next tick; 2m sustained is a real posture
+  # change worth paging (fail-open on a security control).
+  - name: peakload-rate-limiter
+    rules:
+      - alert: PeakloadRateLimiterRedisSyncFailing
+        expr: sum by (kind) (rate(rate_limiter_redis_sync_failures_total[5m])) > 0.1
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Rate-limiter Redis sync failing (kind={{ $labels.kind }}): global ceiling degraded to per-replica (effective limit = N x per_replica). Edge limiter is the backstop; investigate Redis/Sentinel."

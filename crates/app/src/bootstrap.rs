@@ -138,6 +138,10 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics::describe_counter!("cache_hits_total", "Cache hits");
     metrics::describe_counter!("cache_misses_total", "Cache misses");
     metrics::describe_counter!("rate_limited_total", "Rate limited requests");
+    metrics::describe_counter!(
+        "rate_limiter_redis_sync_failures_total",
+        "Rate-limiter Redis sync failures (label `kind`: `pool_get` = could not acquire a Redis connection; `pipeline` = the INCRBY/EXPIRE pipeline errored). Each failure means the global ceiling silently degraded to per-replica enforcement (effective limit = N × per_replica) until Redis recovers — page on sustained non-zero rate (R-6)."
+    );
     metrics::describe_counter!("backpressure_shed_total", "Backpressure shed requests");
     metrics::describe_gauge!("backpressure_in_flight", "In-flight requests");
     metrics::describe_gauge!("circuit_breaker_state", "Circuit breaker state");

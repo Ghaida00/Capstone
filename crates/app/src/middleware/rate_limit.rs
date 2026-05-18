@@ -167,17 +167,53 @@ impl RateLimiter {
             return;
         }
 
-        if let Ok(mut conn) = self.pool.get().await {
-            let mut pipe = redis::pipe();
-            for (ip, count) in &snapshot {
-                let key = format!("rl:global:{}", ip);
-                pipe.cmd("INCRBY").arg(&key).arg(*count as i64).ignore();
-                pipe.cmd("EXPIRE")
-                    .arg(&key)
-                    .arg(self.window_secs as i64)
-                    .ignore();
+        // R-6: both failure paths below were silently swallowed.
+        // When the Redis round-trip fails, every replica keeps
+        // enforcing only its LOCAL counter, so the effective
+        // global ceiling silently becomes `N × per_replica_limit`
+        // — the limiter claims to enforce a number it no longer
+        // enforces. An attacker who can keep Redis just stressed
+        // enough to fail the sync (or who waits for a Sentinel
+        // flip) gets multiplicative burst tolerance. Emit a
+        // counter + WARN on each path so the degradation is a
+        // page-able signal, not an invisible posture change.
+        let mut conn = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                metrics::counter!(
+                    "rate_limiter_redis_sync_failures_total",
+                    "kind" => "pool_get"
+                )
+                .increment(1);
+                tracing::warn!(
+                    error = %e,
+                    "rate-limit Redis sync skipped: pool acquire failed — \
+                     global ceiling degraded to per-replica until Redis recovers"
+                );
+                return;
             }
-            let _: Result<(), _> = pipe.query_async(&mut *conn).await;
+        };
+
+        let mut pipe = redis::pipe();
+        for (ip, count) in &snapshot {
+            let key = format!("rl:global:{}", ip);
+            pipe.cmd("INCRBY").arg(&key).arg(*count as i64).ignore();
+            pipe.cmd("EXPIRE")
+                .arg(&key)
+                .arg(self.window_secs as i64)
+                .ignore();
+        }
+        if let Err(e) = pipe.query_async::<()>(&mut *conn).await {
+            metrics::counter!(
+                "rate_limiter_redis_sync_failures_total",
+                "kind" => "pipeline"
+            )
+            .increment(1);
+            tracing::warn!(
+                error = %e,
+                "rate-limit Redis sync failed: pipeline query errored — \
+                 global ceiling degraded to per-replica until Redis recovers"
+            );
         }
     }
 }
