@@ -62,7 +62,10 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+# proptest used to live here but no proptest! block in `app` exercised
+# it (T-2). The shared_kernel router properties and the transactions
+# domain properties cover the workspace's property-test surface; this
+# crate adds the dep back the day a property arrives.
 axum-test = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }

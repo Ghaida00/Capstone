@@ -39,6 +39,11 @@ notifications = { path = "../notifications" }
 axum-test = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+# T-2: property-based tests for the request_hash / idempotency_key /
+# validate_amount invariants. These are the financial-correctness
+# properties the audit named as the highest-value proptest targets
+# (SHA-256 injectivity, DECIMAL(18,2) scale, key uniqueness).
+proptest = { workspace = true }
 
 [lints]
 workspace = true

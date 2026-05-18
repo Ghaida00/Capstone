@@ -728,3 +728,123 @@ mod tests {
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
+
+// ─── Property-based tests for financial-correctness invariants (T-2) ─
+//
+// The three audit-prescribed properties for the
+// transactions::application surface. Property tests pay off where
+// invariants are easy to state but hard to enumerate by example:
+//
+//   * `hash_request` is a collision-resistant deterministic function
+//     over the canonical input tuple. A payload-tamper attack
+//     succeeds iff this property fails.
+//   * `validate_amount` accepts iff DECIMAL(18,2) accepts. A
+//     mismatch silently rounds money on the consumer INSERT.
+//   * `idempotency_key` is injective over (shard, reference_id).
+//     A collision means two logically-distinct requests share a
+//     reservation slot and the second one replays the first one's
+//     response.
+//
+// Each property runs proptest's default of 256 cases. `_test` suffix
+// avoids macro-expansion shadow collisions with the regression
+// tests above.
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use rust_decimal::Decimal;
+
+    proptest! {
+        /// `hash_request` is injective over distinct input tuples
+        /// (collision resistance of SHA-256 + the `0xff` field
+        /// separator together). Tests the contract the audit names
+        /// as the highest-stakes financial-correctness invariant:
+        /// if two distinct payloads hash equal, the second one
+        /// replays the first one's accepted response, which is a
+        /// payload-tamper bypass.
+        ///
+        /// Strategy: two independently-drawn tuples drawn from a
+        /// space that comfortably exceeds SHA-256's birthday bound
+        /// at 256 trial pairs; collision probability is ~2^-256
+        /// per pair, so the property is empirically equivalent to
+        /// "always distinct" — a failure would mean the separator
+        /// or the field-order shifted in a way the constructor
+        /// drifted from.
+        #[test]
+        fn hash_request_distinct_inputs_distinct_outputs(
+            from1 in "[A-Z]{3}_[0-9]{4}",
+            to1   in "[A-Z]{3}_[0-9]{4}",
+            amt1  in 1_i64..1_000_000_000_i64,
+            ref1  in "[a-zA-Z0-9._-]{1,40}",
+            desc1 in "[ -~]{0,100}",
+            from2 in "[A-Z]{3}_[0-9]{4}",
+            to2   in "[A-Z]{3}_[0-9]{4}",
+            amt2  in 1_i64..1_000_000_000_i64,
+            ref2  in "[a-zA-Z0-9._-]{1,40}",
+            desc2 in "[ -~]{0,100}",
+        ) {
+            let amt1_str = Decimal::new(amt1, 2).to_string();
+            let amt2_str = Decimal::new(amt2, 2).to_string();
+            let h1 = hash_request(&from1, &to1, &amt1_str, "IDR", &ref1, Some(&desc1));
+            let h2 = hash_request(&from2, &to2, &amt2_str, "IDR", &ref2, Some(&desc2));
+            let inputs_equal =
+                from1 == from2 && to1 == to2 && amt1 == amt2 && ref1 == ref2 && desc1 == desc2;
+            if inputs_equal {
+                prop_assert_eq!(h1, h2);
+            } else {
+                prop_assert_ne!(h1, h2);
+            }
+        }
+
+        /// `validate_amount`'s decision matches the DB invariant
+        /// it gates: accept iff `amount > 0 AND scale ≤ 2 AND
+        /// amount ≤ DECIMAL(18,2) max`. A mismatch on the scale
+        /// edge silently rounds money on the consumer's
+        /// DECIMAL(18,2) INSERT; a mismatch on the overflow edge
+        /// trips a runtime CHECK and aborts the whole batch.
+        ///
+        /// Strategy: mantissa bounded so the only way to overflow
+        /// the DB max is via the scale itself, keeping the rule
+        /// crisp on every drawn input.
+        #[test]
+        fn validate_amount_matches_db_constraint(
+            mantissa in 1_i64..=1_000_000_000_000_000_000_i64,
+            scale in 0_u32..=4_u32,
+        ) {
+            let amt = Decimal::new(mantissa, scale);
+            let max = Decimal::new(999_999_999_999_999_999_i64, 2);
+            let should_reject = scale > 2 || amt > max;
+            let res = validate_amount(amt);
+            if should_reject {
+                prop_assert!(res.is_err(), "expected Err for {amt} (scale={scale})");
+            } else {
+                prop_assert!(res.is_ok(), "expected Ok for {amt} (scale={scale})");
+            }
+        }
+
+        /// `idempotency_key(shard, ref)` is injective. The format
+        /// `txn:{shard}:{ref}` is injective regardless of what's
+        /// in `ref` because `shard` is rendered as an integer
+        /// (cannot contain `:` or be empty), so the two `:` in
+        /// the format mark unambiguous field boundaries — every
+        /// distinct `(shard, ref)` pair therefore produces a
+        /// distinct key. Property pins that for any later
+        /// refactor (e.g. dropping the prefix, swapping the
+        /// separator) that would silently break it.
+        #[test]
+        fn idempotency_key_injective(
+            shard1 in 0_usize..1024,
+            shard2 in 0_usize..1024,
+            ref1   in "[ -~]{1,80}",
+            ref2   in "[ -~]{1,80}",
+        ) {
+            let k1 = idempotency_key(shard1, &ref1);
+            let k2 = idempotency_key(shard2, &ref2);
+            if shard1 == shard2 && ref1 == ref2 {
+                prop_assert_eq!(k1, k2);
+            } else {
+                prop_assert_ne!(k1, k2);
+            }
+        }
+    }
+}
