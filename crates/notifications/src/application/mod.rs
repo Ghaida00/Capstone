@@ -29,6 +29,14 @@ use super::ports::{NotificationEntry, NotificationError, NotificationKind, Notif
 /// against accidental "give me everything" queries.
 const MAX_RECENT: usize = 200;
 
+/// Clamp the caller-supplied `limit` into `[1, MAX_RECENT]`.
+/// Extracted so the bound is unit-testable (T-3) — a future
+/// drift of either edge is then caught at <1ms instead of via a
+/// k6 panel saying "/notifications/recent returned 0 rows".
+fn clamp_recent_limit(limit: usize) -> usize {
+    limit.clamp(1, MAX_RECENT)
+}
+
 // ─── Read-side service ─────────────────────────────────────
 
 pub(crate) struct NotificationLogService {
@@ -44,7 +52,7 @@ impl NotificationLogService {
 #[async_trait]
 impl NotificationLog for NotificationLogService {
     async fn recent(&self, limit: usize) -> Result<Vec<NotificationEntry>, NotificationError> {
-        let clamped = limit.clamp(1, MAX_RECENT);
+        let clamped = clamp_recent_limit(limit);
         self.store.recent(clamped).await
     }
 }
@@ -194,5 +202,107 @@ fn map_event_to_entry(event: &Event) -> Option<NotificationEntry> {
             })
         }
         _ => None,
+    }
+}
+
+// ─── Unit tests for pure domain helpers (T-3) ───────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared_kernel::events::{Event, EVENT_TRANSACTIONS_COMMITTED};
+
+    // ── clamp_recent_limit ────────────────────────────────
+
+    #[test]
+    fn clamp_recent_limit_lifts_zero_to_one() {
+        // `store.recent(0)` would return zero rows and the
+        // caller would get an empty page even though entries
+        // exist; the clamp turns 0 into the smallest useful
+        // page.
+        assert_eq!(clamp_recent_limit(0), 1);
+    }
+
+    #[test]
+    fn clamp_recent_limit_caps_oversize_to_max() {
+        assert_eq!(clamp_recent_limit(MAX_RECENT + 1), MAX_RECENT);
+        assert_eq!(clamp_recent_limit(usize::MAX), MAX_RECENT);
+    }
+
+    #[test]
+    fn clamp_recent_limit_passes_through_in_range() {
+        for n in [1, 10, 100, MAX_RECENT] {
+            assert_eq!(clamp_recent_limit(n), n);
+        }
+    }
+
+    // ── map_event_to_entry ────────────────────────────────
+
+    fn committed_event(payload: serde_json::Value) -> Event {
+        // Hand-build to avoid Event::new's strict serialise path;
+        // letting the test inject arbitrary `payload` JSON is the
+        // whole point of the "malformed payload" case.
+        Event {
+            id: Uuid::new_v4(),
+            name: EVENT_TRANSACTIONS_COMMITTED.to_owned(),
+            occurred_at: Utc::now(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn map_event_to_entry_returns_none_for_irrelevant_event() {
+        let evt = Event {
+            id: Uuid::new_v4(),
+            name: "accounts.created".to_owned(),
+            occurred_at: Utc::now(),
+            payload: serde_json::json!({}),
+        };
+        assert!(map_event_to_entry(&evt).is_none());
+    }
+
+    #[test]
+    fn map_event_to_entry_returns_some_for_well_formed_committed() {
+        let evt = committed_event(serde_json::json!({
+            "to_account":   "ACC_0000002",
+            "from_account": "ACC_0000001",
+            "amount":       "12.34",
+            "currency":     "IDR",
+            "reference_id": "ref-1",
+        }));
+        let entry = map_event_to_entry(&evt).expect("should produce entry");
+        assert_eq!(entry.recipient, "ACC_0000002");
+        assert!(matches!(entry.kind, NotificationKind::TransactionCommitted));
+        assert!(entry.summary.contains("ACC_0000001"));
+        assert!(entry.summary.contains("12.34"));
+        assert!(entry.summary.contains("IDR"));
+        assert!(entry.summary.contains("ref-1"));
+    }
+
+    #[test]
+    fn map_event_to_entry_handles_committed_without_reference_id() {
+        // `reference_id` is `Option<String>` — the summary
+        // branch with no `ref` must still produce a valid entry.
+        let evt = committed_event(serde_json::json!({
+            "to_account":   "ACC_0000002",
+            "from_account": "ACC_0000001",
+            "amount":       "1.00",
+            "currency":     "IDR",
+        }));
+        let entry = map_event_to_entry(&evt).expect("should produce entry");
+        assert_eq!(entry.recipient, "ACC_0000002");
+        assert!(!entry.summary.contains("ref"));
+    }
+
+    #[test]
+    fn map_event_to_entry_returns_none_on_malformed_payload() {
+        // Missing required field `to_account` — decode fails;
+        // the dispatcher logs + bumps a counter and returns
+        // None rather than crashing the loop.
+        let evt = committed_event(serde_json::json!({
+            "from_account": "ACC_0000001",
+            "amount":       "1.00",
+            "currency":     "IDR",
+        }));
+        assert!(map_event_to_entry(&evt).is_none());
     }
 }
