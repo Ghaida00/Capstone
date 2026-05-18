@@ -289,7 +289,15 @@ impl Config {
                 .parse()
                 .expect("MAX_CONCURRENT_REQUESTS must be a number"),
 
-            cors_allowed_origins: parse_csv_env("CORS_ALLOWED_ORIGINS", "*"),
+            // S-3: default is empty, NOT "*". `validate()` rejects
+            // an empty allowlist so the deployment must make the
+            // wildcard decision explicit. Existing `.env` files
+            // already set `CORS_ALLOWED_ORIGINS=*` (running stack)
+            // — no regression; `validate()` additionally emits a
+            // WARN when the resolved list contains `*` so a
+            // production deploy that left the dev wildcard in
+            // place is visible in logs.
+            cors_allowed_origins: parse_csv_env("CORS_ALLOWED_ORIGINS", ""),
 
             degradation_mode: env_or("DEGRADATION_MODE", "normal"),
 
@@ -363,6 +371,24 @@ impl Config {
             self.max_concurrent_requests >= 1,
             "MAX_CONCURRENT_REQUESTS must be >= 1"
         );
+
+        // S-3: CORS allowlist must be explicitly set. An empty
+        // list is the unsafe-by-default state (would either reject
+        // every cross-origin browser request OR — in the old wide-
+        // open default — accept every one). Force the deployment
+        // to make the decision.
+        ensure!(
+            !self.cors_allowed_origins.is_empty(),
+            "CORS_ALLOWED_ORIGINS must be set (non-empty list, or \"*\" for development)"
+        );
+        if self.cors_allowed_origins.iter().any(|o| o == "*") {
+            tracing::warn!(
+                origins = ?self.cors_allowed_origins,
+                "CORS_ALLOWED_ORIGINS contains \"*\" — every origin is allowed. \
+                 Expected only in development; restrict to an explicit allowlist \
+                 in production (S-3)."
+            );
+        }
 
         // R-9: degradation posture must be a recognised value, or
         // the process would silently fall back to Normal and an
@@ -670,6 +696,26 @@ mod tests {
         let mut cfg = test_config();
         cfg.rate_limit_per_second = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn empty_cors_allowlist_fails_validation() {
+        // S-3: an unset CORS_ALLOWED_ORIGINS env var must abort
+        // boot rather than silently default to "deny everything"
+        // (or, worse, the prior "*" default).
+        let mut cfg = test_config();
+        cfg.cors_allowed_origins = vec![];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn wildcard_cors_allowlist_validates_with_warn() {
+        // S-3: "*" is a legitimate dev/test setting; validate()
+        // accepts it but emits a startup WARN (side-effect not
+        // captured here — covered by the integration boot probe).
+        let mut cfg = test_config();
+        cfg.cors_allowed_origins = vec!["*".to_string()];
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
