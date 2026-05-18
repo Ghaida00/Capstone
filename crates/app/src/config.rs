@@ -21,7 +21,12 @@ pub struct Config {
     pub database_shard0_read_urls: Vec<String>,
     pub database_shard1_write_url: String,
     pub database_shard1_read_urls: Vec<String>,
-    pub database_shard2_write_url: String,
+    /// Disabled shard 2 — kept as `Option` after S-6 dropped
+    /// credentialed defaults from `from_env`. `None` is the
+    /// normal state (the compose service for shard 2 is
+    /// commented out); re-enabling shard 2 requires the env var
+    /// AND a corresponding pgBouncer/Patroni stack.
+    pub database_shard2_write_url: Option<String>,
     pub db_write_pool_size: u32,
     pub db_read_pool_size: u32,
 
@@ -166,29 +171,27 @@ impl Config {
             // the Patroni migration path (under which these defaults
             // stay unchanged because the HA tool sits behind HAProxy).
 
+            // S-6: credentialed defaults removed — env vars are
+            // REQUIRED. The compose stack supplies them via .env
+            // (which substitutes ${POSTGRES_USER}/${POSTGRES_PASSWORD}
+            // into each URL), so the running stack continues to
+            // boot; a deployment that forgets to set them fails
+            // closed at process start rather than silently embedding
+            // the demo password. Pairs with the Twelve-Factor "open-
+            // source-the-code without leaking credentials" litmus
+            // test (audit S-6).
+            //
             // Shard 0
-            database_shard0_write_url: env_or(
-                "DATABASE_SHARD0_WRITE_URL",
-                "postgres://peakload_user:peakload_secure_pass@pgbouncer-shard0:5432/peakload_db",
-            ),
-            database_shard0_read_urls: parse_csv_env(
-                "DATABASE_SHARD0_READ_URLS",
-                "postgres://peakload_user:peakload_secure_pass@pg-shard0-node-a:5432/peakload_db,postgres://peakload_user:peakload_secure_pass@pg-shard0-node-b:5432/peakload_db",
-            ),
+            database_shard0_write_url: must_env("DATABASE_SHARD0_WRITE_URL"),
+            database_shard0_read_urls: must_csv_env("DATABASE_SHARD0_READ_URLS"),
             // Shard 1
-            database_shard1_write_url: env_or(
-                "DATABASE_SHARD1_WRITE_URL",
-                "postgres://peakload_user:peakload_secure_pass@pgbouncer-shard1:5432/peakload_db",
-            ),
-            database_shard1_read_urls: parse_csv_env(
-                "DATABASE_SHARD1_READ_URLS",
-                "postgres://peakload_user:peakload_secure_pass@pg-shard1-node-a:5432/peakload_db,postgres://peakload_user:peakload_secure_pass@pg-shard1-node-b:5432/peakload_db",
-            ),
-            // Shard 2
-            database_shard2_write_url: env_or(
-                "DATABASE_SHARD2_WRITE_URL",
-                "postgres://peakload_user:peakload_secure_pass@pgbouncer-shard2:5432/peakload_db",
-            ),
+            database_shard1_write_url: must_env("DATABASE_SHARD1_WRITE_URL"),
+            database_shard1_read_urls: must_csv_env("DATABASE_SHARD1_READ_URLS"),
+            // Shard 2 — disabled in compose; .env does not define
+            // the URL. Optional so unset is the normal case, not
+            // a boot failure. Re-enabling shard 2 requires setting
+            // the env var alongside the corresponding compose service.
+            database_shard2_write_url: std::env::var("DATABASE_SHARD2_WRITE_URL").ok(),
             // Pool sizes raised: previous defaults bottlenecked at the
             // app↔pgBouncer hop. With 4 replicas each pool is now sized
             // to soak its share of 1000 concurrent VUs without queueing.
@@ -244,10 +247,8 @@ impl Config {
                 .parse()
                 .expect("DB_WRITE_RETRY_MAX_ATTEMPTS must be a number"),
 
-            rabbitmq_url: env_or(
-                "RABBITMQ_URL",
-                "amqp://peakload_user:peakload_secure_pass@localhost:5672",
-            ),
+            // S-6: same fail-closed treatment as the DB URLs.
+            rabbitmq_url: must_env("RABBITMQ_URL"),
 
             // Per-IP limiter ceiling. R-5: the *default* is the
             // production-safe value; benchmarks override it via
@@ -510,7 +511,10 @@ impl fmt::Display for Config {
         writeln!(
             f,
             "  database_shard2_write_url:    {}",
-            mask_url(&self.database_shard2_write_url)
+            self.database_shard2_write_url
+                .as_deref()
+                .map(mask_url)
+                .unwrap_or_else(|| "(unset — shard 2 disabled)".to_string())
         )?;
         writeln!(
             f,
@@ -548,6 +552,26 @@ fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// S-6: env var with NO compiled-in fallback. Aborts process
+/// startup if unset — the failure message names the variable so
+/// the operator sees it in stderr instead of an opaque "boot
+/// failed".
+fn must_env(key: &str) -> String {
+    env::var(key).unwrap_or_else(|_| {
+        panic!("{key} must be set (S-6: no credentialed defaults; see .env.example)")
+    })
+}
+
+/// S-6: comma-separated env var with NO fallback (same fail-closed
+/// posture as `must_env` for the read-replica URL lists).
+fn must_csv_env(key: &str) -> Vec<String> {
+    must_env(key)
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn parse_csv_env(key: &str, default: &str) -> Vec<String> {
     let raw = env::var(key).unwrap_or_else(|_| default.to_string());
     raw.split(',')
@@ -569,7 +593,7 @@ mod tests {
             database_shard0_read_urls: vec!["postgres://user:pass@host:5432/db".to_string()],
             database_shard1_write_url: "postgres://user:pass@host:5432/db".to_string(),
             database_shard1_read_urls: vec!["postgres://user:pass@host:5432/db".to_string()],
-            database_shard2_write_url: "postgres://user:pass@host:5432/db".to_string(),
+            database_shard2_write_url: Some("postgres://user:pass@host:5432/db".to_string()),
             db_write_pool_size: 30,
             db_read_pool_size: 50,
             db_query_timeout_secs: 5,
