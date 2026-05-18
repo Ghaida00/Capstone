@@ -432,6 +432,10 @@ pub fn build_router(
     let auth_state = crate::middleware::auth::AuthState {
         enabled: config.enable_auth,
     };
+    // Separate clone for the admin sub-router (R-2). Kept distinct
+    // here so a future change to the v2 protection-stack auth
+    // policy does not silently relax the admin gate.
+    let auth_state_admin = auth_state.clone();
 
     // Fix #10: Build CORS layer from configuration
     let cors = build_cors_layer(config);
@@ -500,7 +504,22 @@ pub fn build_router(
     // `nest_service` method accepts any `Service`, bridging the
     // mismatch without forcing module deps to implement
     // `FromRef<AppState>`.
+    // R-2: admin sub-router for operator queries on cross-shard
+    // outbox state and audit-row 'processing' rows. Uses
+    // `require_admin_middleware` (refuses outright when
+    // `ENABLE_AUTH=false`, requires JWT `role="admin"` when on)
+    // instead of the v2 protection stack — the operator surface
+    // does not need rate-limit / circuit-breaker / backpressure
+    // gating (low traffic, already authorised, no customer-impacting
+    // throughput concern). Carries `AppState` directly so the
+    // handlers can reach `state.shard_router`.
+    let admin_router = crate::admin::router().layer(axum_middleware::from_fn_with_state(
+        auth_state_admin,
+        crate::middleware::auth::require_admin_middleware,
+    ));
+
     Router::new()
+        .nest("/api/v2/admin", admin_router)
         .nest_service("/api/v2/accounts", accounts_router)
         .nest_service("/api/v2/transactions", transactions_router)
         .nest_service("/api/v2/notifications", notifications_router)

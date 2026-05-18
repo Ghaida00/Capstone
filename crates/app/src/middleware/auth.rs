@@ -15,10 +15,17 @@ use serde_json::json;
 static DECODING_KEY: OnceCell<DecodingKey> = OnceCell::new();
 
 /// Standard JWT claims we accept.
+///
+/// `role` is optional so existing tokens (issued before the admin
+/// surface existed) still parse — they simply do not satisfy the
+/// `require_admin` gate. A token with `role = "admin"` is the only
+/// shape that passes the admin middleware.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
     pub sub: String,
     pub exp: usize,
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 /// Initialise the shared decoding key. Returns Err if called twice
@@ -87,4 +94,87 @@ pub async fn auth_middleware(
         )
             .into_response(),
     }
+}
+
+/// Admin-only middleware for the `/api/v2/admin/*` operator surface.
+///
+/// Stricter than `auth_middleware` in two ways:
+///   1. Refuses with 403 when `AuthState.enabled == false`. Admin
+///      endpoints would otherwise be wide open in any environment
+///      that has not flipped `ENABLE_AUTH=true` — a foot-gun that
+///      defeats the whole point of gating them.
+///   2. Requires the JWT to carry `role = "admin"`. A regular
+///      user token authenticates but cannot enumerate stuck
+///      outbox rows or in-flight customer transactions.
+///
+/// Does its own decode (rather than chaining to `auth_middleware`
+/// + reading shared state) so the admin router can wire a single
+/// middleware layer; the cost is one extra HMAC verify per admin
+/// request, which is negligible given the low traffic shape of
+/// an operator surface.
+pub async fn require_admin_middleware(
+    axum::extract::State(state): axum::extract::State<AuthState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !state.enabled {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "admin_disabled",
+                       "message": "admin surface requires ENABLE_AUTH=true"})),
+        )
+            .into_response();
+    }
+
+    let key = match DECODING_KEY.get() {
+        Some(k) => k,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "auth_misconfigured",
+                           "message": "AUTH_SECRET not set"})),
+            )
+                .into_response();
+        }
+    };
+
+    let token = match req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+    {
+        Some(t) => t.to_string(),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "missing_token",
+                           "message": "Authorization: Bearer <jwt> required"})),
+            )
+                .into_response();
+        }
+    };
+
+    let claims = match decode::<Claims>(&token, key, &Validation::default()) {
+        Ok(data) => data.claims,
+        Err(e) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "invalid_token",
+                           "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    if claims.role.as_deref() != Some("admin") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "admin_role_required",
+                       "message": "JWT claim `role` must equal \"admin\""})),
+        )
+            .into_response();
+    }
+
+    next.run(req).await
 }
