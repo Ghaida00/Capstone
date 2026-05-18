@@ -276,7 +276,22 @@ services:
     ports:
       - "8080:80"
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # OPS-2 / S-5: rendered by the official image's envsubst step
+      # (20-envsubst-on-templates.sh) at container start.
+      - ./nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+    environment:
+      # Edge rate-limit knobs. Default = production-safe ceiling.
+      # Benchmarks restore bench throughput by exporting the high
+      # values before `docker compose up` (e.g. in .env or shell):
+      #   NGINX_PER_IP_RATE=50000 NGINX_GLOBAL_RATE=100000 \
+      #   NGINX_PER_IP_BURST=10000 NGINX_GLOBAL_BURST=50000
+      NGINX_PER_IP_RATE: "${NGINX_PER_IP_RATE:-2000}"
+      NGINX_GLOBAL_RATE: "${NGINX_GLOBAL_RATE:-50000}"
+      NGINX_PER_IP_BURST: "${NGINX_PER_IP_BURST:-2000}"
+      NGINX_GLOBAL_BURST: "${NGINX_GLOBAL_BURST:-10000}"
+      # Render the full main config (not a conf.d snippet) to
+      # /etc/nginx/nginx.conf.
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
     depends_on:
       app:
         condition: service_healthy
