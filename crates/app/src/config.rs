@@ -119,6 +119,22 @@ fn idempotency_backend_from_env() -> IdempotencyBackend {
 }
 
 impl Config {
+    /// `rate_limit_per_second` at or above this is effectively no
+    /// limit for human traffic (it only ever trips a deliberate
+    /// load generator). `validate()` emits a startup WARN so an
+    /// operator running with a benchmark override in production
+    /// sees it in the logs rather than discovering it during an
+    /// abuse incident. 50 000 r/s/IP ≈ 4.3 billion requests/day
+    /// from one source — far past any legitimate client.
+    pub const RATE_LIMIT_WARN_THRESHOLD: u64 = 50_000;
+
+    /// True when the per-IP limiter is set so high it is a no-op
+    /// for real traffic (R-5). Extracted as a predicate so the
+    /// threshold is unit-testable without capturing log output.
+    pub fn rate_limit_effectively_off(&self) -> bool {
+        self.rate_limit_per_second >= Self::RATE_LIMIT_WARN_THRESHOLD
+    }
+
     /// Load configuration from environment variables with sensible defaults.
     pub fn from_env() -> Self {
         Self {
@@ -228,18 +244,22 @@ impl Config {
                 "amqp://peakload_user:peakload_secure_pass@localhost:5672",
             ),
 
-            // Per-IP limiter ceiling. Old defaults (10 000 / 20 000)
-            // were modelled for many distinct clients; under a
-            // single-source load test the entire k6 fleet shares
-            // one IP and routinely overshoots, producing the
-            // `not rate limited` failures seen in the spike
-            // scenario. Bumped so the limiter is effectively a
-            // safety belt during benchmarks; keep an eye on it
-            // before exposing the service publicly.
-            rate_limit_per_second: env_or("RATE_LIMIT_PER_SECOND", "100000")
+            // Per-IP limiter ceiling. R-5: the *default* is the
+            // production-safe value; benchmarks override it via
+            // env (the load-test `.env` / compose sets a high
+            // value explicitly). Shipping the bench value as the
+            // default is "dangerous defaults, safe overrides" —
+            // the limiter is then effectively off in every
+            // environment where someone forgot to set the env var,
+            // which is the normal case, not the exception. 2000
+            // r/s per IP is a defensible starting point for this
+            // API; `validate()` WARNs if it is ever raised to a
+            // level where the limiter is a no-op for human traffic
+            // (see RATE_LIMIT_WARN_THRESHOLD).
+            rate_limit_per_second: env_or("RATE_LIMIT_PER_SECOND", "2000")
                 .parse()
                 .expect("RATE_LIMIT_PER_SECOND must be a number"),
-            rate_limit_burst: env_or("RATE_LIMIT_BURST", "200000")
+            rate_limit_burst: env_or("RATE_LIMIT_BURST", "4000")
                 .parse()
                 .expect("RATE_LIMIT_BURST must be a number"),
 
@@ -341,6 +361,19 @@ impl Config {
             self.rate_limit_per_second > 0,
             "RATE_LIMIT_PER_SECOND must be > 0"
         );
+        // R-5: not a hard failure (benchmarks legitimately raise
+        // it) but it must never pass silently — an unbounded
+        // limiter in production is a security gap, not a config
+        // typo.
+        if self.rate_limit_effectively_off() {
+            tracing::warn!(
+                rate_limit_per_second = self.rate_limit_per_second,
+                threshold = Self::RATE_LIMIT_WARN_THRESHOLD,
+                "RATE_LIMIT_PER_SECOND is at or above the no-op threshold — the per-IP \
+                 limiter is effectively OFF for human traffic. Expected only on a \
+                 load-test host; if this is production, an override leaked."
+            );
+        }
 
         // Circuit breaker
         ensure!(
@@ -590,6 +623,34 @@ mod tests {
         let mut cfg = test_config();
         cfg.rate_limit_per_second = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn safe_rate_limit_not_flagged_as_effectively_off() {
+        let mut cfg = test_config();
+        cfg.rate_limit_per_second = 2000; // the new production-safe default
+        assert!(!cfg.rate_limit_effectively_off());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn benchmark_rate_limit_is_flagged_but_still_valid() {
+        // R-5: a benchmark override is allowed (validate still Ok —
+        // it is a WARN, not a hard failure) but MUST be flagged so
+        // it cannot pass silently into production.
+        let mut cfg = test_config();
+        cfg.rate_limit_per_second = 100_000;
+        assert!(cfg.rate_limit_effectively_off());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rate_limit_warn_threshold_boundary() {
+        let mut cfg = test_config();
+        cfg.rate_limit_per_second = Config::RATE_LIMIT_WARN_THRESHOLD - 1;
+        assert!(!cfg.rate_limit_effectively_off());
+        cfg.rate_limit_per_second = Config::RATE_LIMIT_WARN_THRESHOLD;
+        assert!(cfg.rate_limit_effectively_off());
     }
 
     #[test]
