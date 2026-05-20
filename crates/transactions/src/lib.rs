@@ -6,9 +6,9 @@
 //! the consumer they shared the queue with also lives here now
 //! at `infrastructure/consumer.rs` (Step A).
 //!
-//! See `docs/architecture/phase2-transactions-walkthrough.md`
-//! for the file-by-file tour. The module mirrors the shape of
-//! `accounts/` so the navigation is identical.
+//! See the crate [`README.md`](../../README.md) for the per-module
+//! checklist; the module mirrors the shape of `accounts/` so the
+//! navigation is identical.
 //!
 //! Dependency position: this crate DEPENDS on
 //! `accounts::ports::DynAccountService`, injected at startup

@@ -22,11 +22,13 @@ For why the workspace has a dedicated composition-root crate see
 ## Middleware stack
 
 Applied uniformly to every `/api/v2/*` sub-router via
-`apply_protection_stack` in [`bootstrap.rs`](./src/bootstrap.rs):
+`apply_protection_stack` in [`bootstrap.rs`](./src/bootstrap.rs).
 
-```
-request → backpressure → circuit_breaker → rate_limit → auth → handler
-```
+The full canonical middleware-order list (TraceLayer → … → handler,
+including the outer-router layers and the R-9 degradation gate) lives
+in [`docs/architecture.md` §6 — Cross-cutting concerns](../../docs/architecture.md#6-cross-cutting-concerns).
+That section is the single source of truth so this README does not
+drift away from it again (DOC-9 in the WP13 reconciliation).
 
 | File                                                              | Concern                                                |
 |-------------------------------------------------------------------|--------------------------------------------------------|

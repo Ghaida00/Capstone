@@ -9,9 +9,13 @@ info:
   title: Exploding User Data Scalabilities (Topik B.4)
   description: |
     Prototype sistem manajemen Peak Load yang dibangun dengan Rust.
-    Sistem ini menangani transaksi finansial dengan mekanisme sharding, idempotency, 
+    Sistem ini menangani transaksi finansial dengan mekanisme sharding, idempotency,
     dan pemrosesan asinkron via RabbitMQ.
-  version: "1.0.0"
+  # 2.0.0 reflects the post-Phase-4 v1 cull (ADR-0007 Step B —
+  # routes renamed from /api/v1/* to /api/v2/*, `users` resource
+  # renamed to `accounts`). The previous 1.0.0 was the pre-cull
+  # surface and is gone from the running system.
+  version: "2.0.0"
 
 
 components:
@@ -144,6 +148,27 @@ components:
           type: string
           example: "active"
 
+    # Shared error envelope. Matches the actual runtime wire shape
+    # emitted by `shared_kernel::error::AppError::into_response`.
+    # NOT the same envelope as the success-path `ApiResponse`:
+    # error responses do NOT carry `success: false` or `data: null` —
+    # they are a separate two-key shape with `error` (machine-readable
+    # type tag) and `message` (human-readable detail).
+    ErrorResponse:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: |
+            Stable, machine-readable error tag. Use this for client
+            retry / error-mapping logic; the `message` field is
+            human-readable and may change.
+          example: "rate_limited"
+        message:
+          type: string
+          example: "Too many requests, please try again later"
+
     HealthResponse:
       type: object
       properties:
@@ -161,6 +186,129 @@ components:
               type: boolean
             rabbitmq:
               type: boolean
+
+    # One entry in the notifications ring buffer. Wire shape mirrors
+    # `notifications::ports::NotificationEntry` 1:1; `kind` is a
+    # snake_case stable wire-level identifier (do not rename without
+    # a wire-break bump).
+    NotificationEntry:
+      type: object
+      required: [id, kind, recipient, summary, payload, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [transaction_committed]
+        recipient:
+          type: string
+          description: |
+            Free-form recipient identifier. For `transaction_committed`
+            this is the `to_account` (the receiving side gets the
+            "money landed" alert).
+          example: "ACC_0000002"
+        summary:
+          type: string
+          description: Human-readable one-liner suitable for list display.
+          example: "Received 12.34 IDR from ACC_0000001 (ref ref-1)"
+        payload:
+          type: object
+          description: Original event payload, kept for audit / detail views.
+        created_at:
+          type: string
+          format: date-time
+
+  # Reusable response shapes — every error path uses one of these
+  # so the wire contract is uniform across endpoints and changes
+  # land in one place. The HTTP statuses match the actual responses
+  # the middleware stack and AppError mapping emit.
+  responses:
+    BadRequest:
+      description: |
+        Validation error, missing required field, or idempotency-key
+        reused with a different payload (`error: "bad_request"`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Unauthorized:
+      description: |
+        Missing or invalid bearer token when `ENABLE_AUTH=true`
+        (`error: "unauthorized"`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Forbidden:
+      description: |
+        Authenticated but lacking required role (e.g. `/api/v2/admin/*`
+        requires `role=admin`); also returned with `error: "admin_disabled"`
+        when admin routes are hit while `ENABLE_AUTH=false`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    NotFound:
+      description: |
+        Resource not found (`error: "not_found"`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    RateLimited:
+      description: |
+        Rate-limit exceeded for this client IP. Retry after the
+        `Retry-After` header value (`error: "rate_limited"`).
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds to wait before retrying.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    CircuitBreakerOpen:
+      description: |
+        Edge breaker tripped on accumulated 5xx; service temporarily
+        unavailable until the half-open probe succeeds
+        (`error: "circuit_breaker_open"`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    ServiceOverloaded:
+      description: |
+        Backpressure shed: in-flight concurrency cap reached and the
+        queue wait expired (`error: "service_overloaded"`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    DependencyDown:
+      description: |
+        Per-dependency breaker tripped (e.g. DB/Redis/RabbitMQ);
+        fail-fast 503 (`error: "dependency_down"`). The `Retry-After`
+        header carries the recovery hint.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds to wait before retrying.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    DegradedReadOnly:
+      description: |
+        R-9 graceful-degradation mode is `read_only` or `essential_only`;
+        write methods (POST / PUT / DELETE) are shed
+        (`error: "degraded_read_only"`).
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds to wait before retrying.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    InternalError:
+      description: |
+        Unhandled internal error (`error: "internal_error"`,
+        `database_error`, or `cache_error` depending on origin).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
 
   # S-8: securitySchemes declares the auth mechanism the runtime
   # actually enforces (when ENABLE_AUTH=true) so the contract
@@ -217,18 +365,38 @@ paths:
   /api/v2/transactions:
     get:
       summary: List Transactions
-      description: Mengambil daftar transaksi terakhir dari semua shard.
+      description: |
+        Mengambil daftar transaksi terakhir dari semua shard.
+
+        **Pagination uses a keyset cursor**, NOT `offset` — passing
+        `offset` returns 400. Use `before` + `before_id` from the
+        last row of the previous page to fetch the next page.
       parameters:
         - name: limit
           in: query
+          description: Page size. Hard-capped server-side; default 20.
           schema:
             type: integer
             default: 20
-        - name: offset
+            minimum: 1
+        - name: before
           in: query
+          description: |
+            RFC-3339 timestamp of the last row from the previous page
+            (`created_at`). Returns rows older than this timestamp.
           schema:
-            type: integer
-            default: 0
+            type: string
+            format: date-time
+        - name: before_id
+          in: query
+          description: |
+            UUID of the last row from the previous page. Required
+            alongside `before` to disambiguate rows that share a
+            `created_at` (the keyset cursor's second half — without
+            it, ties at a page boundary drop or duplicate rows).
+          schema:
+            type: string
+            format: uuid
       responses:
         '200':
           description: OK
@@ -243,18 +411,36 @@ paths:
                         type: array
                         items:
                           $ref: '#/components/schemas/Transaction'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
     post:
       summary: Create Transaction
       description: |
         Membuat transaksi baru. Menggunakan mekanisme idempotency lewat `reference_id`.
         Transaksi akan dimasukkan ke antrian (RabbitMQ) dan diproses secara asinkron.
+
+        **Idempotency contract**: a retry with the same `reference_id`
+        AND the same body returns the same `202 Accepted` envelope.
+        A retry with the same `reference_id` but a different body
+        returns `400` with `error: "bad_request"` and a message
+        naming the conflict (the payload-tamper protection — see
+        the T-6 fault-injection tests).
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/CreateTransactionRequest'
+            example:
+              from_account: "ACC_0000001"
+              to_account: "ACC_0000002"
+              amount: "12345.67"
+              currency: "IDR"
+              reference_id: "ref-2026-05-21-001"
+              description: "Salary payment"
       responses:
         '202':
           description: Accepted (Queued)
@@ -267,10 +453,18 @@ paths:
                     properties:
                       data:
                         $ref: '#/components/schemas/TransactionCreatedResponse'
-        '400':
-          description: Bad Request (Validation Error)
-        '429':
-          description: Too Many Requests (Rate Limited)
+              example:
+                success: true
+                message: null
+                data:
+                  reference_id: "ref-2026-05-21-001"
+                  status: "accepted"
+                  message: "Transaction queued for processing (shard 1)"
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ServiceOverloaded' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /api/v2/transactions/{id}:
     get:
@@ -295,8 +489,10 @@ paths:
                     properties:
                       data:
                         $ref: '#/components/schemas/Transaction'
-        '404':
-          description: Not Found
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /api/v2/transactions/status/{reference_id}:
     get:
@@ -320,6 +516,10 @@ paths:
                     properties:
                       data:
                         $ref: '#/components/schemas/TransactionStatusResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /api/v2/accounts/{account_number}/balance:
     get:
@@ -346,5 +546,49 @@ paths:
                     properties:
                       data:
                         $ref: '#/components/schemas/BalanceResponse'
-        '404':
-          description: Account Not Found
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/DependencyDown' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /api/v2/notifications/recent:
+    get:
+      summary: Recent Notifications
+      description: |
+        Returns the most recent in-memory notification entries,
+        newest-first. The store is currently an in-memory ring
+        buffer in the `notifications` module (planned migration to
+        a persistent `notification_log` table per the notifications
+        crate README). Page size is clamped server-side to a
+        hard cap (`MAX_RECENT = 200`); callers may pass a smaller
+        value via `limit`.
+      parameters:
+        - name: limit
+          in: query
+          description: |
+            Caller-supplied page size. Clamped to `[1, MAX_RECENT]`
+            (currently 200). A `limit=0` is silently lifted to 1
+            and an oversize value is capped at MAX_RECENT.
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/NotificationEntry'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }

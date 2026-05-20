@@ -6,8 +6,8 @@
 //!                wiring constructor, re-exported for bootstrap use.
 //!
 //! Everything else is `pub(crate)` or private. Widening visibility
-//! beyond that is a review blocker; see
-//! docs/architecture/dependency-rules.md §2.
+//! beyond that is a review blocker; the port-adapter shape is
+//! documented in `docs/adr/0003-port-adapter-shape.md`.
 //!
 //! This file is deliberately commented out so the template does not
 //! contribute compile work until the module is real. When you copy

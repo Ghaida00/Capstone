@@ -6,10 +6,10 @@
 //! arrives in this file is already deserialised into module-owned
 //! shapes.
 //!
-//! See `docs/architecture/module-anatomy.md` §3 for why the
-//! repository trait declared here lives in `domain/` rather than
-//! in `infrastructure/`: domain says what it needs, infrastructure
-//! implements it. Classic dependency inversion.
+//! The repository trait declared here lives in `domain/` rather
+//! than `infrastructure/` so the dependency-inversion rule from
+//! [ADR-0003](../../../../docs/adr/0003-port-adapter-shape.md)
+//! holds: domain says what it needs, infrastructure implements it.
 
 use async_trait::async_trait;
 use serde::Deserialize;

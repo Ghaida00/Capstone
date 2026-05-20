@@ -7,8 +7,9 @@
 //! `transactions` AND a `notifications/recent` entry referencing
 //! the same `reference_id`.
 //!
-//! Regression detector for the Phase-2 follow-up consumer rewire —
-//! see `docs/architecture/cutover-readiness.md` §2.3.
+//! Regression detector for the Phase-2 follow-up consumer rewire
+//! (see [ADR-0007](../../../docs/adr/0007-v1-cull-and-rename.md)
+//! Step A — "consumer module moved into `transactions/`").
 
 use std::sync::Arc;
 use std::time::Duration;

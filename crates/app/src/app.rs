@@ -26,7 +26,8 @@ pub struct App {
     /// Shared-kernel cross-module bus. One instance per process,
     /// exposed as both a publisher (handed to the queue consumer)
     /// and a subscriber (handed to the notifications module). See
-    /// `docs/architecture/phase3-notifications-walkthrough.md`.
+    /// [ADR-0004](../../../docs/adr/0004-in-process-event-bus.md)
+    /// for the rationale and the planned AMQP swap surface.
     event_publisher: Arc<dyn EventPublisher>,
     event_subscriber: Arc<dyn EventSubscriber>,
 }
@@ -92,7 +93,7 @@ impl App {
     /// 5. Database connection pools are closed.
     pub async fn run(self) -> anyhow::Result<()> {
         // Start the shard-aware queue consumer with a child token.
-        // After the Step-A rewire (cutover-readiness §1) the consumer
+        // After the Step-A rewire (ADR-0007 Step A) the consumer
         // lives in `transactions::infrastructure::consumer`; the
         // bootstrap calls one entry point and the `transactions`
         // crate owns its full write path. The publisher half of the

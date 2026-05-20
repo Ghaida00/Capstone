@@ -1,7 +1,7 @@
 //! Pure domain layer for this module.
 //!
 //! Rules (enforced by review; see
-//! docs/architecture/dependency-rules.md §2):
+//! `docs/adr/0003-port-adapter-shape.md` for the full rule set):
 //!
 //!   * No `sqlx`, `redis`, `axum`, `reqwest`, or any I/O crate.
 //!   * No `tokio::fs`, no `tokio::net`.
