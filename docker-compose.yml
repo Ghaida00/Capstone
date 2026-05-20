@@ -772,6 +772,9 @@ services:
   # boot against an un-migrated schema.
   # ============================================================
   db-migrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: peakload-app
     container_name: peakload-db-migrator
     command: ["/app/peakload-capstone", "--migrate"]
