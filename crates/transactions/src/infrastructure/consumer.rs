@@ -55,7 +55,15 @@ use shared_kernel::events::{Event, EventPublisher, EVENT_TRANSACTIONS_COMMITTED}
 
 const QUEUE_NAME: &str = "transactions.process";
 const CONSUMER_TAG: &str = "peakload-consumer";
-const BATCH_SIZE: usize = 100;
+/// Maximum messages buffered before a size-flush triggers. Raised
+/// from 100 to 200 in Phase 2: per-batch overhead collapsed to a
+/// single `apply_transactions_batch` function call, so larger
+/// batches amortise fixed cost over more messages without a
+/// proportional rise in per-batch wall time. The AMQP prefetch
+/// derives from this value (`basic_qos(0, BATCH_SIZE as u16, …)`),
+/// so the broker delivers up to 200 unacked messages per consumer
+/// — within pgbouncer's `MAX_DB_CONNECTIONS = 200`.
+const BATCH_SIZE: usize = 200;
 /// Maximum time a partial batch waits in the buffer with no new
 /// arrival before the timer flushes it. Under sustained load the
 /// idle window never opens (messages arrive every few ms), so the
