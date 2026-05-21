@@ -795,39 +795,26 @@ struct ShardOutcome {
     skipped_tags: Vec<u64>,
 }
 
-/// Tx structure (atomic on `pool`):
+/// Apply one shard's batch via the `apply_transactions_batch`
+/// PL/pgSQL function — a single round-trip that runs the per-row
+/// claim / debit / credit / refund / outbox sequence server-side.
 ///
-/// 1. **Claim slots** — bulk INSERT a placeholder row (status='pending',
-///    processed_at=NOW()) for every message, `ON CONFLICT (reference_id,
-///    from_account) DO NOTHING RETURNING id, reference_id, from_account`.
-///    Messages whose key was already inserted by a prior batch (or a
-///    concurrent batch racing this one) lose the claim and are reported
-///    as `skipped` — they ARE NOT debited again.
-/// 2. For each message that won the claim:
-///    a. UPDATE balance debit (atomic check-and-decrement).
-///    b. If debit matched zero rows: mark message 'failed', continue.
-///    c. If receiver lives on this shard: UPDATE balance credit. If
-///    credit matched zero rows (recipient missing): refund the
-///    sender atomically within this tx, mark message 'failed'.
-///    d. Else: queue an outbox row for the cross-shard processor.
-/// 3. Bulk INSERT outbox rows (in tx).
-/// 4. Bulk UPDATE the placeholder transactions rows to terminal
-///    ('completed' or 'failed') status.
-/// 5. tx.commit().
+/// The function returns one `(idx, outcome, assigned_id)` row per
+/// input message; this fn marshals the batch into the function's
+/// array arguments and maps the outcomes onto `ShardOutcome`.
+/// `idx` is 1-based (PL/pgSQL `FOR i IN 1..n`).
 ///
-/// Why insert-first rather than the previous SELECT-then-UPDATE:
-/// the dedupe SELECT runs at READ COMMITTED snapshot time, so two
-/// concurrent batches racing on the same `(reference_id, from_account)`
-/// could both see "no row exists", both proceed to debit, and only
-/// one INSERT survive `ON CONFLICT DO NOTHING`. The losing batch's
-/// debit became silent money loss. INSERT-first turns the
-/// `(reference_id, from_account)` UNIQUE constraint into the
-/// serialisation point: only the writer that successfully inserts
-/// the placeholder owns the slot for the rest of the tx.
+/// Outcome semantics, preserved from the previous per-statement
+/// Rust loop: a debit checks the running balance (two debits from
+/// one `from_account` in a batch see each other's effects); a
+/// same-shard credit miss refunds the sender atomically; a
+/// cross-shard row queues a `cross_shard_outbox` row in the same
+/// transaction and leaves the sender row 'processing'.
 ///
-/// On any DB error before commit the whole batch returns Err. The
-/// caller decides per-error class whether to requeue or fall back
-/// to a per-message retry that isolates the bad row.
+/// On any DB error — including a poison row that aborts the
+/// function and rolls back the tx — the whole batch returns Err;
+/// the caller (`flush_batch_to_shards`) falls back to a per-message
+/// retry that isolates the bad row.
 async fn process_shard_batch(
     pool: &sqlx::PgPool,
     sender_shard: usize,
@@ -846,175 +833,116 @@ async fn process_shard_batch(
         });
     }
 
-    let mut tx = pool.begin().await?;
-
-    // Claim the (reference_id, from_account) slot up front. The
-    // returned map covers ONLY the messages whose row was actually
-    // inserted; everything else lost the claim race and is an
-    // idempotent skip.
-    let claimed: std::collections::HashMap<(String, String), Uuid> =
-        bulk_claim_slots(&mut tx, messages).await?;
-
-    let mut completed_msgs: Vec<PendingMessage> = Vec::with_capacity(messages.len());
-    let mut failed_msgs: Vec<PendingMessage> = Vec::new();
-    // Cross-shard rows: sender-side audit row stays at 'processing'
-    // until `cross_shard_processor` confirms the credit landed on
-    // the receiver. Marking these 'completed' at sender commit time
-    // would surface a "completed" status to clients during the
-    // 250 ms+ window before the cross-shard apply runs, even though
-    // the recipient has not been credited yet.
-    let mut processing_msgs: Vec<PendingMessage> = Vec::new();
-    // (msg, receiver_shard) — outbox rows queued for cross-shard credit.
-    let mut cross_shard_outbox: Vec<(PendingMessage, usize)> = Vec::new();
-    // Intra-batch dedupe: ON CONFLICT DO NOTHING returns one
-    // placeholder per key, so without this two messages sharing
-    // (ref_id, from) would both look up the same id and double-debit.
-    let mut consumed: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::new();
+    // Marshal the batch into the function's array arguments. UUIDs
+    // for transactions.id and cross_shard_outbox.id are generated
+    // here so the function needs no pgcrypto / gen_random_uuid.
+    // Messages with a NULL reference_id are rejected to DLQ by the
+    // consume() callback before reaching this loop; defense-in-depth
+    // skips any that slip through, and the kept subset stays
+    // index-aligned with `owned` below.
+    let n = messages.len();
+    let mut ids: Vec<Uuid> = Vec::with_capacity(n);
+    let mut outbox_ids: Vec<Uuid> = Vec::with_capacity(n);
+    let mut from_accounts: Vec<String> = Vec::with_capacity(n);
+    let mut to_accounts: Vec<String> = Vec::with_capacity(n);
+    let mut amounts: Vec<Decimal> = Vec::with_capacity(n);
+    let mut currencies: Vec<String> = Vec::with_capacity(n);
+    let mut reference_ids: Vec<String> = Vec::with_capacity(n);
+    let mut descriptions: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut receiver_shards: Vec<i32> = Vec::with_capacity(n);
+    let mut owned: Vec<&PendingMessage> = Vec::with_capacity(n);
 
     for msg in messages {
         let ref_id = match msg.request.reference_id.as_deref() {
             Some(r) => r.to_string(),
-            // The `consume` callback rejects messages with a NULL
-            // reference_id to DLQ before they ever land in the
-            // buffer; defense-in-depth — skip this row.
             None => {
                 skipped_tags.push(msg.delivery_tag);
                 continue;
             }
         };
-        let key = (ref_id, msg.request.from_account.clone());
-        let assigned_id = match claimed.get(&key) {
-            Some(id) => *id,
-            None => {
-                tracing::debug!(
-                    reference_id = %key.0,
-                    from_account = %key.1,
-                    "Skipping already-claimed message (idempotent redelivery)"
+        ids.push(Uuid::new_v4());
+        outbox_ids.push(Uuid::new_v4());
+        from_accounts.push(msg.request.from_account.clone());
+        to_accounts.push(msg.request.to_account.clone());
+        amounts.push(msg.request.amount);
+        currencies.push(msg.request.currency.clone());
+        reference_ids.push(ref_id);
+        descriptions.push(msg.request.description.clone());
+        receiver_shards.push(router.shard_for_account(&msg.request.to_account) as i32);
+        owned.push(msg);
+    }
+
+    if owned.is_empty() {
+        return Ok(ShardOutcome {
+            completed,
+            failed_tags,
+            skipped_tags,
+        });
+    }
+
+    // Single round-trip: the function loops server-side and returns
+    // one row per input. It runs in the connection's implicit
+    // transaction; a poison row aborts it, sqlx surfaces the error,
+    // and `flush_batch_to_shards` routes the whole batch into the
+    // per-message poison-fallback (`process_messages_individually`).
+    let outcomes: Vec<(i32, String, Option<Uuid>)> = sqlx::query_as(
+        r#"SELECT idx, outcome, assigned_id
+           FROM apply_transactions_batch(
+               $1::uuid[], $2::uuid[], $3::text[], $4::text[],
+               $5::numeric[], $6::text[], $7::text[], $8::text[],
+               $9::int[], $10::int
+           )"#,
+    )
+    .bind(&ids)
+    .bind(&outbox_ids)
+    .bind(&from_accounts)
+    .bind(&to_accounts)
+    .bind(&amounts)
+    .bind(&currencies)
+    .bind(&reference_ids)
+    .bind(&descriptions)
+    .bind(&receiver_shards)
+    .bind(sender_shard as i32)
+    .fetch_all(pool)
+    .await?;
+
+    for (idx_one_based, outcome, assigned_id) in outcomes {
+        // PL/pgSQL `FOR i IN 1..n` yields idx starting at 1.
+        let i = match (idx_one_based as usize).checked_sub(1) {
+            Some(i) if i < owned.len() => i,
+            _ => {
+                tracing::error!(
+                    idx = idx_one_based,
+                    "apply_transactions_batch returned out-of-range idx"
                 );
-                skipped_tags.push(msg.delivery_tag);
                 continue;
             }
         };
-        if !consumed.insert(key.clone()) {
-            tracing::debug!(
-                reference_id = %key.0,
-                from_account = %key.1,
-                "Skipping intra-batch duplicate"
-            );
-            metrics::counter!("transactions_intra_batch_dupes_total").increment(1);
-            skipped_tags.push(msg.delivery_tag);
-            continue;
-        }
-
-        let mut owned = msg.clone();
-        owned.id = Some(assigned_id);
-
-        // Debit sender: atomic check-and-decrement against an
-        // active row. The `status = 'active'` predicate is what
-        // closes the bug where the API layer's `verify_from_account`
-        // is OFF and an inactive/blocked sender's tx would otherwise
-        // be silently debited.
-        let updated = sqlx::query(
-            "UPDATE users SET balance = balance - $1 \
-             WHERE account_number = $2 AND balance >= $1 AND status = 'active'",
-        )
-        .bind(owned.request.amount)
-        .bind(&owned.request.from_account)
-        .execute(&mut *tx)
-        .await?;
-
-        if updated.rows_affected() == 0 {
-            // Insufficient balance OR sender missing — both surface
-            // here as a no-op debit. Persist as 'failed'.
-            failed_msgs.push(owned);
-            continue;
-        }
-
-        // Credit recipient. Filter on `status = 'active'` so a
-        // blocked/inactive recipient is treated the same as a
-        // missing one — refund the sender and mark failed rather
-        // than crediting funds to an account that can't transact.
-        let receiver_shard = router.shard_for_account(&owned.request.to_account);
-        if receiver_shard == sender_shard {
-            let credited = sqlx::query(
-                "UPDATE users SET balance = balance + $1 \
-                 WHERE account_number = $2 AND status = 'active'",
-            )
-            .bind(owned.request.amount)
-            .bind(&owned.request.to_account)
-            .execute(&mut *tx)
-            .await?;
-
-            if credited.rows_affected() == 0 {
-                // Recipient missing or not active on this shard.
-                // Compensate the sender's debit atomically within
-                // the same tx so money is never lost. Mark
-                // message 'failed'.
-                tracing::warn!(
-                    from = %owned.request.from_account,
-                    to = %owned.request.to_account,
-                    "same-shard credit hit no row, refunding sender"
-                );
-                metrics::counter!("same_shard_credit_missing_total").increment(1);
-                sqlx::query("UPDATE users SET balance = balance + $1 WHERE account_number = $2")
-                    .bind(owned.request.amount)
-                    .bind(&owned.request.from_account)
-                    .execute(&mut *tx)
-                    .await?;
-                failed_msgs.push(owned);
-                continue;
+        let src = owned[i];
+        match outcome.as_str() {
+            // Same-shard 'completed' and cross-shard 'processing'
+            // are both durably committed and both ACK at the
+            // consumer. publish_committed_events emits one
+            // transactions.committed per row so the cache
+            // invalidator DELs stale keys; the cross-shard
+            // processor emits a second one when it flips
+            // 'processing' -> 'completed'.
+            "completed" | "processing" => {
+                let mut m = src.clone();
+                m.id = assigned_id;
+                completed.push(m);
             }
-            completed_msgs.push(owned);
-        } else {
-            // Cross-shard credit deferred to outbox row written
-            // INSIDE this tx — atomic with the debit. The sender
-            // audit row commits as 'processing' and is flipped to
-            // 'completed' by `cross_shard_processor` only after the
-            // receiver shard's credit lands.
-            cross_shard_outbox.push((owned.clone(), receiver_shard));
-            processing_msgs.push(owned);
+            "failed" => failed_tags.push(src.delivery_tag),
+            "skipped" => skipped_tags.push(src.delivery_tag),
+            other => {
+                tracing::error!(
+                    outcome = other,
+                    "apply_transactions_batch returned unknown outcome — treating as skipped"
+                );
+                skipped_tags.push(src.delivery_tag);
+            }
         }
     }
-
-    // Insert outbox rows in same tx as debit.
-    if !cross_shard_outbox.is_empty() {
-        let outbox_refs: Vec<(&PendingMessage, usize)> =
-            cross_shard_outbox.iter().map(|(m, s)| (m, *s)).collect();
-        bulk_insert_outbox(&mut tx, &outbox_refs).await?;
-    }
-
-    // ─── Promote placeholder rows from 'pending' ────────────
-    // Same-shard outcomes are terminal here ('completed' /
-    // 'failed'). Cross-shard rows go to the non-terminal
-    // 'processing' state — `cross_shard_processor` flips them to
-    // 'completed' once the receiver-shard credit lands, or to
-    // 'reversed' on the recipient-missing refund path.
-    if !failed_msgs.is_empty() {
-        bulk_update_status(&mut tx, &failed_msgs, "failed").await?;
-        for msg in &failed_msgs {
-            failed_tags.push(msg.delivery_tag);
-        }
-    }
-
-    if !completed_msgs.is_empty() {
-        bulk_update_status(&mut tx, &completed_msgs, "completed").await?;
-        completed.extend(completed_msgs);
-    }
-
-    if !processing_msgs.is_empty() {
-        bulk_update_status(&mut tx, &processing_msgs, "processing").await?;
-        // Both same-shard 'completed' and cross-shard 'processing'
-        // rows are durably committed at this point. Publish the
-        // `transactions.committed` event for both so the cache
-        // invalidator DELs the per-id / per-status keys; clients
-        // who poll status during the cross-shard window then read
-        // the truthful 'processing' state from the DB instead of a
-        // stale cached value.
-        completed.extend(processing_msgs);
-    }
-
-    tx.commit().await?;
 
     Ok(ShardOutcome {
         completed,
@@ -1072,156 +1000,6 @@ struct ShardSplit {
     skipped_tags: Vec<u64>,
     dlq_tags: Vec<u64>,
     requeue_tags: Vec<u64>,
-}
-
-async fn bulk_insert_outbox(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    rows: &[(&PendingMessage, usize)],
-) -> Result<(), AppError> {
-    let n = rows.len();
-    let mut ids: Vec<Uuid> = Vec::with_capacity(n);
-    let mut from_accounts: Vec<String> = Vec::with_capacity(n);
-    let mut to_accounts: Vec<String> = Vec::with_capacity(n);
-    let mut to_shards: Vec<i32> = Vec::with_capacity(n);
-    let mut amounts: Vec<Decimal> = Vec::with_capacity(n);
-    let mut currencies: Vec<String> = Vec::with_capacity(n);
-    let mut reference_ids: Vec<String> = Vec::with_capacity(n);
-    let mut descriptions: Vec<Option<String>> = Vec::with_capacity(n);
-    for (msg, to_shard) in rows {
-        ids.push(Uuid::new_v4());
-        from_accounts.push(msg.request.from_account.clone());
-        to_accounts.push(msg.request.to_account.clone());
-        to_shards.push(*to_shard as i32);
-        amounts.push(msg.request.amount);
-        currencies.push(msg.request.currency.clone());
-        // Producer guarantees Some(ref) — null-rejected at the
-        // wire level. unwrap_or for defense.
-        reference_ids.push(msg.request.reference_id.clone().unwrap_or_default());
-        descriptions.push(msg.request.description.clone());
-    }
-    sqlx::query(
-        r#"INSERT INTO cross_shard_outbox
-           (id, from_account, to_account, to_shard, amount, currency,
-            reference_id, description, status)
-           SELECT * FROM UNNEST(
-               $1::uuid[], $2::text[], $3::text[], $4::int[],
-               $5::numeric[], $6::text[], $7::text[], $8::text[],
-               ARRAY_FILL('pending'::text, ARRAY[$9::int])
-           )"#,
-    )
-    .bind(&ids)
-    .bind(&from_accounts)
-    .bind(&to_accounts)
-    .bind(&to_shards)
-    .bind(&amounts)
-    .bind(&currencies)
-    .bind(&reference_ids)
-    .bind(&descriptions)
-    .bind(n as i32)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-/// Bulk INSERT placeholder rows for the batch and return the set
-/// of `(reference_id, from_account) → id` whose row this batch
-/// actually claimed. Conflicts are silent — the conflicting key
-/// belongs to a prior batch's commit and is the caller's signal
-/// to treat the message as an idempotent skip.
-///
-/// The placeholder is inserted with `status = 'pending'` and
-/// `processed_at = NOW()`. The schema CHECK allows 'pending', and
-/// the row is promoted to a terminal status by `bulk_update_status`
-/// before tx commit, so external readers (READ COMMITTED snapshot)
-/// only ever observe the terminal state.
-async fn bulk_claim_slots(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    msgs: &[PendingMessage],
-) -> Result<std::collections::HashMap<(String, String), Uuid>, AppError> {
-    let n = msgs.len();
-    let mut ids: Vec<Uuid> = Vec::with_capacity(n);
-    let mut from_accounts: Vec<String> = Vec::with_capacity(n);
-    let mut to_accounts: Vec<String> = Vec::with_capacity(n);
-    let mut amounts: Vec<Decimal> = Vec::with_capacity(n);
-    let mut currencies: Vec<String> = Vec::with_capacity(n);
-    let mut reference_ids: Vec<String> = Vec::with_capacity(n);
-    let mut descriptions: Vec<Option<String>> = Vec::with_capacity(n);
-
-    for msg in msgs {
-        // Producer always supplies a reference_id (UUID fallback);
-        // the consume callback rejects NULLs to DLQ before they
-        // reach the buffer. Fall back to empty string here only
-        // for the type-system — the conflict on (NULL, from) would
-        // never match the message's logical key anyway.
-        let ref_id = msg.request.reference_id.clone().unwrap_or_default();
-        ids.push(Uuid::new_v4());
-        from_accounts.push(msg.request.from_account.clone());
-        to_accounts.push(msg.request.to_account.clone());
-        amounts.push(msg.request.amount);
-        currencies.push(msg.request.currency.clone());
-        reference_ids.push(ref_id);
-        descriptions.push(msg.request.description.clone());
-    }
-
-    let returned: Vec<(Uuid, Option<String>, String)> = sqlx::query_as(
-        r#"INSERT INTO transactions
-           (id, from_account, to_account, amount, currency, status, reference_id, description, processed_at)
-           SELECT * FROM UNNEST(
-               $1::uuid[], $2::text[], $3::text[], $4::numeric[], $5::text[],
-               ARRAY_FILL('pending'::text, ARRAY[$8::int]),
-               $6::text[], $7::text[],
-               ARRAY_FILL(NOW()::timestamptz, ARRAY[$8::int])
-           )
-           ON CONFLICT (reference_id, from_account) DO NOTHING
-           RETURNING id, reference_id, from_account"#,
-    )
-    .bind(&ids)
-    .bind(&from_accounts)
-    .bind(&to_accounts)
-    .bind(&amounts)
-    .bind(&currencies)
-    .bind(&reference_ids)
-    .bind(&descriptions)
-    .bind(n as i32)
-    .fetch_all(&mut **tx)
-    .await?;
-
-    Ok(returned
-        .into_iter()
-        .filter_map(|(id, ref_id, from_acc)| ref_id.map(|r| ((r, from_acc), id)))
-        .collect())
-}
-
-/// Promote the placeholder rows claimed by `bulk_claim_slots` to
-/// the given terminal status. Both `processed_at` and `updated_at`
-/// are refreshed to `NOW()` so the timestamp on the terminal row
-/// reflects when the status was finalised, not when the placeholder
-/// was first inserted.
-async fn bulk_update_status(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    msgs: &[PendingMessage],
-    status: &'static str,
-) -> Result<(), AppError> {
-    let n = msgs.len();
-    let mut reference_ids: Vec<String> = Vec::with_capacity(n);
-    let mut from_accounts: Vec<String> = Vec::with_capacity(n);
-    for msg in msgs {
-        reference_ids.push(msg.request.reference_id.clone().unwrap_or_default());
-        from_accounts.push(msg.request.from_account.clone());
-    }
-    sqlx::query(
-        r#"UPDATE transactions
-           SET status = $3, processed_at = NOW(), updated_at = NOW()
-           WHERE (reference_id, from_account) IN (
-               SELECT * FROM UNNEST($1::text[], $2::text[])
-           )"#,
-    )
-    .bind(&reference_ids)
-    .bind(&from_accounts)
-    .bind(status)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
 }
 
 // ─── Cross-module event publication ─────────────────────────
