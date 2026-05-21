@@ -40,7 +40,9 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use shared_kernel::queue::callback::ConsumerChannelCallback;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -252,12 +254,14 @@ pub async fn start_consumer(
 
     let shared_channel = Arc::new(channel);
 
+    let last_arrival_ms = Arc::new(AtomicU64::new(0));
     let consumer = BatchTransactionConsumer {
         shard_router: shard_router.clone(),
         buffer: Arc::new(Mutex::new(Vec::with_capacity(BATCH_SIZE))),
         channel: shared_channel.clone(),
         events: events.clone(),
         spawned: Arc::new(Mutex::new(JoinSet::new())),
+        last_arrival_ms: last_arrival_ms.clone(),
     };
 
     // Spawn flush timer — respects the cancellation token, drains
@@ -466,6 +470,13 @@ struct BatchTransactionConsumer {
     /// visible (`background_task_panics_total`) and lets shutdown
     /// drain by `join_all`-ing.
     spawned: Arc<Mutex<JoinSet<()>>>,
+    /// Wall-clock millis of the most recent buffer push. Read by
+    /// the flush-timer to decide whether the buffer has been idle
+    /// long enough to flush a partial batch (`should_idle_flush`).
+    /// Updated in `consume()` after each push. Relaxed ordering is
+    /// fine: the timer's idle-check tolerates a slightly stale read
+    /// (it will just re-check on the next tick).
+    last_arrival_ms: Arc<AtomicU64>,
 }
 
 #[async_trait]
@@ -552,6 +563,16 @@ impl AsyncConsumer for BatchTransactionConsumer {
             });
             should_flush = buf.len() >= BATCH_SIZE;
         }
+        // Stamp arrival time AFTER the buffer push so the timer's
+        // idle-check (which also drains under the buffer mutex) sees
+        // a consistent "buffer has content AND was recently touched"
+        // window. Relaxed is sufficient — the timer tolerates stale
+        // reads, it will retry on the next tick.
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_arrival_ms.store(now_ms, Ordering::Relaxed);
 
         if should_flush {
             let batch = drain_buffer(&self.buffer).await;
