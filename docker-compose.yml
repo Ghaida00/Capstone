@@ -630,6 +630,8 @@ services:
     volumes:
       - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
+      - "127.0.0.1:5000:5000"
+      - "127.0.0.1:5001:5001"
       - "127.0.0.1:7000:7000"
     expose:
       - "5000"
@@ -723,6 +725,8 @@ services:
     image: redis:8.6.1-alpine3.23
     container_name: peakload-redis-master
     command: *redis-command
+    ports:
+      - "127.0.0.1:6379:6379"
     expose:
       - "6379"
     volumes:
@@ -756,6 +760,8 @@ services:
         --requirepass ${REDIS_PASSWORD}
         --masterauth ${REDIS_PASSWORD}
         --replicaof redis-master 6379
+    ports:
+      - "127.0.0.1:6380:6379"
     expose:
       - "6379"
     depends_on:
@@ -775,14 +781,20 @@ services:
   redis-sentinel-1:
     <<: *sentinel-common
     container_name: peakload-redis-sentinel-1
+    ports:
+      - "127.0.0.1:26379:26379"
 
   redis-sentinel-2:
     <<: *sentinel-common
     container_name: peakload-redis-sentinel-2
+    ports:
+      - "127.0.0.1:26380:26379"
 
   redis-sentinel-3:
     <<: *sentinel-common
     container_name: peakload-redis-sentinel-3
+    ports:
+      - "127.0.0.1:26381:26379"
 
   # ============================================================
   # RabbitMQ — Async Message Queue
@@ -797,6 +809,7 @@ services:
     expose:
       - "5672"
     ports:
+      - "127.0.0.1:5672:5672"
       - "127.0.0.1:15672:15672"
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
@@ -966,4 +979,3 @@ volumes:
 networks:
   peakload-network:
     driver: bridge
-
