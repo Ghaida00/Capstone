@@ -357,7 +357,7 @@ services:
       # (preferred, no restart) PUT /api/v2/admin/degradation.
       DEGRADATION_MODE: "${DEGRADATION_MODE:-normal}"
       # ── OpenTelemetry ────────────────────────────────────
-      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
       OTEL_SERVICE_NAME: "peakload-capstone"
     expose:
       - "3000"
@@ -381,6 +381,7 @@ services:
         condition: service_healthy
       otel-collector:
         condition: service_started
+        required: false
     healthcheck:
       test: [ "CMD", "/app/peakload-capstone", "--health-check" ]
       interval: 10s
@@ -942,6 +943,7 @@ services:
   prometheus:
     image: prom/prometheus:v3.10.0-distroless
     container_name: peakload-prometheus
+    profiles: ["observability", "metrics", "prometheus"]
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus/rules:/etc/prometheus/rules:ro
@@ -965,22 +967,29 @@ services:
   # ============================================================
   # OpenTelemetry Collector — receives OTLP traces from app
   # ============================================================
-  # Receives OTLP/gRPC on 4317; emits span detail to stdout via the
-  # debug exporter (verbosity: detailed). No persistent back-end in
-  # this stack — `docker logs peakload-otel-collector` is the
-  # observation surface. Scope is intentionally tight; swap the
-  # exporter for OTLP-HTTP → Tempo/Jaeger if persistence is needed.
+  # Receives OTLP/gRPC on 4317 and fans traces out to two exporters:
+  # `debug` (span-count heartbeat in `docker logs
+  # peakload-otel-collector`) and `otlp` (forwards to the `jaeger`
+  # service for the searchable trace UI). See otel/collector.yaml.
   # No healthcheck (image is upstream-distroless: no shell). App
   # depends on `service_started`, mirroring the prometheus pattern.
   # ============================================================
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.117.0
     container_name: peakload-otel-collector
+    profiles: ["observability", "tracing", "otel-collector"]
     volumes:
       - ./otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
     command: ["--config=/etc/otelcol-contrib/config.yaml"]
     expose:
       - "4317"
+    # Start after Jaeger so the `otlp` exporter's first spans have a
+    # back-end to land in (the exporter retries regardless, but this
+    # keeps the cold-start window clean).
+    depends_on:
+      jaeger:
+        condition: service_started
+        required: false
     restart: unless-stopped
     logging: *default-logging
     networks:
@@ -992,11 +1001,43 @@ services:
           cpus: "0.3"
 
   # ============================================================
+  # Jaeger — trace UI + storage back-end for the collector
+  # ============================================================
+  # All-in-one Jaeger: receives OTLP/gRPC on 4317 from the
+  # otel-collector's `otlp` exporter, stores spans in memory
+  # (MEMORY_MAX_TRACES bounds RAM under load-test span volume), and
+  # serves the search/trace UI on :16686 → host :16686. In-memory
+  # storage is intentional — traces here are a live debugging
+  # surface, not a retained record; a restart clears them.
+  # ============================================================
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: peakload-jaeger
+    profiles: ["observability", "tracing", "jaeger"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      MEMORY_MAX_TRACES: "50000"
+    ports:
+      - "16686:16686"
+    expose:
+      - "4317"
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - peakload-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.3"
+
+  # ============================================================
   # Grafana — Metrics Visualization
   # ============================================================
   grafana:
     image: grafana/grafana:12.3
     container_name: peakload-grafana
+    profiles: ["observability", "metrics", "grafana"]
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:?set GRAFANA_USER in .env}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in .env}
@@ -1015,6 +1056,7 @@ services:
     depends_on:
       prometheus:
         condition: service_started
+        required: false
     restart: unless-stopped
     logging: *default-logging
     networks:
@@ -1031,6 +1073,7 @@ services:
   cadvisor:
     image: ghcr.io/google/cadvisor:0.56.2
     container_name: peakload-cadvisor
+    profiles: ["observability", "metrics", "cadvisor"]
     ports:
       - "8081:8080"
     volumes:
