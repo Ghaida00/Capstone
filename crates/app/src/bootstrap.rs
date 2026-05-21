@@ -40,11 +40,13 @@ use shared_kernel::queue::producer::QueueProducer;
 /// Plain compact format is used when `RUST_LOG_PRETTY` is set or the binary
 /// is built with `debug_assertions` (i.e. `cargo run` / `cargo test`).
 ///
-/// When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, an OTLP/gRPC batch span
-/// exporter is layered onto the subscriber and registered as the global
-/// tracer provider. `OTEL_SERVICE_NAME` (default `peakload-capstone`) is
-/// attached as the `service.name` resource attribute. With the endpoint
-/// unset, no OTLP pipeline runs and the subscriber behaves as above.
+/// When `OTEL_EXPORTER_OTLP_ENDPOINT` is set and non-blank, an OTLP/gRPC
+/// batch span exporter is layered onto the subscriber and registered as
+/// the global tracer provider. `OTEL_SERVICE_NAME` (default
+/// `peakload-capstone`) is attached as the `service.name` resource
+/// attribute. With the endpoint unset or blank (the latter is what
+/// Compose passes for a cleared variable), no OTLP pipeline runs and
+/// the subscriber behaves as above.
 ///
 /// Filter composition: a single `EnvFilter` from `RUST_LOG` (default
 /// `info`) is applied as a Layer on the Registry. Both the OTel and fmt
@@ -56,6 +58,14 @@ use shared_kernel::queue::producer::QueueProducer;
 /// breaking `tracing_opentelemetry::OpenTelemetrySpanExt::context()`
 /// at the publish boundary (traceparent injection silently writes
 /// nothing). This is the canonical `tracing-opentelemetry` pattern.
+/// Resolve the OTLP exporter endpoint from its raw env value. Tracing
+/// exports only when the endpoint is present and non-blank; both an
+/// unset variable and an empty/whitespace one (what Compose passes for
+/// a cleared variable) yield `None`, leaving the OTLP pipeline off.
+fn resolve_otlp_endpoint(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 pub fn init_tracing() {
     let log_directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     let pretty = std::env::var("RUST_LOG_PRETTY").is_ok() || cfg!(debug_assertions);
@@ -63,8 +73,7 @@ pub fn init_tracing() {
     let global_filter =
         EnvFilter::try_new(&log_directives).unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let otel_layer = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .ok()
+    let otel_layer = resolve_otlp_endpoint(std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())
         .map(|endpoint| {
             let exporter = SpanExporter::builder()
                 .with_tonic()
@@ -704,5 +713,41 @@ fn build_cors_layer(config: &Config) -> CorsLayer {
             .allow_origin(origins)
             .allow_methods(Any)
             .allow_headers(Any)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_otlp_endpoint_returns_none_for_unset() {
+        assert_eq!(resolve_otlp_endpoint(None), None);
+    }
+
+    #[test]
+    fn resolve_otlp_endpoint_returns_none_for_empty_string() {
+        assert_eq!(resolve_otlp_endpoint(Some(String::new())), None);
+    }
+
+    #[test]
+    fn resolve_otlp_endpoint_returns_none_for_whitespace_only() {
+        assert_eq!(resolve_otlp_endpoint(Some("   ".to_string())), None);
+    }
+
+    #[test]
+    fn resolve_otlp_endpoint_returns_some_for_real_endpoint() {
+        assert_eq!(
+            resolve_otlp_endpoint(Some("http://otel-collector:4317".to_string())),
+            Some("http://otel-collector:4317".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_otlp_endpoint_trims_padded_input() {
+        assert_eq!(
+            resolve_otlp_endpoint(Some("  http://x:4317  ".to_string())),
+            Some("http://x:4317".to_string())
+        );
     }
 }
