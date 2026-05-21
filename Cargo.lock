@@ -4187,6 +4187,7 @@ dependencies = [
  "axum-test",
  "chrono",
  "fnv",
+ "futures",
  "metrics",
  "notifications",
  "opentelemetry",

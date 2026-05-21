@@ -29,6 +29,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 fnv = { workspace = true }
 sha2 = { workspace = true }
+futures = { workspace = true }
 
 tracing = { workspace = true }
 opentelemetry = { workspace = true }

@@ -44,6 +44,7 @@ fnv = "1.0.7"
 sha2 = "0.10"
 url = "2.5"
 dotenvy = "0.15.7"
+futures = "0.3"
 
 # ── Auth ──
 jsonwebtoken = "9.3.1"
