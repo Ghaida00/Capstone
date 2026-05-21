@@ -472,7 +472,14 @@ services:
       PATRONI_NAME:     shard0-a
       PATRONI_HOSTNAME: pg-shard0-node-a
     volumes:
-      - pg_shard0_node_a_data:/var/lib/postgresql/data
+      # Mount at the parent path (postgres image declares
+      # `VOLUME /var/lib/postgresql`). Mounting only PGDATA
+      # would leave the parent uncovered and Docker would
+      # spawn a fresh anonymous volume for it on every
+      # container recreate. PGDATA stays at the `data/`
+      # subdirectory inside this named volume (see patroni-
+      # entrypoint.sh which chowns both).
+      - pg_shard0_node_a_data:/var/lib/postgresql
     depends_on:
       etcd-1:
         condition: service_healthy
@@ -491,7 +498,8 @@ services:
       PATRONI_NAME:     shard0-b
       PATRONI_HOSTNAME: pg-shard0-node-b
     volumes:
-      - pg_shard0_node_b_data:/var/lib/postgresql/data
+      # Mounted at parent path — see pg-shard0-node-a for rationale.
+      - pg_shard0_node_b_data:/var/lib/postgresql
     depends_on:
       etcd-1:
         condition: service_healthy
@@ -532,7 +540,8 @@ services:
       PATRONI_NAME:     shard1-a
       PATRONI_HOSTNAME: pg-shard1-node-a
     volumes:
-      - pg_shard1_node_a_data:/var/lib/postgresql/data
+      # Mounted at parent path — see pg-shard0-node-a for rationale.
+      - pg_shard1_node_a_data:/var/lib/postgresql
     depends_on:
       etcd-1:
         condition: service_healthy
@@ -551,7 +560,8 @@ services:
       PATRONI_NAME:     shard1-b
       PATRONI_HOSTNAME: pg-shard1-node-b
     volumes:
-      - pg_shard1_node_b_data:/var/lib/postgresql/data
+      # Mounted at parent path — see pg-shard0-node-a for rationale.
+      - pg_shard1_node_b_data:/var/lib/postgresql
     depends_on:
       etcd-1:
         condition: service_healthy
@@ -601,7 +611,8 @@ services:
   #     PATRONI_NAME:     shard2-a
   #     PATRONI_HOSTNAME: pg-shard2-node-a
   #   volumes:
-  #     - pg_shard2_node_a_data:/var/lib/postgresql/data
+  #     # Mounted at parent path — see pg-shard0-node-a for rationale.
+  #     - pg_shard2_node_a_data:/var/lib/postgresql
   #   depends_on:
   #     etcd-1:
   #       condition: service_healthy
@@ -620,7 +631,8 @@ services:
   #     PATRONI_NAME:     shard2-b
   #     PATRONI_HOSTNAME: pg-shard2-node-b
   #   volumes:
-  #     - pg_shard2_node_b_data:/var/lib/postgresql/data
+  #     # Mounted at parent path — see pg-shard0-node-a for rationale.
+  #     - pg_shard2_node_b_data:/var/lib/postgresql
   #   depends_on:
   #     etcd-1:
   #       condition: service_healthy
@@ -726,6 +738,14 @@ services:
     image: postgres:18.3-alpine3.23
     container_name: peakload-db-bootstrap-schema
     entrypoint: [ "/bin/sh", "/opt/bootstrap-schema.sh" ]
+    # The postgres image declares `VOLUME /var/lib/postgresql`,
+    # which otherwise spawns a fresh anonymous volume on every
+    # container recreate. This container only runs psql against
+    # remote pg-haproxy and never touches its own /var/lib/postgresql,
+    # so an 8 MB tmpfs there is sufficient to satisfy the VOLUME
+    # declaration without leaving disk residue.
+    tmpfs:
+      - /var/lib/postgresql:size=8m
     environment:
       POSTGRES_USER:     ${POSTGRES_USER:?set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
