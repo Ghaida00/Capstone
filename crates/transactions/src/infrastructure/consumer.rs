@@ -56,12 +56,25 @@ use shared_kernel::events::{Event, EventPublisher, EVENT_TRANSACTIONS_COMMITTED}
 const QUEUE_NAME: &str = "transactions.process";
 const CONSUMER_TAG: &str = "peakload-consumer";
 const BATCH_SIZE: usize = 100;
-/// Maximum time a partial batch waits in the buffer before being
-/// flushed to PG. Caps the average status-reflection latency at
-/// `BATCH_FLUSH_MS / 2` for any single message that doesn't fill
-/// a full batch on its own. The value is the dominant tunable for
-/// the 202-to-`completed` window.
-const BATCH_FLUSH_MS: u64 = 50;
+/// Maximum time a partial batch waits in the buffer with no new
+/// arrival before the timer flushes it. Under sustained load the
+/// idle window never opens (messages arrive every few ms), so the
+/// size-flush at `BATCH_SIZE` dominates — bigger batches, higher
+/// throughput. When inflow pauses, the last partial batch flushes
+/// after this window, bounding straggler status-reflection latency
+/// at roughly `IDLE_FLUSH_MS` for the slowest message.
+///
+/// Why this is larger than the previous fixed `BATCH_FLUSH_MS = 50`:
+/// at 50ms the timer fired before the buffer could accumulate (~7
+/// messages per consumer × 50ms), so per-shard batches averaged 2.1
+/// instead of the configured cap of 100, and per-tx overhead was
+/// amortised over almost nothing. See the 2026-05-21 throughput
+/// design doc.
+const IDLE_FLUSH_MS: u64 = 250;
+/// How often the timer wakes up to evaluate `should_idle_flush`.
+/// Decoupled from `IDLE_FLUSH_MS` so cancellation still drains
+/// promptly (the `select!` polls cancellation on the same cadence).
+const CHECK_INTERVAL_MS: u64 = 50;
 
 /// Wire-shape DTO for the queue message. Owned by the consumer
 /// because it represents the format the producer writes — the
@@ -271,16 +284,31 @@ pub async fn start_consumer(
     let timer_channel = shared_channel.clone();
     let timer_events = events.clone();
     let flush_cancel = cancel.clone();
+    let timer_last_arrival = last_arrival_ms.clone();
     let timer_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(tokio::time::Duration::from_millis(BATCH_FLUSH_MS)) => {
-                    let batch = drain_buffer(&buffer_ref).await;
-                    if !batch.is_empty() {
-                        let report = flush_batch_to_shards(&batch, &router_ref).await;
-                        apply_acks(&timer_channel, &report, "timer-flush").await;
-                        record_batch_metrics(&report);
-                        publish_committed_events(&report.successful, &timer_events);
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(CHECK_INTERVAL_MS)) => {
+                    // Debounce: only flush when the buffer has been
+                    // idle for IDLE_FLUSH_MS. Under sustained load
+                    // arrivals keep landing inside the window and the
+                    // size-flush in `consume()` wins; we never enter
+                    // this branch's drain. During quiet periods the
+                    // last partial batch ships after the idle window.
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let buf_len = buffer_ref.lock().await.len();
+                    let last = timer_last_arrival.load(Ordering::Relaxed);
+                    if should_idle_flush(buf_len, last, now_ms, IDLE_FLUSH_MS) {
+                        let batch = drain_buffer(&buffer_ref).await;
+                        if !batch.is_empty() {
+                            let report = flush_batch_to_shards(&batch, &router_ref).await;
+                            apply_acks(&timer_channel, &report, "idle-flush").await;
+                            record_batch_metrics(&report);
+                            publish_committed_events(&report.successful, &timer_events);
+                        }
                     }
                 }
                 _ = flush_cancel.cancelled() => {
