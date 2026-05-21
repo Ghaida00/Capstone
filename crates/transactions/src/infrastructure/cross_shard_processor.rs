@@ -99,10 +99,32 @@ pub fn spawn_cross_shard_processor(
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = ticker.tick() => {
+                    // Drain each shard concurrently within the tick.
+                    // The shards are fully independent (distinct sender
+                    // pool, distinct claimed rows via FOR UPDATE SKIP
+                    // LOCKED). Joining before returning preserves the
+                    // per-tick semantics of the previous sequential
+                    // loop — the next tick does not start before every
+                    // shard's drain has settled.
+                    let mut shard_handles = Vec::with_capacity(shards.num_shards());
                     for sender_shard in 0..shards.num_shards() {
-                        if let Err(e) = drain_shard(&shards, sender_shard).await {
-                            tracing::warn!(shard = sender_shard, error = %e, "outbox drain error");
-                        }
+                        let shards_cl = shards.clone();
+                        shard_handles.push(tokio::spawn(async move {
+                            if let Err(e) = drain_shard(&shards_cl, sender_shard).await {
+                                tracing::warn!(
+                                    shard = sender_shard,
+                                    error = %e,
+                                    "outbox drain error"
+                                );
+                            }
+                        }));
+                    }
+                    for h in shard_handles {
+                        // Best-effort join — a panicked task is a bug
+                        // surfaced by the existing panic hook /
+                        // counter; we don't want one shard's panic to
+                        // wedge the tick loop.
+                        let _ = h.await;
                     }
                 }
             }
