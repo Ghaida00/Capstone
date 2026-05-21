@@ -22,12 +22,21 @@ name: peakload
 #  redis-replica                    1.0      384 M
 #  redis-sentinel-1/2/3 (× 3)       0.3      96 M       (0.1 × 3, 32 M × 3)
 #  rabbitmq                         1.0      512 M
+#  ───────────────────────────────  ───────  ────────
+#  CORE TOTAL                       13.10    4768 M (~4.66 GB)
+#
+#  Observability (profile-gated — set COMPOSE_PROFILES in .env):
 #  prometheus                       0.5      256 M
 #  grafana                          0.5      256 M
 #  cadvisor                         0.2      128 M
+#  otel-collector                   0.3      256 M
+#  jaeger                           0.3      512 M
 #  ───────────────────────────────  ───────  ────────
-#  TOTAL steady-state               14.30    5408 M (~5.28 GB)
-#  TOTAL termasuk bootstrap         14.40    5472 M (~5.34 GB)
+#  OBSERVABILITY TOTAL              1.8      1408 M (~1.37 GB)
+#
+#  FULL  (observability ON)         14.90    6176 M (~6.03 GB)
+#  LEAN  (observability OFF)        13.10    4768 M (~4.66 GB)
+#  TOTAL termasuk bootstrap (FULL)  15.00    6240 M (~6.09 GB)
 #
 # Catatan:
 # * Ini limit, bukan request — pemakaian aktual idle jauh
@@ -37,6 +46,11 @@ name: peakload
 #   8-core host). Kalau host < 8 GB RAM atau < 6 cores,
 #   turunkan PG node ke 0.5 CPU / 256 M lewat anchor
 #   `x-pg-node-deploy` di bawah.
+# * Observability (prometheus/grafana/cadvisor/otel-collector/
+#   jaeger) di-gate lewat Compose profiles. Set COMPOSE_PROFILES
+#   di .env: `observability` untuk FULL, kosongkan untuk LEAN
+#   (k6 perf runs). Granular: `tracing`, `metrics`, atau
+#   nama service spesifik (`jaeger,prometheus`).
 # ============================================================
 
 # ============================================================
