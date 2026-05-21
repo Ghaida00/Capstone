@@ -127,6 +127,7 @@ impl App {
         // Cross-shard credit outbox drainer.
         let outbox_handle = transactions::spawn_cross_shard_processor(
             self.state.shard_router.clone(),
+            self.event_publisher.clone(),
             self.cancel.child_token(),
         );
 

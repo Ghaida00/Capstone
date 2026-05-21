@@ -1025,14 +1025,42 @@ struct ShardSplit {
 /// Older subscribers without the field continue to work — they
 /// just ignore the new key.
 #[derive(serde::Serialize)]
-struct TransactionCommittedPayload<'a> {
-    id: Option<Uuid>,
-    from_account: &'a str,
-    to_account: &'a str,
-    amount: String,
-    currency: &'a str,
-    reference_id: Option<&'a str>,
-    shard: usize,
+pub(super) struct TransactionCommittedPayload<'a> {
+    pub id: Option<Uuid>,
+    pub from_account: &'a str,
+    pub to_account: &'a str,
+    pub amount: String,
+    pub currency: &'a str,
+    pub reference_id: Option<&'a str>,
+    pub shard: usize,
+}
+
+/// Build + publish one `transactions.committed` event. Shared by
+/// the consumer's batch flush and the cross-shard processor's
+/// sender-row completion. Best-effort: failures are logged +
+/// counted, never propagated — the row is already durably
+/// committed and queue ACK / outbox progress must not depend on a
+/// notification channel being healthy.
+pub(super) fn publish_one_committed_event(
+    events: &Arc<dyn EventPublisher>,
+    payload: TransactionCommittedPayload<'_>,
+    request_id: &str,
+) {
+    let event = match Event::new(EVENT_TRANSACTIONS_COMMITTED, &payload) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(error = %e, request_id, "Failed to build TransactionCommitted event");
+            metrics::counter!("events_build_errors_total").increment(1);
+            return;
+        }
+    };
+    if let Err(e) = events.publish(event) {
+        tracing::warn!(error = %e, request_id, "EventBus publish failed");
+        metrics::counter!("events_publish_errors_total").increment(1);
+    } else {
+        metrics::counter!("events_published_total", "name" => EVENT_TRANSACTIONS_COMMITTED)
+            .increment(1);
+    }
 }
 
 /// Publish one `transactions.committed` event per row in
@@ -1051,29 +1079,7 @@ fn publish_committed_events(successful: &[PendingMessage], events: &Arc<dyn Even
             reference_id: msg.request.reference_id.as_deref(),
             shard: msg.shard,
         };
-        let event = match Event::new(EVENT_TRANSACTIONS_COMMITTED, &payload) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    request_id = %msg.request_id,
-                    "Failed to build TransactionCommitted event"
-                );
-                metrics::counter!("events_build_errors_total").increment(1);
-                continue;
-            }
-        };
-        if let Err(e) = events.publish(event) {
-            tracing::warn!(
-                error = %e,
-                request_id = %msg.request_id,
-                "EventBus publish failed"
-            );
-            metrics::counter!("events_publish_errors_total").increment(1);
-        } else {
-            metrics::counter!("events_published_total", "name" => EVENT_TRANSACTIONS_COMMITTED)
-                .increment(1);
-        }
+        publish_one_committed_event(events, payload, &msg.request_id);
     }
 }
 

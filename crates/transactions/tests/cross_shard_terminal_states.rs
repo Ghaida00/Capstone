@@ -38,6 +38,7 @@
 //! tests in one binary; the durable DB state is the authoritative
 //! contract and proves the same branch executed.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::PgPool;
@@ -49,6 +50,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use shared_kernel::db::shard::{ShardRouter, ShardRouterConfig, ShardUrls};
+use shared_kernel::events::{EventPublisher, InProcessEventBus};
 
 const SCHEMA_SQL: &str = include_str!("../../../db/init.sql");
 
@@ -63,6 +65,10 @@ struct Fixture {
     pool: PgPool,
     shards: ShardRouter,
     cancel: CancellationToken,
+    // Event publisher passed to `spawn_cross_shard_processor`. The
+    // tests assert on durable DB state, not on published events, so
+    // a throwaway in-process bus is sufficient.
+    events: Arc<dyn EventPublisher>,
     // Container guard — dropped at end of test to tear down.
     _pg: ContainerAsync<Postgres>,
 }
@@ -92,10 +98,13 @@ async fn setup() -> Fixture {
         .await
         .unwrap();
 
+    let events: Arc<dyn EventPublisher> = Arc::new(InProcessEventBus::new());
+
     Fixture {
         pool,
         shards,
         cancel,
+        events,
         _pg: pg,
     }
 }
@@ -215,7 +224,11 @@ async fn credit_path_terminal_fails_after_max_attempts() {
     )
     .await;
 
-    let _h = transactions::spawn_cross_shard_processor(fx.shards.clone(), fx.cancel.child_token());
+    let _h = transactions::spawn_cross_shard_processor(
+        fx.shards.clone(),
+        fx.events.clone(),
+        fx.cancel.child_token(),
+    );
 
     let (status, attempts, _) = poll_outbox_until(&fx.pool, id, |s, _, _| s == "failed").await;
 
@@ -266,7 +279,11 @@ async fn refund_path_holds_at_max_attempts_with_extended_lease() {
     )
     .await;
 
-    let _h = transactions::spawn_cross_shard_processor(fx.shards.clone(), fx.cancel.child_token());
+    let _h = transactions::spawn_cross_shard_processor(
+        fx.shards.clone(),
+        fx.events.clone(),
+        fx.cancel.child_token(),
+    );
 
     // Stuck state: attempts held at MAX-1 (so the `attempts <
     // MAX_ATTEMPTS` claim filter keeps selecting it), status still
@@ -335,7 +352,11 @@ async fn sender_audit_row_transitions_to_failed_after_credit_terminal_fail() {
     )
     .await;
 
-    let _h = transactions::spawn_cross_shard_processor(fx.shards.clone(), fx.cancel.child_token());
+    let _h = transactions::spawn_cross_shard_processor(
+        fx.shards.clone(),
+        fx.events.clone(),
+        fx.cancel.child_token(),
+    );
 
     // Precondition: the outbox row terminal-fails.
     let (status, _, _) = poll_outbox_until(&fx.pool, id, |s, _, _| s == "failed").await;

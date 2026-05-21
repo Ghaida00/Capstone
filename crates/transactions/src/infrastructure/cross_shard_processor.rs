@@ -33,6 +33,7 @@
 //! `REFUND_STUCK_BACKOFF_SECS` so the row stays claimable on a
 //! sane cadence rather than at every poll tick.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
@@ -100,6 +101,7 @@ enum ApplyOutcome {
 
 pub fn spawn_cross_shard_processor(
     shards: ShardRouter,
+    events: Arc<dyn shared_kernel::events::EventPublisher>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -120,8 +122,9 @@ pub fn spawn_cross_shard_processor(
                     let mut shard_handles = Vec::with_capacity(shards.num_shards());
                     for sender_shard in 0..shards.num_shards() {
                         let shards_cl = shards.clone();
+                        let events_cl = events.clone();
                         shard_handles.push(tokio::spawn(async move {
-                            if let Err(e) = drain_shard(&shards_cl, sender_shard).await {
+                            if let Err(e) = drain_shard(&shards_cl, sender_shard, &events_cl).await {
                                 tracing::warn!(
                                     shard = sender_shard,
                                     error = %e,
@@ -144,7 +147,39 @@ pub fn spawn_cross_shard_processor(
     })
 }
 
-async fn drain_shard(shards: &ShardRouter, sender_shard: usize) -> Result<(), sqlx::Error> {
+/// Publish a `transactions.committed` event for a cross-shard
+/// sender row whose credit just landed, so the cache invalidator
+/// DELs the stale `tx_status:` Redis entry immediately instead of
+/// letting the client wait out the 5 s cache TTL. `id` is None —
+/// the cross-shard processor does not hold the sender row's
+/// `transactions.id`; the invalidator keys the `tx_status:` DEL on
+/// `reference_id`, which is what matters here. Best-effort —
+/// `publish_one_committed_event` never propagates failures.
+fn publish_sender_completed_event(
+    events: &Arc<dyn shared_kernel::events::EventPublisher>,
+    sender_shard: usize,
+    row: &OutboxRow,
+) {
+    super::consumer::publish_one_committed_event(
+        events,
+        super::consumer::TransactionCommittedPayload {
+            id: None,
+            from_account: &row.from_account,
+            to_account: &row.to_account,
+            amount: row.amount.to_string(),
+            currency: &row.currency,
+            reference_id: Some(row.reference_id.as_str()),
+            shard: sender_shard,
+        },
+        "",
+    );
+}
+
+async fn drain_shard(
+    shards: &ShardRouter,
+    sender_shard: usize,
+    events: &Arc<dyn shared_kernel::events::EventPublisher>,
+) -> Result<(), sqlx::Error> {
     let sender_pool = shards.writer(sender_shard).clone();
     // Atomic lease-claim. SKIP LOCKED keeps two app instances
     // from grabbing the same row; lease_until gates re-claim if
@@ -187,6 +222,7 @@ async fn drain_shard(shards: &ShardRouter, sender_shard: usize) -> Result<(), sq
         .for_each_concurrent(ROW_CONCURRENCY, |row| {
             let sender_pool = sender_pool.clone();
             let shards = shards.clone();
+            let events = events.clone();
             async move {
                 let receiver_shard = row.to_shard as usize;
                 if receiver_shard >= shards.num_shards() {
@@ -228,6 +264,7 @@ async fn drain_shard(shards: &ShardRouter, sender_shard: usize) -> Result<(), sq
                             row.id,
                             mark_sender_completed(&sender_pool, &row.reference_id, &row.from_account).await,
                         );
+                        publish_sender_completed_event(&events, sender_shard, &row);
                         best_effort(
                             "mark_completed",
                             row.id,
@@ -241,6 +278,7 @@ async fn drain_shard(shards: &ShardRouter, sender_shard: usize) -> Result<(), sq
                             row.id,
                             mark_sender_completed(&sender_pool, &row.reference_id, &row.from_account).await,
                         );
+                        publish_sender_completed_event(&events, sender_shard, &row);
                         best_effort(
                             "mark_completed",
                             row.id,
