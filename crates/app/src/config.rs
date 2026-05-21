@@ -1,6 +1,8 @@
 use std::env;
 use std::fmt;
 
+pub use transactions::IdempotencyBackend;
+
 /// Application configuration loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -80,6 +82,33 @@ pub struct Config {
     /// fraction of that — 50 ms is the new default; 0 disables
     /// queueing entirely.
     pub backpressure_wait_ms: u64,
+
+    /// Selects which `IdempotencyAwareWriter` impl the POST handler
+    /// uses to commit a reservation. See
+    /// `crates/transactions/src/infrastructure/redis_idempotency.rs`
+    /// for the Redis-async path.
+    ///   * `pg` (legacy) — synchronous PG INSERT into
+    ///     `idempotency_keys`, the durability story unchanged.
+    ///   * `redis` — Redis SETNX on the hot path; PG INSERT happens
+    ///     in a background `RedisIntakeWorker` per shard. Lowest
+    ///     POST latency. Requires Redis AOF + replica.
+    ///   * `hybrid` (default) — try Redis first; on Redis error
+    ///     fall back to the PG path so a Redis outage degrades
+    ///     latency rather than rejecting requests.
+    pub idempotency_backend: IdempotencyBackend,
+}
+
+/// Parse `IDEMPOTENCY_BACKEND` from env. Defaults to `hybrid` and
+/// panics on any unknown value so misconfigurations fail fast at
+/// startup rather than landing requests on the wrong code path.
+fn idempotency_backend_from_env() -> IdempotencyBackend {
+    let raw = env_or("IDEMPOTENCY_BACKEND", "hybrid");
+    IdempotencyBackend::parse(&raw).unwrap_or_else(|other| {
+        panic!(
+            "IDEMPOTENCY_BACKEND must be one of: pg, redis, hybrid (got: {})",
+            other
+        )
+    })
 }
 
 impl Config {
@@ -135,7 +164,7 @@ impl Config {
             // Pool sizes raised: previous defaults bottlenecked at the
             // app↔pgBouncer hop. With 4 replicas each pool is now sized
             // to soak its share of 1000 concurrent VUs without queueing.
-            db_write_pool_size: env_or("DB_WRITE_POOL_SIZE", "60")
+            db_write_pool_size: env_or("DB_WRITE_POOL_SIZE", "100")
                 .parse()
                 .expect("DB_WRITE_POOL_SIZE must be a number"),
             db_read_pool_size: env_or("DB_READ_POOL_SIZE", "80")
@@ -241,6 +270,8 @@ impl Config {
             backpressure_wait_ms: env_or("BACKPRESSURE_WAIT_MS", "50")
                 .parse()
                 .expect("BACKPRESSURE_WAIT_MS must be a number"),
+
+            idempotency_backend: idempotency_backend_from_env(),
         }
     }
 
@@ -401,6 +432,11 @@ impl fmt::Display for Config {
         writeln!(f, "  enable_auth:                  {}", self.enable_auth)?;
         writeln!(
             f,
+            "  idempotency_backend:          {}",
+            self.idempotency_backend
+        )?;
+        writeln!(
+            f,
             "  database_shard0_write_url:    {}",
             mask_url(&self.database_shard0_write_url)
         )?;
@@ -496,6 +532,7 @@ mod tests {
             auth_secret: None,
             verify_from_account_exists: false,
             backpressure_wait_ms: 50,
+            idempotency_backend: IdempotencyBackend::Pg,
         }
     }
 

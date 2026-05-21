@@ -285,6 +285,82 @@ impl RedisCache {
         Ok(())
     }
 
+    /// Atomic `SET key value NX EX ttl_secs`. Returns true if this
+    /// caller created the key, false if it already existed.
+    /// Serialises `value` as JSON.
+    pub async fn set_nx_ex<T: Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+        ttl_secs: u64,
+    ) -> Result<bool, AppError> {
+        let json = serde_json::to_string(value)?;
+        let mut conn = self.write_conn().await?;
+        let res: Option<String> = ::redis::cmd("SET")
+            .arg(key)
+            .arg(json)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl_secs)
+            .query_async(&mut *conn)
+            .await
+            .map_err(AppError::Redis)?;
+        Ok(res.is_some())
+    }
+
+    /// `LPUSH list value`. Returns the new list length.
+    pub async fn lpush(&self, list: &str, value: &str) -> Result<i64, AppError> {
+        let mut conn = self.write_conn().await?;
+        let len: i64 = conn.lpush(list, value).await.map_err(AppError::Redis)?;
+        Ok(len)
+    }
+
+    /// Non-blocking `RPOPLPUSH src dst` — atomically moves the
+    /// rightmost element of `src` to the left of `dst`. Returns
+    /// `Ok(None)` if `src` is empty. Used instead of the blocking
+    /// `BRPOPLPUSH` so callers can sleep+loop on their own cadence
+    /// without racing the deadpool/redis-crate connection timeout
+    /// that would otherwise fire mid-block on idle queues.
+    pub async fn rpoplpush(
+        &self,
+        src: &str,
+        dst: &str,
+    ) -> Result<Option<String>, AppError> {
+        let mut conn = self.write_conn().await?;
+        let res: Option<String> = ::redis::cmd("RPOPLPUSH")
+            .arg(src)
+            .arg(dst)
+            .query_async(&mut *conn)
+            .await
+            .map_err(AppError::Redis)?;
+        Ok(res)
+    }
+
+    /// `LREM list count value` — remove `count` occurrences of
+    /// `value` from `list`. With `count = 1` removes the first
+    /// match (left-to-right). Returns the number actually removed.
+    pub async fn lrem(&self, list: &str, count: isize, value: &str) -> Result<i64, AppError> {
+        let mut conn = self.write_conn().await?;
+        let removed: i64 = conn
+            .lrem(list, count, value)
+            .await
+            .map_err(AppError::Redis)?;
+        Ok(removed)
+    }
+
+    /// Raw GET against the MASTER pool (no replication lag),
+    /// returning the JSON string. Used by writers that read what
+    /// they just wrote — replay detection on the idempotency
+    /// reservation path, intake-worker payload retrieval. Skips
+    /// the deserialize step so the caller can match on a typed
+    /// shape without paying for the cache's "deserialize-error →
+    /// miss" semantics.
+    pub async fn get_master_raw(&self, key: &str) -> Result<Option<String>, AppError> {
+        let mut conn = self.write_conn().await?;
+        let value: Option<String> = conn.get(key).await.map_err(AppError::Redis)?;
+        Ok(value)
+    }
+
     /// Check if Redis is healthy — pings BOTH master and replica pools.
     pub async fn health_check(&self) -> Result<bool, AppError> {
         let mut write_conn = self.write_conn().await?;

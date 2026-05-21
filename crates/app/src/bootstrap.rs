@@ -84,8 +84,8 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics::describe_histogram!("transactions_batch_size", "Batch sizes");
     metrics::describe_counter!("dlq_messages_total", "Dead letter queue messages");
     metrics::describe_counter!(
-        "cross_shard_credit_failures_total",
-        "Cross-shard credit UPDATEs that failed AFTER the sender's tx committed — needs reconciliation"
+        "cross_shard_step_failures_total",
+        "Cross-shard outbox step failures (label `step`: `credit` or `refund`) — credit failures stranded a sender debit; refund failures left a sender un-compensated"
     );
 
     // Failover metrics
@@ -132,6 +132,90 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics::describe_counter!(
         "notifications_payload_decode_errors_total",
         "Events the notifications dispatcher could not decode (malformed payload)"
+    );
+
+    // Redis-async idempotency reservation path (request side).
+    metrics::describe_counter!(
+        "idempotency_redis_reserved_total",
+        "Reservations committed via the Redis-async path (SETNX succeeded)"
+    );
+    metrics::describe_counter!(
+        "idempotency_redis_replay_total",
+        "Replays detected on the Redis path (existing entry, matching request_hash)"
+    );
+    metrics::describe_counter!(
+        "idempotency_redis_hash_conflict_total",
+        "Hash mismatches on the Redis path (existing entry, different request_hash)"
+    );
+    metrics::describe_counter!(
+        "idempotency_redis_ttl_race_total",
+        "SETNX-conflict GET-miss races on the Redis path (TTL expired between ops)"
+    );
+    metrics::describe_counter!(
+        "idempotency_redis_fallback_total",
+        "Hybrid-mode fallthroughs from the Redis path to the PG path"
+    );
+
+    // Redis-intake background worker (drains the Tier-2 pending list).
+    metrics::describe_counter!(
+        "idempotency_redis_intake_failures_total",
+        "Intake worker process_one failures (entry stays in inflight, retried)"
+    );
+    metrics::describe_counter!(
+        "idempotency_redis_intake_errors_total",
+        "Intake worker BRPOPLPUSH errors (Redis transient)"
+    );
+    metrics::describe_counter!(
+        "idempotency_redis_intake_publish_failures_total",
+        "Intake worker broker publish failures (lease cleared, publish_outbox retries)"
+    );
+    metrics::describe_counter!(
+        "idempotency_redis_intake_published_total",
+        "Outbox payloads successfully published by the intake worker"
+    );
+
+    // Outbox-publisher worker counters.
+    metrics::describe_counter!(
+        "publish_outbox_shipped_total",
+        "Outbox rows successfully published and marked published=true"
+    );
+    metrics::describe_counter!(
+        "publish_outbox_publish_failures_total",
+        "Outbox publish failures (broker unhealthy; row stays leased for retry)"
+    );
+    metrics::describe_counter!(
+        "publish_outbox_iteration_errors_total",
+        "Outbox iteration errors (PG transient on Phase 1 claim)"
+    );
+
+    // AMQP channel-callback events (consumer + publisher sides).
+    metrics::describe_counter!(
+        "amqp_consumer_cancel_total",
+        "Broker-initiated basic.cancel events (queue deleted, mirror failover, policy reset)"
+    );
+    metrics::describe_counter!(
+        "amqp_channel_close_total",
+        "Broker-initiated channel.close events (label `side`: consumer / publisher)"
+    );
+    metrics::describe_counter!(
+        "amqp_flow_total",
+        "Broker-initiated channel.flow requests (label `side`: consumer / publisher)"
+    );
+    metrics::describe_counter!(
+        "amqp_publish_failed_total",
+        "Outbox publish failed terminally (label `kind`: nack_or_returned, etc.)"
+    );
+    metrics::describe_counter!(
+        "amqp_publish_nack_total",
+        "Broker NACKed a publish confirm"
+    );
+    metrics::describe_counter!(
+        "amqp_publish_return_total",
+        "Broker returned a mandatory publish as unrouteable"
+    );
+    metrics::describe_counter!(
+        "amqp_ack_failures_total",
+        "Consumer ACK / NACK failures (label `kind`: ack, nack_requeue, nack_dlq)"
     );
 
     // Initialise to zero
@@ -296,6 +380,7 @@ pub fn build_router(
         state.cache.clone(),
         accounts_deps.service.clone(),
         config.verify_from_account_exists,
+        config.idempotency_backend,
     );
     let transactions_router = apply_protection_stack(
         transactions::router(transactions_deps),
