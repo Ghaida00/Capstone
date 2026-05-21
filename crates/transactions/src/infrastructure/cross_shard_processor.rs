@@ -35,6 +35,7 @@
 
 use std::time::Duration;
 
+use futures::stream::{self, StreamExt};
 use rust_decimal::Decimal;
 use sqlx::FromRow;
 use tokio::task::JoinHandle;
@@ -58,6 +59,16 @@ const LEASE_SECS: i64 = 60;
 /// catches up quickly, long enough that an extended outage does
 /// not produce per-tick failure spam.
 const REFUND_STUCK_BACKOFF_SECS: i64 = 300;
+/// Maximum rows processed concurrently within a single `drain_shard`
+/// call. Each row holds two connections during its async lifetime
+/// (one on the receiver pool for `apply_on_receiver`, one on the
+/// sender pool for the two bookkeeping UPDATEs). With
+/// `db_write_pool_size = 40` per shard per app instance and two app
+/// instances drawing from disjoint claimed-row sets (FOR UPDATE SKIP
+/// LOCKED), 16 keeps peak per-instance pool usage at ~32 connections,
+/// leaving 8 headroom for the consumer + publish-outbox + POST
+/// handlers running on the same instance.
+const ROW_CONCURRENCY: usize = 16;
 
 #[derive(FromRow)]
 struct OutboxRow {
@@ -134,7 +145,7 @@ pub fn spawn_cross_shard_processor(
 }
 
 async fn drain_shard(shards: &ShardRouter, sender_shard: usize) -> Result<(), sqlx::Error> {
-    let sender_pool = shards.writer(sender_shard);
+    let sender_pool = shards.writer(sender_shard).clone();
     // Atomic lease-claim. SKIP LOCKED keeps two app instances
     // from grabbing the same row; lease_until gates re-claim if
     // the holder crashes mid-process (LEASE_SECS expiry).
@@ -159,92 +170,105 @@ async fn drain_shard(shards: &ShardRouter, sender_shard: usize) -> Result<(), sq
     .bind(MAX_ATTEMPTS)
     .bind(BATCH_LIMIT)
     .bind(LEASE_SECS)
-    .fetch_all(sender_pool)
+    .fetch_all(&sender_pool)
     .await?;
 
-    for row in rows {
-        // Each row's processing is independent — log+continue on
-        // bookkeeping errors instead of `?`-ing out of the loop.
-        // A single sender-pool hiccup used to abort the rest of
-        // the drain and starve every other row this tick.
-        let receiver_shard = row.to_shard as usize;
-        if receiver_shard >= shards.num_shards() {
-            best_effort(
-                "mark_failed (invalid to_shard)",
-                row.id,
-                mark_failed(sender_pool, row.id, "invalid to_shard").await,
-            );
-            continue;
-        }
-
-        if row.refund_required {
-            // Receiver-side credit could not land on a real account.
-            // Refund the sender atomically + mark sender audit row
-            // 'reversed'. The CTE makes the whole compensation
-            // idempotent against redelivery / retry.
-            match refund_sender(sender_pool, &row).await {
-                Ok(()) => {
-                    metrics::counter!("cross_shard_refund_applied_total").increment(1);
+    // Process each row concurrently with bounded fan-out. Each row's
+    // per-row processing is independent — the receiver-side dedupe
+    // via `cross_shard_outbox_applied (sender_shard, outbox_id)` PK
+    // absorbs any duplicate apply, and sender-side state changes
+    // target distinct `(reference_id, from_account)` keys gated on
+    // `status='processing'`, so the refund-vs-completion races
+    // already covered in the sequential design remain covered.
+    // A single row's failure is contained (logged via
+    // `handle_attempt_error`); it does not abort the rest of the
+    // batch.
+    stream::iter(rows)
+        .for_each_concurrent(ROW_CONCURRENCY, |row| {
+            let sender_pool = sender_pool.clone();
+            let shards = shards.clone();
+            async move {
+                let receiver_shard = row.to_shard as usize;
+                if receiver_shard >= shards.num_shards() {
                     best_effort(
-                        "mark_completed",
+                        "mark_failed (invalid to_shard)",
                         row.id,
-                        mark_completed(sender_pool, row.id).await,
+                        mark_failed(&sender_pool, row.id, "invalid to_shard").await,
                     );
+                    return;
                 }
-                Err(e) => {
-                    handle_attempt_error(sender_pool, &row, e.to_string(), "refund").await;
-                }
-            }
-            continue;
-        }
 
-        let receiver_pool = shards.writer(receiver_shard);
-        match apply_on_receiver(receiver_pool, sender_shard, &row).await {
-            Ok(ApplyOutcome::Applied) => {
-                metrics::counter!("cross_shard_credit_applied_total").increment(1);
-                best_effort(
-                    "mark_sender_completed",
-                    row.id,
-                    mark_sender_completed(sender_pool, &row.reference_id, &row.from_account).await,
-                );
-                best_effort(
-                    "mark_completed",
-                    row.id,
-                    mark_completed(sender_pool, row.id).await,
-                );
+                if row.refund_required {
+                    // Receiver-side credit could not land on a real account.
+                    // Refund the sender atomically + mark sender audit row
+                    // 'reversed'. The CTE makes the whole compensation
+                    // idempotent against redelivery / retry.
+                    match refund_sender(&sender_pool, &row).await {
+                        Ok(()) => {
+                            metrics::counter!("cross_shard_refund_applied_total").increment(1);
+                            best_effort(
+                                "mark_completed",
+                                row.id,
+                                mark_completed(&sender_pool, row.id).await,
+                            );
+                        }
+                        Err(e) => {
+                            handle_attempt_error(&sender_pool, &row, e.to_string(), "refund").await;
+                        }
+                    }
+                    return;
+                }
+
+                let receiver_pool = shards.writer(receiver_shard);
+                match apply_on_receiver(receiver_pool, sender_shard, &row).await {
+                    Ok(ApplyOutcome::Applied) => {
+                        metrics::counter!("cross_shard_credit_applied_total").increment(1);
+                        best_effort(
+                            "mark_sender_completed",
+                            row.id,
+                            mark_sender_completed(&sender_pool, &row.reference_id, &row.from_account).await,
+                        );
+                        best_effort(
+                            "mark_completed",
+                            row.id,
+                            mark_completed(&sender_pool, row.id).await,
+                        );
+                    }
+                    Ok(ApplyOutcome::AlreadyApplied) => {
+                        metrics::counter!("cross_shard_credit_redundant_total").increment(1);
+                        best_effort(
+                            "mark_sender_completed",
+                            row.id,
+                            mark_sender_completed(&sender_pool, &row.reference_id, &row.from_account).await,
+                        );
+                        best_effort(
+                            "mark_completed",
+                            row.id,
+                            mark_completed(&sender_pool, row.id).await,
+                        );
+                    }
+                    Ok(ApplyOutcome::RecipientMissing) => {
+                        metrics::counter!("cross_shard_credit_recipient_missing_total").increment(1);
+                        tracing::warn!(
+                            outbox_id = %row.id,
+                            from = %row.from_account,
+                            to = %row.to_account,
+                            "cross-shard recipient missing — flagging for sender refund"
+                        );
+                        best_effort(
+                            "mark_refund_required",
+                            row.id,
+                            mark_refund_required(&sender_pool, row.id).await,
+                        );
+                    }
+                    Err(e) => {
+                        handle_attempt_error(&sender_pool, &row, e.to_string(), "credit").await;
+                    }
+                }
             }
-            Ok(ApplyOutcome::AlreadyApplied) => {
-                metrics::counter!("cross_shard_credit_redundant_total").increment(1);
-                best_effort(
-                    "mark_sender_completed",
-                    row.id,
-                    mark_sender_completed(sender_pool, &row.reference_id, &row.from_account).await,
-                );
-                best_effort(
-                    "mark_completed",
-                    row.id,
-                    mark_completed(sender_pool, row.id).await,
-                );
-            }
-            Ok(ApplyOutcome::RecipientMissing) => {
-                metrics::counter!("cross_shard_credit_recipient_missing_total").increment(1);
-                tracing::warn!(
-                    outbox_id = %row.id,
-                    from = %row.from_account,
-                    to = %row.to_account,
-                    "cross-shard recipient missing — flagging for sender refund"
-                );
-                best_effort(
-                    "mark_refund_required",
-                    row.id,
-                    mark_refund_required(sender_pool, row.id).await,
-                );
-            }
-            Err(e) => {
-                handle_attempt_error(sender_pool, &row, e.to_string(), "credit").await;
-            }
-        }
-    }
+        })
+        .await;
+
     Ok(())
 }
 
