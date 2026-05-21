@@ -1,9 +1,13 @@
 # OTel Collector — Peakload Capstone
 #
-# Receives OTLP/gRPC from app instances, batches, and prints span detail
-# to stdout (visible via `docker logs peakload-otel-collector`). No
-# Jaeger/Tempo/persistent backend — the debug exporter is the
-# observation surface for this stack.
+# Receives OTLP/gRPC from app instances, batches, and fans every trace
+# out to two exporters:
+#   - otlp:  forwards to the `jaeger` service, which stores spans and
+#            serves the searchable trace UI at http://localhost:16686.
+#            This is the primary observation surface.
+#   - debug: prints full span detail to stdout (visible via
+#            `docker logs peakload-otel-collector`) as a
+#            no-dependency observation surface alongside Jaeger.
 receivers:
   otlp:
     protocols:
@@ -14,6 +18,12 @@ processors:
   batch: {}
 
 exporters:
+  otlp:
+    endpoint: jaeger:4317
+    # Jaeger's OTLP gRPC listener is plaintext on the internal Docker
+    # network — no TLS to negotiate.
+    tls:
+      insecure: true
   debug:
     verbosity: detailed
 
@@ -22,4 +32,4 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug]
+      exporters: [otlp, debug]
