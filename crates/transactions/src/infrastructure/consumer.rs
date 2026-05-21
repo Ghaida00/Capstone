@@ -336,6 +336,28 @@ pub async fn start_consumer(
     Ok(handle)
 }
 
+/// Decide whether the timer should flush a partial batch.
+///
+/// Returns true when the buffer has at least one message AND no new
+/// arrival has landed for `idle_threshold_ms`. Under sustained load
+/// the idle window never opens (messages arrive every few ms), so
+/// the size-flush at `BATCH_SIZE` dominates and batches reach their
+/// configured cap. When inflow stops or pauses, the last partial
+/// batch flushes after a bounded idle window — bounding straggler
+/// latency without capping throughput.
+///
+/// `saturating_sub` defends against `last_arrival_ms > now_ms`
+/// (initial zero state, NTP step, clock skew) — that case is
+/// treated as "just arrived", not "very old".
+fn should_idle_flush(
+    buf_len: usize,
+    last_arrival_ms: u64,
+    now_ms: u64,
+    idle_threshold_ms: u64,
+) -> bool {
+    buf_len > 0 && now_ms.saturating_sub(last_arrival_ms) >= idle_threshold_ms
+}
+
 async fn drain_buffer(buffer: &Arc<Mutex<Vec<PendingMessage>>>) -> Vec<PendingMessage> {
     let mut buf = buffer.lock().await;
     buf.drain(..).collect()
@@ -1217,5 +1239,41 @@ fn publish_committed_events(successful: &[PendingMessage], events: &Arc<dyn Even
             metrics::counter!("events_published_total", "name" => EVENT_TRANSACTIONS_COMMITTED)
                 .increment(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_idle_flush;
+
+    #[test]
+    fn idle_flush_yes_when_buffer_nonempty_and_idle_threshold_exceeded() {
+        // last arrival at t=0, now at t=300, threshold 250 → idle
+        assert!(should_idle_flush(3, 0, 300, 250));
+    }
+
+    #[test]
+    fn idle_flush_no_when_buffer_empty() {
+        // Nothing to flush even if idle for a long time.
+        assert!(!should_idle_flush(0, 0, 1000, 250));
+    }
+
+    #[test]
+    fn idle_flush_no_when_arrival_is_recent() {
+        // 100ms since last arrival, threshold 250ms → keep accumulating.
+        assert!(!should_idle_flush(5, 200, 300, 250));
+    }
+
+    #[test]
+    fn idle_flush_yes_at_exactly_the_threshold() {
+        // Boundary: now - last == threshold → flush (>=, not >).
+        assert!(should_idle_flush(1, 0, 250, 250));
+    }
+
+    #[test]
+    fn idle_flush_handles_clock_running_backwards() {
+        // last_arrival_ms > now_ms (clock skew, NTP step, or initial state).
+        // saturating_sub returns 0 → not idle → keep accumulating.
+        assert!(!should_idle_flush(5, 1000, 500, 250));
     }
 }
