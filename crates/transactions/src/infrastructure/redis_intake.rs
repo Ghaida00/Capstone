@@ -45,26 +45,36 @@ const IDLE_TICK: Duration = Duration::from_millis(10);
 /// immediately.
 const ERROR_BACKOFF: Duration = Duration::from_millis(500);
 
-/// Spawns one intake worker per shard. Mirrors
-/// [`super::publish_outbox::spawn_publish_outbox`] in shape so
-/// shutdown wiring is uniform across the bootstrap.
+/// Spawns `num_shards × concurrency` redis-intake workers — `concurrency`
+/// independent serial workers per shard, each draining that shard's
+/// `idempotency:pending` list. Atomic `RPOPLPUSH pending -> inflight`
+/// makes the workers within a shard pull disjoint keys, so running
+/// several multiplies intake throughput without any new coordination.
+/// Mirrors [`super::publish_outbox::spawn_publish_outbox`] in shutdown
+/// wiring so the bootstrap stays uniform.
 pub fn spawn_redis_intake(
     shards: ShardRouter,
     cache: RedisCache,
     queue: QueueProducer,
     cancel: CancellationToken,
+    concurrency: usize,
 ) -> Vec<JoinHandle<()>> {
-    (0..shards.num_shards())
-        .map(|shard_idx| {
+    // `validate()` already rejects 0; `.max(1)` keeps the function
+    // safe if called directly (e.g. from a test) with an unchecked value.
+    let concurrency = concurrency.max(1);
+    let mut handles = Vec::with_capacity(shards.num_shards() * concurrency);
+    for shard_idx in 0..shards.num_shards() {
+        for _ in 0..concurrency {
             let shards = shards.clone();
             let cache = cache.clone();
             let queue = queue.clone();
             let cancel = cancel.clone();
-            tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 run_shard_worker(shard_idx, shards, cache, queue, cancel).await;
-            })
-        })
-        .collect()
+            }));
+        }
+    }
+    handles
 }
 
 async fn run_shard_worker(
