@@ -155,6 +155,7 @@ impl App {
                 self.state.queue_producer.clone(),
                 self.cancel.child_token(),
                 self.config.redis_intake_concurrency,
+                self.config.redis_intake_batch_size,
             ),
         };
 
