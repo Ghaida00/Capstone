@@ -133,6 +133,13 @@ pub struct Config {
     /// disjoint keys, so no coordination is needed. Env:
     /// `REDIS_INTAKE_CONCURRENCY`, default 4.
     pub redis_intake_concurrency: usize,
+
+    /// Number of reservation keys claimed and processed as one batch
+    /// by each redis-intake worker iteration. Larger batches amortise
+    /// fixed round-trip latency over more messages but coarsen the
+    /// failure granularity (a crash reprocesses the whole batch).
+    /// Env: `REDIS_INTAKE_BATCH_SIZE`, default 25.
+    pub redis_intake_batch_size: usize,
 }
 
 /// Parse `IDEMPOTENCY_BACKEND` from env. Defaults to `hybrid` and
@@ -341,6 +348,10 @@ impl Config {
             redis_intake_concurrency: env_or("REDIS_INTAKE_CONCURRENCY", "4")
                 .parse()
                 .expect("REDIS_INTAKE_CONCURRENCY must be a number"),
+
+            redis_intake_batch_size: env_or("REDIS_INTAKE_BATCH_SIZE", "25")
+                .parse()
+                .expect("REDIS_INTAKE_BATCH_SIZE must be a number"),
         }
     }
 
@@ -492,6 +503,15 @@ impl Config {
             self.redis_intake_concurrency
         );
 
+        // Batched intake size. Lower bound 1 (zero is meaningless);
+        // upper bound 500 mirrors the pool-size cap — past that the
+        // PG bulk INSERT/UPDATE arrays grow without payoff.
+        ensure!(
+            self.redis_intake_batch_size >= 1 && self.redis_intake_batch_size <= 500,
+            "REDIS_INTAKE_BATCH_SIZE must be 1-500, got {}",
+            self.redis_intake_batch_size
+        );
+
         Ok(())
     }
 }
@@ -616,6 +636,11 @@ impl fmt::Display for Config {
             "  redis_intake_concurrency:     {}",
             self.redis_intake_concurrency
         )?;
+        writeln!(
+            f,
+            "  redis_intake_batch_size:      {}",
+            self.redis_intake_batch_size
+        )?;
         Ok(())
     }
 }
@@ -713,6 +738,7 @@ mod tests {
             backpressure_wait_ms: 50,
             idempotency_backend: IdempotencyBackend::Pg,
             redis_intake_concurrency: 4,
+            redis_intake_batch_size: 25,
         }
     }
 
@@ -855,6 +881,27 @@ mod tests {
     fn default_redis_intake_concurrency_passes() {
         let mut cfg = test_config();
         cfg.redis_intake_concurrency = 4;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_redis_intake_batch_size_fails() {
+        let mut cfg = test_config();
+        cfg.redis_intake_batch_size = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn over_max_redis_intake_batch_size_fails() {
+        let mut cfg = test_config();
+        cfg.redis_intake_batch_size = 501;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn default_redis_intake_batch_size_passes() {
+        let mut cfg = test_config();
+        cfg.redis_intake_batch_size = 25;
         assert!(cfg.validate().is_ok());
     }
 }
