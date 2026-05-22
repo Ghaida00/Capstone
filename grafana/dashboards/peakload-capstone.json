@@ -355,8 +355,8 @@
       }
     },
     {
-      "title": "Created − Processed (lifetime delta)",
-      "description": "Lifetime created_total − processed_total. NOT real RabbitMQ queue depth — ignores DLQ, asymmetric restarts, and counter resets. Use as a coarse drift indicator only.",
+      "title": "Drift (replay-adjusted)",
+      "description": "Lifetime created − processed − idempotency_replays (both Redis and PG paths). Should be ~0 in steady state. A non-zero reading is real loss to investigate: DLQ, requeued, or cross-shard terminal-failed. The raw created − processed includes idempotency replays — those are accepted POSTs that intentionally short-circuit to the cached response and never reach the consumer, so they accumulate in the delta despite being correct behaviour.",
       "type": "stat",
       "gridPos": {
         "h": 4,
@@ -366,7 +366,7 @@
       },
       "targets": [
         {
-          "expr": "sum(transactions_created_total) - sum(transactions_processed_total)",
+          "expr": "sum(transactions_created_total) - sum(transactions_processed_total) - sum(idempotency_redis_replay_total) - sum(idempotency_hits_total)",
           "refId": "A"
         }
       ],
@@ -394,6 +394,7 @@
     },
     {
       "title": "Idempotency Hits",
+      "description": "Replay attempts detected and short-circuited (cached response returned without reaching the consumer). Sums both backend paths: idempotency_hits_total (PG path, IDEMPOTENCY_BACKEND=pg) and idempotency_redis_replay_total (Redis/hybrid path). Under the default hybrid backend the Redis counter is the active one.",
       "type": "stat",
       "gridPos": {
         "h": 4,
@@ -403,7 +404,7 @@
       },
       "targets": [
         {
-          "expr": "sum(idempotency_hits_total)",
+          "expr": "sum(idempotency_hits_total) + sum(idempotency_redis_replay_total)",
           "refId": "A"
         }
       ],
@@ -1598,5 +1599,5 @@
   "timezone": "browser",
   "title": "Peakload Capstone — Performance Dashboard",
   "uid": "peakload-capstone-perf",
-  "version": 5
+  "version": 6
 }
