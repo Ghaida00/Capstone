@@ -97,6 +97,12 @@ jobs:
     name: cargo audit (S-7)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # rustsec/audit-check writes its findings via the GitHub Checks
+    # API. Without `checks: write` the action errors at the create-a-
+    # check-run call even when the scan itself exits clean.
+    permissions:
+      checks: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2.0.0
