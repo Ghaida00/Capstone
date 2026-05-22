@@ -125,6 +125,14 @@ pub struct Config {
     ///     fall back to the PG path so a Redis outage degrades
     ///     latency rather than rejecting requests.
     pub idempotency_backend: IdempotencyBackend,
+
+    /// Number of redis-intake workers to run per shard. Each worker
+    /// is an independent serial drain of that shard's
+    /// `idempotency:pending` list; running several multiplies stage-2
+    /// publish throughput. Atomic `RPOPLPUSH` makes the workers pull
+    /// disjoint keys, so no coordination is needed. Env:
+    /// `REDIS_INTAKE_CONCURRENCY`, default 4.
+    pub redis_intake_concurrency: usize,
 }
 
 /// Parse `IDEMPOTENCY_BACKEND` from env. Defaults to `hybrid` and
@@ -329,6 +337,10 @@ impl Config {
                 .expect("BACKPRESSURE_WAIT_MS must be a number"),
 
             idempotency_backend: idempotency_backend_from_env(),
+
+            redis_intake_concurrency: env_or("REDIS_INTAKE_CONCURRENCY", "4")
+                .parse()
+                .expect("REDIS_INTAKE_CONCURRENCY must be a number"),
         }
     }
 
@@ -470,6 +482,16 @@ impl Config {
             "REDIS_SENTINEL_MONITOR_INTERVAL_SECS must be > 0"
         );
 
+        // Stage-2 intake worker fan-out. Lower bound 1 (zero workers
+        // would silently strand the pending list); upper bound 64
+        // guards a typo'd value from oversubscribing the PG pool and
+        // AMQP channels.
+        ensure!(
+            self.redis_intake_concurrency >= 1 && self.redis_intake_concurrency <= 64,
+            "REDIS_INTAKE_CONCURRENCY must be 1-64, got {}",
+            self.redis_intake_concurrency
+        );
+
         Ok(())
     }
 }
@@ -589,6 +611,11 @@ impl fmt::Display for Config {
             "  rabbitmq_url:                 {}",
             mask_url(&self.rabbitmq_url)
         )?;
+        writeln!(
+            f,
+            "  redis_intake_concurrency:     {}",
+            self.redis_intake_concurrency
+        )?;
         Ok(())
     }
 }
@@ -685,6 +712,7 @@ mod tests {
             verify_from_account_exists: false,
             backpressure_wait_ms: 50,
             idempotency_backend: IdempotencyBackend::Pg,
+            redis_intake_concurrency: 4,
         }
     }
 
@@ -807,5 +835,26 @@ mod tests {
             output.contains("****"),
             "Display should contain masked markers"
         );
+    }
+
+    #[test]
+    fn zero_redis_intake_concurrency_fails() {
+        let mut cfg = test_config();
+        cfg.redis_intake_concurrency = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn over_max_redis_intake_concurrency_fails() {
+        let mut cfg = test_config();
+        cfg.redis_intake_concurrency = 65;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn default_redis_intake_concurrency_passes() {
+        let mut cfg = test_config();
+        cfg.redis_intake_concurrency = 4;
+        assert!(cfg.validate().is_ok());
     }
 }
