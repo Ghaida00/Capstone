@@ -33,8 +33,12 @@ const ROUTING_KEY: &str = "transaction.created";
 const DLX_EXCHANGE: &str = "peakload.transactions.dlx";
 const DLX_QUEUE: &str = "transactions.dead_letter";
 
-/// AMQP channels per connection.
-const CHANNELS_PER_CONNECTION: usize = 4;
+/// AMQP channels per connection. Raised from 4 to 8 so the batched
+/// redis-intake worker's `buffer_unordered` publish step is not
+/// bottlenecked on per-channel `publish_lock` contention. Channel
+/// pool per replica = `CONNECTION_POOL_SIZE × CHANNELS_PER_CONNECTION`
+/// = 16; cluster-wide = 32 across the 2 app replicas.
+const CHANNELS_PER_CONNECTION: usize = 8;
 /// Connections in the producer pool. Multiple TCP connections are
 /// the RabbitMQ-recommended HA pattern; one connection drop no
 /// longer kills every in-flight publish.
