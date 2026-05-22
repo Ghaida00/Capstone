@@ -127,10 +127,7 @@ async fn batched_intake_recovers_from_seeded_inflight() {
         // Seed directly into inflight (NOT pending): the exact
         // post-crash state where a prior worker had claimed via
         // RPOPLPUSH but died before LREM.
-        env.cache
-            .lpush(&inflight_list_key(0), &key)
-            .await
-            .unwrap();
+        env.cache.lpush(&inflight_list_key(0), &key).await.unwrap();
     }
 
     let cancel = CancellationToken::new();
@@ -280,11 +277,7 @@ impl TestEnv {
             "shard": shard,
         });
         self.cache
-            .set_nx_ex(
-                &format!("v1:idemp:{}", idempotency_key),
-                &entry,
-                3600,
-            )
+            .set_nx_ex(&format!("v1:idemp:{}", idempotency_key), &entry, 3600)
             .await
             .unwrap();
         self.cache

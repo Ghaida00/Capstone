@@ -238,7 +238,10 @@ async fn apply_batch_intra_batch_same_sender_sees_running_balance() {
         &pool,
         &ids,
         &outbox_ids,
-        &["ACC_TEST_SENDER1".to_string(), "ACC_TEST_SENDER1".to_string()],
+        &[
+            "ACC_TEST_SENDER1".to_string(),
+            "ACC_TEST_SENDER1".to_string(),
+        ],
         &vec!["ACC_TEST_RECVR_SAME".to_string(); 2],
         &[Decimal::new(6000, 2), Decimal::new(5000, 2)],
         &vec!["IDR".to_string(); 2],

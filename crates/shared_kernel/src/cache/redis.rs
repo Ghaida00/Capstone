@@ -447,34 +447,25 @@ impl RedisCache {
         for _ in 0..n {
             pipe.cmd("RPOPLPUSH").arg(src).arg(dst);
         }
-        let results: Vec<Option<String>> =
-            self.map_redis(pipe.query_async(&mut *conn).await)?;
+        let results: Vec<Option<String>> = self.map_redis(pipe.query_async(&mut *conn).await)?;
         Ok(results.into_iter().flatten().collect())
     }
 
     /// `MGET` against the master pool (no replication lag). Values
     /// align with input; `None` for missing keys.
-    pub async fn mget_master_raw(
-        &self,
-        keys: &[String],
-    ) -> Result<Vec<Option<String>>, AppError> {
+    pub async fn mget_master_raw(&self, keys: &[String]) -> Result<Vec<Option<String>>, AppError> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
         let mut conn = self.write_conn().await?;
-        let values: Vec<Option<String>> = self.map_redis(
-            ::redis::cmd("MGET").arg(keys).query_async(&mut *conn).await,
-        )?;
+        let values: Vec<Option<String>> =
+            self.map_redis(::redis::cmd("MGET").arg(keys).query_async(&mut *conn).await)?;
         Ok(values)
     }
 
     /// Pipelined batched `LREM list 1 key` — one round-trip for N
     /// keys. Returns total items removed (sum across the N LREMs).
-    pub async fn lrem_batch(
-        &self,
-        list: &str,
-        keys: &[String],
-    ) -> Result<i64, AppError> {
+    pub async fn lrem_batch(&self, list: &str, keys: &[String]) -> Result<i64, AppError> {
         if keys.is_empty() {
             return Ok(0);
         }
@@ -483,8 +474,7 @@ impl RedisCache {
         for k in keys {
             pipe.cmd("LREM").arg(list).arg(1).arg(k);
         }
-        let removed: Vec<i64> =
-            self.map_redis(pipe.query_async(&mut *conn).await)?;
+        let removed: Vec<i64> = self.map_redis(pipe.query_async(&mut *conn).await)?;
         Ok(removed.iter().sum())
     }
 

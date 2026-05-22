@@ -73,8 +73,8 @@ pub fn init_tracing() {
     let global_filter =
         EnvFilter::try_new(&log_directives).unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let otel_layer = resolve_otlp_endpoint(std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())
-        .map(|endpoint| {
+    let otel_layer =
+        resolve_otlp_endpoint(std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()).map(|endpoint| {
             let exporter = SpanExporter::builder()
                 .with_tonic()
                 .with_endpoint(endpoint)

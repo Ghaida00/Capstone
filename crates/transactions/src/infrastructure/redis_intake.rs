@@ -102,7 +102,11 @@ async fn run_shard_worker(
     cancel: CancellationToken,
     batch_size: usize,
 ) {
-    tracing::info!(shard = shard_idx, batch_size, "redis-intake worker starting");
+    tracing::info!(
+        shard = shard_idx,
+        batch_size,
+        "redis-intake worker starting"
+    );
 
     let pending = pending_key(shard_idx);
     let inflight = inflight_key(shard_idx);
@@ -124,9 +128,7 @@ async fn run_shard_worker(
                 }
             }
             Ok(keys) => {
-                if let Err(e) =
-                    process_batch(shard_idx, &shards, &cache, &queue, keys).await
-                {
+                if let Err(e) = process_batch(shard_idx, &shards, &cache, &queue, keys).await {
                     tracing::warn!(
                         shard = shard_idx,
                         error = %e,
@@ -174,10 +176,7 @@ async fn drain_inflight_batched(
         // the same list; process_batch's final LREM cleans up the
         // ones it handled. Anything that errored stays in inflight
         // for the next cycle.
-        let claimed = match cache
-            .rpoplpush_batch(inflight, inflight, batch_size)
-            .await
-        {
+        let claimed = match cache.rpoplpush_batch(inflight, inflight, batch_size).await {
             Ok(k) => k,
             Err(e) => {
                 tracing::warn!(

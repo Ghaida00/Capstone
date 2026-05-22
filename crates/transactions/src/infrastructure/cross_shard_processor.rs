@@ -262,7 +262,12 @@ async fn drain_shard(
                         best_effort(
                             "mark_sender_completed",
                             row.id,
-                            mark_sender_completed(&sender_pool, &row.reference_id, &row.from_account).await,
+                            mark_sender_completed(
+                                &sender_pool,
+                                &row.reference_id,
+                                &row.from_account,
+                            )
+                            .await,
                         );
                         publish_sender_completed_event(&events, sender_shard, &row);
                         best_effort(
@@ -276,7 +281,12 @@ async fn drain_shard(
                         best_effort(
                             "mark_sender_completed",
                             row.id,
-                            mark_sender_completed(&sender_pool, &row.reference_id, &row.from_account).await,
+                            mark_sender_completed(
+                                &sender_pool,
+                                &row.reference_id,
+                                &row.from_account,
+                            )
+                            .await,
                         );
                         publish_sender_completed_event(&events, sender_shard, &row);
                         best_effort(
@@ -286,7 +296,8 @@ async fn drain_shard(
                         );
                     }
                     Ok(ApplyOutcome::RecipientMissing) => {
-                        metrics::counter!("cross_shard_credit_recipient_missing_total").increment(1);
+                        metrics::counter!("cross_shard_credit_recipient_missing_total")
+                            .increment(1);
                         tracing::warn!(
                             outbox_id = %row.id,
                             from = %row.from_account,
