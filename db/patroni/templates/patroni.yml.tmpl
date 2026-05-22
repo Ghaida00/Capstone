@@ -137,36 +137,16 @@ bootstrap:
         autovacuum_vacuum_cost_limit: 2000
         autovacuum_vacuum_insert_scale_factor: 0.05
 
-        # --- Write-path latency knobs ---------------------
-        # `remote_write` waits for the synchronous replica to
-        # receive the WAL in memory before returning success on
-        # COMMIT — replica disk fsync is NOT awaited. The
-        # `bootstrap.dcs.synchronous_mode: true` setting above
-        # publishes `synchronous_standby_names` so this engages.
-        # If the sync replica is unreachable PG drops back to
-        # async (writes keep succeeding) because
-        # `synchronous_mode_strict: false`; promotion is still
-        # safe because Patroni only promotes nodes that were
-        # synchronously replicating at the moment of failover.
-        synchronous_commit: "remote_write"
-        # `commit_delay` was tuned for the previous
-        # `synchronous_commit: "off"` configuration where the
-        # primary's local fsync was the dominant commit cost and
-        # batching siblings into one fsync was a net win. Under
-        # `remote_write` the bottleneck is the network round-trip
-        # to the sync replica, which `commit_delay` cannot batch —
-        # so the 100 µs nap on every commit is pure latency for
-        # no fsync-amortisation benefit. Set to 0 to disable.
-        # `commit_siblings` is left at its prior value but is a
-        # no-op while `commit_delay = 0`.
-        commit_delay: 0
-        commit_siblings: 5
+        # --- Write-path I/O knobs -------------------------
         # Tell PG the underlying disk can handle some
         # parallel I/O. Default (1) underestimates the
         # NVMe / overlay-fs combo Docker runs on.
         effective_io_concurrency: 200
-        # WAL writer naps less, flushes earlier — pairs with
-        # the reduced commit_delay above.
+        # WAL writer flush cadence. The durability knobs that
+        # pair with it — synchronous_commit, commit_delay,
+        # commit_siblings — live in the local `postgresql`
+        # block below so they are env-driven; see the PG_*
+        # vars there.
         wal_writer_delay: 200ms
 
   # NOTE: Patroni 4.0 dropped the declarative `bootstrap.users:`
@@ -206,6 +186,38 @@ postgresql:
   connect_address: ${PATRONI_HOSTNAME}:5432
   data_dir: ${PGDATA}
   bin_dir: /usr/lib/postgresql/18/bin
+
+  # ── Env-driven durability parameters ─────────────────
+  # These live in the LOCAL config, not under
+  # `bootstrap.dcs` above: the bootstrap block is read
+  # only at first cluster init, so a templated value
+  # there can never change an already-running cluster.
+  # Local `postgresql.parameters` are re-read on every
+  # Patroni start and override the dynamic (etcd) copy —
+  # so editing the PG_* vars in `.env` and recreating the
+  # node is what actually moves these.
+  #
+  #   synchronous_commit  durability vs. write latency.
+  #     on / remote_apply — strongest, slowest.
+  #     remote_write      — wait for the sync replica to
+  #                         hold the WAL in RAM.
+  #     local             — wait for local fsync only;
+  #                         the primary stays crash-safe.
+  #     off               — wait for nothing; a crash can
+  #                         lose the last ~wal_writer_delay
+  #                         of committed transactions.
+  #   commit_delay        per-commit nap (µs) that lets
+  #                       sibling commits batch into one
+  #                       fsync — group commit. 0 = off.
+  #   commit_siblings     concurrent-transaction floor
+  #                       before commit_delay engages.
+  #
+  # patroni-entrypoint.sh defaults these to
+  # remote_write / 0 / 5 when the PG_* vars are unset.
+  parameters:
+    synchronous_commit: "${PG_SYNCHRONOUS_COMMIT}"
+    commit_delay: ${PG_COMMIT_DELAY}
+    commit_siblings: ${PG_COMMIT_SIBLINGS}
 
   authentication:
     superuser:

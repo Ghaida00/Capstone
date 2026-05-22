@@ -20,14 +20,20 @@ see [ADR-0006](../docs/adr/0006-haproxy-primary-routing.md).
 | `5000` | shard 0 — writes to whichever node is primary            |
 | `5001` | shard 1 — same                                           |
 | `5002` | shard 2 — same                                           |
-| `7000` | HAProxy stats dashboard (HTTP, read-only, host-bound to `127.0.0.1`) |
+| `7000` | HAProxy stats dashboard (HTTP, read-only). Container port — Docker publishes it to a free ephemeral port on `127.0.0.1`. |
 
 The `:8008` port referenced in `haproxy.cfg` is **the target** on each
 PG node — Patroni's REST API. HAProxy does not bind it.
 
 ## Operational
 
-**View live status**: open `http://127.0.0.1:7000` while the stack runs.
+**View live status**: the dashboard is published to a free ephemeral port
+on `127.0.0.1` (a fixed port is unreliable on Windows — WinNAT may reserve
+it). Print the current URL with:
+
+```
+docker compose port pg-haproxy 7000
+```
 
 **Promotion timing** (worst case): `inter × fall = 2s × 2 = 4s` for
 HAProxy to mark the old primary DOWN, plus Patroni's promotion latency

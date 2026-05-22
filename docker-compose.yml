@@ -112,6 +112,13 @@ x-pg-node-env: &pg-node-env
   POSTGRES_SUPERUSER_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD in .env}
   REPL_PASSWORD: ${REPL_PASSWORD:?set REPL_PASSWORD in .env}
   ETCD_HOSTS: "etcd-1:2379,etcd-2:2379,etcd-3:2379"
+  # Durability posture — rendered into each node's local PG
+  # parameters by patroni-entrypoint.sh. Defaults here mirror
+  # the entrypoint's so a missing .env entry stays safe. See
+  # the "Postgres durability posture" block in .env.
+  PG_SYNCHRONOUS_COMMIT: ${PG_SYNCHRONOUS_COMMIT:-remote_write}
+  PG_COMMIT_DELAY: ${PG_COMMIT_DELAY:-0}
+  PG_COMMIT_SIBLINGS: ${PG_COMMIT_SIBLINGS:-5}
 
 # Per-node resource envelope. 1.5 CPU / 512 MB gives the
 # primary headroom for both request-driven INSERT/UPDATE
@@ -680,9 +687,9 @@ services:
   # answers HTTP 200 on GET /primary. See haproxy/README.md
   # for the detailed protocol.
   #
-  # Port 7000 stats dashboard is bound to 127.0.0.1 so it is
-  # visible from the host for debugging but never from the
-  # public internet.
+  # The stats dashboard (container port 7000) is published to
+  # 127.0.0.1 only — reachable from the host for debugging but
+  # never from the public internet. See the ports: block below.
   # ============================================================
   pg-haproxy:
     image: haproxy:3.3-alpine
@@ -690,7 +697,13 @@ services:
     volumes:
       - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
-      - "127.0.0.1:7000:7000"
+      # Host port left unspecified: Docker binds a free ephemeral port
+      # on 127.0.0.1 at `up` time. A fixed host port is unsafe on
+      # Windows — WinNAT reserves arbitrary blocks from the TCP dynamic
+      # range, and binding inside a reserved block fails with WSAEACCES.
+      # Letting the OS choose avoids every reservation. Discover the
+      # assigned URL with:  docker compose port pg-haproxy 7000
+      - "127.0.0.1::7000"
     expose:
       - "5000"
       - "5001"
