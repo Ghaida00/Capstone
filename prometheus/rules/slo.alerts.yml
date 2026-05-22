@@ -1,0 +1,108 @@
+groups:
+  - name: peakload-slo-burn
+    rules:
+      - alert: PeakloadAvailabilityFastBurn
+        expr: |
+          (1 - peakload:http_availability:ratio_rate5m) > (14.4 * 0.001)
+          and (1 - avg_over_time(peakload:http_availability:ratio_rate5m[1h])) > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Availability fast-burn: ~2% 30d budget in 1h"
+      - alert: PeakloadAvailabilitySlowBurn
+        expr: (1 - avg_over_time(peakload:http_availability:ratio_rate5m[6h])) > (6 * 0.001)
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Availability slow-burn: 10% 30d budget over 6h"
+      - alert: PeakloadLatencySLOBreach
+        expr: peakload:http_latency_under_slo:ratio_rate5m < 0.95
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "P95 latency SLO (<500ms for 95%) breached 10m"
+
+  # D-5: replica fallback signal. Every replica of a shard marked
+  # unhealthy → reads flow to the writer pool, amplifying primary
+  # load. Without this alert the only signal is a per-call WARN log.
+  - name: peakload-db-pool
+    rules:
+      - alert: PeakloadReadReplicaFallback
+        expr: sum by (shard) (rate(db_read_fallback_to_primary_total[1m])) > 0
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Shard {{ $labels.shard }}: read fallback to primary sustained 1m (replica health probes failing)"
+
+  # R-2: cross-shard outbox operator-visibility. Both counters
+  # already exist on the metric side; nothing was watching them
+  # until now, so the well-engineered "drop out and require
+  # manual reconciliation" semantics became "silently lose money".
+  - name: peakload-cross-shard-outbox
+    rules:
+      # Any credit terminal-fail is a money-stranded event: sender
+      # is debited, recipient never got their money, retries are
+      # exhausted. The R-8 audit-row transition makes the customer
+      # see 'failed' — but the operator still has to reconcile.
+      # for=1m to ride out a single benign transient that ticks
+      # the counter once on the very last attempt; sustained >=1m
+      # means a real terminal failure has occurred.
+      - alert: PeakloadCrossShardCreditTerminalFailure
+        expr: sum by (step) (rate(cross_shard_outbox_terminal_failures_total{step="credit"}[5m])) > 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "Cross-shard credit terminally failed (step={{ $labels.step }}): sender debited, recipient un-credited, audit row 'failed' with failure_reason populated. Run docs/runbooks/cross-shard-outbox-reconciliation.md."
+      # Refund-stuck counter increments every REFUND_STUCK_BACKOFF_SECS=300s
+      # per stuck row → one stuck row = 1/300 ≈ 0.0033 increments/sec.
+      # Threshold 0.003 catches "at least one stuck row sustained";
+      # for=30m matches the audit's "stuck for 30+ min" prescription
+      # and avoids paging on the very first re-claim tick (which is
+      # at most one increment 5 minutes after the row first hit
+      # MAX_ATTEMPTS — too short to be reliable signal yet).
+      - alert: PeakloadCrossShardRefundStuck
+        expr: rate(cross_shard_refund_stuck_total[15m]) > 0.003
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Cross-shard refund path stuck past MAX_ATTEMPTS for 30+ min: sender debited, no compensation. Run docs/runbooks/cross-shard-outbox-reconciliation.md (refund branch)."
+
+  # R-6: rate-limiter Redis-sync degradation. When the sync fails,
+  # each replica silently falls back to enforcing only its LOCAL
+  # counter, so the effective global ceiling becomes N ×
+  # per_replica — the limiter claims a number it no longer
+  # enforces. The sync runs ~1/s, so sustained failure ≈ ~1/s
+  # increments; 0.1/s catches real degradation while ignoring a
+  # single self-healing blip. for=2m: a one-off Redis hiccup
+  # recovers on the next tick; 2m sustained is a real posture
+  # change worth paging (fail-open on a security control).
+  - name: peakload-rate-limiter
+    rules:
+      - alert: PeakloadRateLimiterRedisSyncFailing
+        expr: sum by (kind) (rate(rate_limiter_redis_sync_failures_total[5m])) > 0.1
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Rate-limiter Redis sync failing (kind={{ $labels.kind }}): global ceiling degraded to per-replica (effective limit = N x per_replica). Edge limiter is the backstop; investigate Redis/Sentinel."
+
+  # R-9: degradation posture. Usually operator-initiated (a
+  # maintenance/incident read-only window) so this is a ticket,
+  # not a page — but it MUST be visible: a degraded mode left on
+  # by accident silently 503s every write. for=5m rides out a
+  # brief deliberate flip during a controlled procedure.
+  - name: peakload-degradation
+    rules:
+      - alert: PeakloadDegradationModeActive
+        expr: max(degradation_mode) > 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Degradation mode active (writes are being 503'd). If this was not a deliberate maintenance window, an operator flip leaked — GET /api/v2/admin/degradation to inspect, PUT mode=normal to clear."

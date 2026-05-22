@@ -38,3 +38,8 @@ logs/
 # ─── k6 output ──────────────────────────────────────────────
 k6/output/
 *.json.gz
+
+# ─── Docs ─────────────────────────────────────────────────
+docs/audit/
+docs/codemap/
+docs/superpowers/

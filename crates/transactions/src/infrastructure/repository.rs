@@ -12,13 +12,21 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use std::time::Duration;
 use uuid::Uuid;
+
+/// Per-shard wall-clock budget for the `find_by_id` fan-out. Single-row
+/// PK lookups are sub-10 ms on healthy shards; 500 ms gives ~50× buffer
+/// while bounding the tail when one shard is degraded so the call does
+/// not pin the API-timeout (D-4).
+const FIND_BY_ID_PER_SHARD_TIMEOUT: Duration = Duration::from_millis(500);
 
 use shared_kernel::cache::redis::RedisCache;
 use shared_kernel::db::shard::ShardRouter;
 
 use super::super::domain::{
-    IdempotencyAwareWriter, ReserveOutcome, Transaction, TransactionRepository, TransactionStatus,
+    IdempotencyAwareWriter, RepoError, ReserveOutcome, Transaction, TransactionRepository,
+    TransactionStatus,
 };
 use super::super::ports::{ListFilter, TransactionId};
 
@@ -76,37 +84,55 @@ impl SqlxTransactionRepository {
 
 #[async_trait]
 impl TransactionRepository for SqlxTransactionRepository {
-    async fn find_by_id(&self, id: TransactionId) -> Result<Option<Transaction>, String> {
-        // Cross-shard fan-out: spawn one query per shard, await
-        // ALL of them. Surfacing infra errors (one shard down) is
-        // important — silently swallowing them would return 404
-        // for rows that genuinely live on the unavailable shard.
-        // Awaiting all handles also avoids the leak the
-        // first-hit-wins variant produced.
+    async fn find_by_id(&self, id: TransactionId) -> Result<Option<Transaction>, RepoError> {
+        // Cross-shard fan-out: spawn one query per shard, each wrapped
+        // in `tokio::time::timeout(FIND_BY_ID_PER_SHARD_TIMEOUT, _)`
+        // so a degraded shard turns into a per-shard error rather than
+        // pinning the API-wide wall-clock (D-4). Surfacing infra errors
+        // (one shard down) still matters — silently swallowing them
+        // would return 404 for rows that genuinely live on the
+        // unavailable shard. Awaiting all handles still applies; it
+        // avoids the leak the first-hit-wins variant produced.
         let mut handles = Vec::with_capacity(self.shards.num_shards());
         for shard_idx in 0..self.shards.num_shards() {
             let pool = self.shards.reader(shard_idx).clone();
             let id = id.as_uuid();
             handles.push(tokio::spawn(async move {
-                sqlx::query_as::<_, TransactionRowSlim>(
-                    "SELECT id, from_account, to_account, amount, currency, status, reference_id, description, created_at, updated_at, processed_at FROM transactions WHERE id = $1",
-                )
-                .bind(id)
-                .fetch_optional(&pool)
-                .await
+                let res = tokio::time::timeout(FIND_BY_ID_PER_SHARD_TIMEOUT, async {
+                    sqlx::query_as::<_, TransactionRowSlim>(
+                        "SELECT id, from_account, to_account, amount, currency, status, reference_id, description, created_at, updated_at, processed_at FROM transactions WHERE id = $1",
+                    )
+                    .bind(id)
+                    .fetch_optional(&pool)
+                    .await
+                })
+                .await;
+                (shard_idx, res)
             }));
         }
         let mut found: Option<Transaction> = None;
         let mut last_err: Option<String> = None;
         for h in handles {
             match h.await {
-                Ok(Ok(Some(row))) => {
+                Ok((_, Ok(Ok(Some(row))))) => {
                     if found.is_none() {
                         found = Some(row.into());
                     }
                 }
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => last_err = Some(e.to_string()),
+                Ok((_, Ok(Ok(None)))) => {}
+                Ok((_, Ok(Err(e)))) => last_err = Some(e.to_string()),
+                Ok((shard_idx, Err(_elapsed))) => {
+                    metrics::counter!(
+                        "transactions_find_by_id_shard_timeout_total",
+                        "shard" => shard_idx.to_string()
+                    )
+                    .increment(1);
+                    last_err = Some(format!(
+                        "shard {} exceeded {}ms find_by_id budget",
+                        shard_idx,
+                        FIND_BY_ID_PER_SHARD_TIMEOUT.as_millis()
+                    ));
+                }
                 Err(e) => last_err = Some(format!("join: {}", e)),
             }
         }
@@ -120,30 +146,30 @@ impl TransactionRepository for SqlxTransactionRepository {
             return Ok(found);
         }
         if let Some(err) = last_err {
-            return Err(err);
+            return Err(RepoError::Other(err));
         }
         Ok(None)
     }
 
-    async fn list(&self, filter: &ListFilter) -> Result<Vec<Transaction>, String> {
+    async fn list(&self, filter: &ListFilter) -> Result<Vec<Transaction>, RepoError> {
         let limit = filter.limit.min(100) as i64;
-        // Per-shard fetch budget = `limit + ceil(limit / num_shards)`,
-        // floored at `limit + 2`.
+        // Two-phase cross-shard pagination. Each shard fetches its top
+        // `limit + 1` rows. The `(limit+1)`th row (if present) is a
+        // "tail probe" — the OLDEST row on that shard's slice that we
+        // would have dropped on truncate. Across shards, the MAX of
+        // those probes is the *safe cursor*: the oldest `(created_at,
+        // id)` for which every shard's slice still has full coverage
+        // newer than it. Any row in the merged page OLDER than the
+        // safe cursor is in a range where at least one shard's
+        // coverage is incomplete — drop it so the client's next-page
+        // cursor (derived from the last returned row) is safe.
         //
-        // Each shard returns its top `per_shard_limit` rows; the
-        // caller merges and truncates the union to `limit`. The
-        // slack term absorbs ordinary inter-shard skew so the
-        // merge step does not drop a row whose `created_at` lands
-        // older than another shard's tail. Pages that bunch
-        // entirely on one shard can still lose a tail row at the
-        // page boundary; the next page's cursor recovers it on
-        // the following call.
-        //
-        // Invariant: `per_shard_limit >= limit` so a single-shard
-        // result set is never under-fetched.
-        let num_shards = self.shards.num_shards() as i64;
-        let per_shard_slack = (limit / num_shards.max(1)).max(2);
-        let per_shard_limit = limit.saturating_add(per_shard_slack);
+        // Replaces the prior slack-based heuristic (`per_shard_limit =
+        // limit + ceil(limit/N)`) that silently dropped tail rows
+        // when a page bunched lopsidedly (D-3). Shards that exhaust
+        // (return fewer than `limit + 1` rows) do not contribute a
+        // probe — they cannot have more rows than they returned.
+        let per_shard_limit = limit.saturating_add(1);
         let cursor = filter.before;
         let cursor_id = filter.before_id;
 
@@ -191,35 +217,79 @@ impl TransactionRepository for SqlxTransactionRepository {
             }));
         }
 
-        let mut rows: Vec<Transaction> = Vec::new();
+        let mut per_shard_slices: Vec<Vec<TransactionRowSlim>> =
+            Vec::with_capacity(self.shards.num_shards());
         let mut last_err: Option<String> = None;
         for h in handles {
             match h.await {
-                Ok(Ok(rs)) => rows.extend(rs.into_iter().map(Into::into)),
+                Ok(Ok(rs)) => per_shard_slices.push(rs),
                 Ok(Err(e)) => last_err = Some(e.to_string()),
                 Err(e) => last_err = Some(format!("join: {}", e)),
             }
         }
+
+        // MAX (created_at, id) over the (limit+1)th row of each shard
+        // that returned a full `limit + 1`. Tuple Ord is lexicographic
+        // — matches our DESC sort key, so larger = newer.
+        let safe_cursor: Option<(chrono::DateTime<Utc>, Uuid)> = per_shard_slices
+            .iter()
+            .filter_map(|slice| slice.get(limit as usize))
+            .map(|row| (row.created_at, row.id))
+            .max();
+
+        // Each slice contributes its first `limit` rows (drop the
+        // `+1` probe row). The probe was a tail signal, not page data.
+        let mut rows: Vec<Transaction> = per_shard_slices
+            .into_iter()
+            .flat_map(|slice| {
+                slice
+                    .into_iter()
+                    .take(limit as usize)
+                    .map(Into::into)
+                    .collect::<Vec<Transaction>>()
+            })
+            .collect();
+
         // Surface infra errors only when zero shards answered —
         // a partial result is still useful and the error is logged.
         if rows.is_empty() {
             if let Some(err) = last_err {
-                return Err(err);
+                return Err(RepoError::Other(err));
             }
         } else if let Some(err) = last_err {
             tracing::warn!(err = %err, "list: partial shard failure");
         }
+
         // Stable order: created_at DESC, id DESC (matches per-shard
         // ORDER BY so merging is consistent).
-        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        rows.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         rows.truncate(limit as usize);
+
+        // Drop rows older than the safe cursor — at least one shard
+        // has un-fetched coverage there. When `safe_cursor` is None
+        // (no shard returned a full `limit + 1`), the global result
+        // fits within `limit` and no rows are unsafe.
+        if let Some((sc_at, sc_id)) = safe_cursor {
+            let pre_drop = rows.len();
+            rows.retain(|r| (r.created_at, r.id) > (sc_at, sc_id));
+            let dropped = pre_drop - rows.len();
+            if dropped > 0 {
+                metrics::counter!("transactions_list_tail_skew_dropped_total")
+                    .increment(dropped as u64);
+            }
+        }
+
         Ok(rows)
     }
 
     async fn find_status_by_reference(
         &self,
         reference_id: &str,
-    ) -> Result<Option<TransactionStatus>, String> {
+    ) -> Result<Option<TransactionStatus>, RepoError> {
         // Cross-shard transactions can produce TWO rows for the
         // same reference_id — one on the sender shard (consumer
         // bulk-insert) and one on the receiver shard (cross-shard
@@ -275,7 +345,7 @@ impl TransactionRepository for SqlxTransactionRepository {
             return Ok(candidates.into_iter().next());
         }
         if let Some(err) = last_err {
-            return Err(err);
+            return Err(RepoError::Other(err));
         }
         Ok(None)
     }
@@ -336,10 +406,24 @@ impl SqlxIdempotencyWriter {
     /// round-trip earlier. A dropped SET is not a correctness
     /// issue: the next replay falls through to the DB SELECT and
     /// repopulates from there.
+    ///
+    /// A-3: lower-stakes than the consumer size-flush spawn (no
+    /// ACK durability hinges on it), so the lighter wrapper is
+    /// sufficient — a `tracing::Instrument` span carries task
+    /// identity through panics, and the attempt counter makes the
+    /// path observable on the cache-write panel even when every
+    /// SET succeeds. JoinSet wrap unnecessary because the result
+    /// of the spawn does not influence any external state the
+    /// caller awaits.
     fn spawn_cache_set(cache: RedisCache, key: String, entry: IdempotencyCacheEntry) {
-        tokio::spawn(async move {
-            let _ = cache.set(&key, &entry, IDEMPOTENCY_TTL_SECS).await;
-        });
+        use tracing::Instrument;
+        tokio::spawn(
+            async move {
+                metrics::counter!("idempotency_cache_set_attempts_total").increment(1);
+                let _ = cache.set(&key, &entry, IDEMPOTENCY_TTL_SECS).await;
+            }
+            .instrument(tracing::info_span!("idempotency_cache_set")),
+        );
     }
 }
 
@@ -352,7 +436,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         request_hash: &str,
         accepted_payload: &serde_json::Value,
         outbox_payload: &serde_json::Value,
-    ) -> Result<ReserveOutcome, String> {
+    ) -> Result<ReserveOutcome, RepoError> {
         let writer = self.shards.writer(shard);
 
         // Optimistic INSERT first. The fresh path is ~95% of
@@ -377,8 +461,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         .bind(accepted_payload)
         .bind(outbox_payload)
         .execute(writer)
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
 
         if inserted.rows_affected() > 0 {
             Self::spawn_cache_set(
@@ -429,8 +512,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         )
         .bind(idempotency_key)
         .fetch_optional(writer)
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
 
         let Some(existing) = existing else {
             // Row vanished between INSERT and SELECT (cleanup race).
@@ -438,7 +520,9 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
             // this as a clean reservation would risk two concurrent
             // callers both writing outbox rows for the same logical
             // transaction.
-            return Err("idempotency row vanished after INSERT conflict".to_string());
+            return Err(RepoError::Other(
+                "idempotency row vanished after INSERT conflict".to_string(),
+            ));
         };
 
         if existing.request_hash != request_hash {
@@ -486,8 +570,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         .bind(accepted_payload)
         .bind(outbox_payload)
         .execute(writer)
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
 
         if revived.rows_affected() > 0 {
             Self::spawn_cache_set(
@@ -514,8 +597,7 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         )
         .bind(idempotency_key)
         .fetch_optional(writer)
-        .await
-        .map_err(|e| e.to_string())?;
+        .await?;
         let payload = winner
             .and_then(|w| w.response_payload)
             .unwrap_or_else(|| accepted_payload.clone());

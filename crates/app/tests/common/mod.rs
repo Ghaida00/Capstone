@@ -30,3 +30,27 @@ pub async fn spawn_postgres() -> (PgPool, ContainerAsync<Postgres>) {
     (pool, container)
 }
 
+/// Same as [`spawn_postgres`] but also returns the connection URL so a
+/// test can construct its own pool types (e.g. `DatabasePool`) instead
+/// of only getting a ready-made `PgPool`. Intentionally retained for
+/// future tests that need the raw URL (e.g. spawning a `ShardRouter`
+/// against the same container); the `#[allow(dead_code)]` is the
+/// honest annotation while CI's `clippy -D warnings` gate is active
+/// (WP4) and no caller exists yet.
+#[allow(dead_code)]
+pub async fn spawn_postgres_with_url() -> (PgPool, String, ContainerAsync<Postgres>) {
+    let container = Postgres::default().start().await.unwrap();
+    let host_port = container.get_host_port_ipv4(5432).await.unwrap();
+
+    let url = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        host_port
+    );
+
+    let pool = PgPool::connect(&url).await.unwrap();
+
+    let init_sql = include_str!("../../../../db/init.sql");
+    sqlx::raw_sql(init_sql).execute(&pool).await.unwrap();
+
+    (pool, url, container)
+}

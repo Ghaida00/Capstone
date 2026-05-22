@@ -27,4 +27,5 @@ pub mod db;
 pub mod error;
 pub mod events;
 pub mod queue;
+pub mod resilience;
 pub mod responses;

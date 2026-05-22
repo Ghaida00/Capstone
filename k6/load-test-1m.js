@@ -12,8 +12,8 @@ const idempotencyReplayHits = new Counter("idempotency_replay_attempts");
 // ─── Configuration ─────────────────────────────────────────
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";
 
-// Must match the accounts seeded by db/init.sql (ACC_0000001 – ACC_1000000)
-const NUM_ACCOUNTS = 1000000;
+// Must match the accounts seeded by db/init.sql (ACC_0000001 – ACC_0100000)
+const NUM_ACCOUNTS = 100000;
 
 // Hot-key contention pool: tiny set to force row-lock waits on the
 // debit UPDATE. Exercises the locking behavior that the uniform
@@ -159,7 +159,7 @@ function waitForCompletion(refId, timeoutMs = 5000, pollMs = 200) {
 export function setup() {
   console.log(`🎯 Target: ${BASE_URL}`);
   console.log(`📊 Running: smoke → load → stress → spike → hotkey`);
-  console.log(`👥 Using ${NUM_ACCOUNTS} pre-seeded accounts (ACC_0000001 – ACC_1000000)`);
+  console.log(`👥 Using ${NUM_ACCOUNTS} pre-seeded accounts (ACC_0000001 – ACC_0100000)`);
   console.log(`🔥 Hot-key pool: ${HOT_KEY_POOL_SIZE} accounts (ACC_0000001 – ACC_${String(HOT_KEY_POOL_SIZE).padStart(7, "0")})\n`);
 
   // 1. Health check

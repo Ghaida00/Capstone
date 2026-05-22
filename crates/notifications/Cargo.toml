@@ -3,6 +3,9 @@ name = "notifications"
 version = "0.1.0"
 edition = "2021"
 description = "Bounded context: out-of-band alerts. Pure event consumer."
+# Internal workspace crate — never published. Marks this for
+# cargo-deny's `[licenses.private] ignore = true` rule (WP4).
+publish = false
 
 [lib]
 path = "src/lib.rs"
@@ -24,3 +27,6 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 
 thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use futures::stream::{self, StreamExt};
 use sqlx::FromRow;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +26,12 @@ use shared_kernel::queue::producer::QueueProducer;
 /// many rows one worker holds against the lease before the next
 /// re-claim window opens.
 const BATCH_SIZE: i64 = 25;
+
+/// Maximum concurrent publishes per drain iteration. Matches the
+/// producer's `CHANNEL_POOL_SIZE` (2 connections × 4 channels = 8)
+/// so each parallel publish gets a fresh channel rather than
+/// contending on the per-channel `publish_lock`.
+const PUBLISH_CONCURRENCY: usize = 8;
 
 /// Sleep between iterations when the previous batch was empty.
 /// Trades CPU and database load against publish latency: every
@@ -203,48 +210,66 @@ async fn drain_once(
         return Ok(DrainOutcome::Empty);
     }
 
-    // Phase 2: publish + mark per row, with no enclosing tx. A
-    // publish failure leaves the row's `claimed_at` stamped;
-    // re-claim resumes naturally after `LEASE_SECS`.
-    for row in rows {
-        match queue.publish(&row.outbox_payload).await {
-            Ok(()) => {
-                sqlx::query(
-                    "UPDATE idempotency_keys
-                       SET published = true,
-                           published_at = NOW(),
-                           claimed_at = NULL,
-                           updated_at = NOW()
-                     WHERE id = $1",
-                )
-                .bind(row.id)
-                .execute(pool)
-                .await?;
-                metrics::counter!(
-                    "publish_outbox_shipped_total",
-                    "shard" => shard_idx.to_string()
-                )
-                .increment(1);
+    // Publish all claimed rows in parallel, then bulk-mark the
+    // confirmed ones with a single UPDATE. A failed publish leaves
+    // that row's `claimed_at` stamped; re-claim resumes after
+    // `LEASE_SECS`. Any failure trips `BrokerFailed` so the outer
+    // loop sleeps `ERROR_TICK` instead of hot-looping on `IDLE_TICK`.
+    let results: Vec<(Uuid, bool)> = stream::iter(rows)
+        .map(|row| {
+            let queue = queue.clone();
+            async move {
+                let tp = row
+                    .outbox_payload
+                    .get("traceparent")
+                    .and_then(|v| v.as_str());
+                let ok = queue.publish_traced(&row.outbox_payload, tp).await.is_ok();
+                (row.id, ok)
             }
-            Err(e) => {
-                tracing::warn!(
-                    shard = shard_idx,
-                    id = %row.id,
-                    error = %e,
-                    "publish-outbox publish failed; remaining rows in batch \
-                     will be retried after lease expiry"
-                );
-                metrics::counter!(
-                    "publish_outbox_publish_failures_total",
-                    "shard" => shard_idx.to_string()
-                )
-                .increment(1);
-                // Surface broker failure distinctly from "queue
-                // empty" so the outer loop sleeps `ERROR_TICK`
-                // instead of hot-looping on `IDLE_TICK`.
-                return Ok(DrainOutcome::BrokerFailed);
-            }
-        }
+        })
+        .buffer_unordered(PUBLISH_CONCURRENCY)
+        .collect()
+        .await;
+
+    let succeeded: Vec<Uuid> = results
+        .iter()
+        .filter_map(|(id, ok)| if *ok { Some(*id) } else { None })
+        .collect();
+
+    if !succeeded.is_empty() {
+        sqlx::query(
+            "UPDATE idempotency_keys
+                SET published = true,
+                    published_at = NOW(),
+                    claimed_at = NULL,
+                    updated_at = NOW()
+              WHERE id = ANY($1)",
+        )
+        .bind(&succeeded)
+        .execute(pool)
+        .await?;
+        metrics::counter!(
+            "publish_outbox_shipped_total",
+            "shard" => shard_idx.to_string()
+        )
+        .increment(succeeded.len() as u64);
+    }
+
+    if results.iter().any(|(_, ok)| !*ok) {
+        tracing::warn!(
+            shard = shard_idx,
+            failed = results.iter().filter(|(_, ok)| !*ok).count(),
+            "publish-outbox: one or more publishes failed; \
+             remaining rows retry after lease expiry"
+        );
+        metrics::counter!(
+            "publish_outbox_publish_failures_total",
+            "shard" => shard_idx.to_string()
+        )
+        .increment(1);
+        // Surface broker failure distinctly from "queue empty" so
+        // the outer loop sleeps `ERROR_TICK` instead of `IDLE_TICK`.
+        return Ok(DrainOutcome::BrokerFailed);
     }
 
     Ok(DrainOutcome::Drained)

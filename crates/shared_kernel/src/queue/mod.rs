@@ -8,3 +8,4 @@
 
 pub mod callback;
 pub mod producer;
+pub mod trace_propagation;

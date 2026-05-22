@@ -4,10 +4,10 @@ This is the canonical shape. Copy the whole directory to a new name,
 rewrite this README, then fill in the code from the inside out
 (`domain/` → `application/` → `infrastructure/` → `api/`).
 
-See [../../../docs/architecture/module-anatomy.md](../../../docs/architecture/module-anatomy.md)
-for the file-by-file walkthrough. This README focuses on the
-**per-module checklist** you should be able to answer before the
-first PR lands.
+The port-adapter shape this template encodes is documented in
+[ADR-0003](../../adr/0003-port-adapter-shape.md). This README focuses
+on the **per-module checklist** you should be able to answer before
+the first PR lands.
 
 ---
 

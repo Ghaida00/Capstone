@@ -1,0 +1,133 @@
+# WP4 — closes T-8 (k6 not in CI; thresholds were a manual gate
+# with no historical baseline). Runs on a nightly schedule
+# (04:00 UTC = 11:00 WIB, off-peak for the project's typical
+# work hours) and on workflow_dispatch for ad-hoc runs.
+#
+# IMPORTANT — which k6 script we run and why:
+#   * k6/load-test.js is the 6-scenario stress / spike / hotkey
+#     suite. It deliberately ramps to 2000 VUs in the spike
+#     phase and to 1000 VUs in the stress phase, with relaxed
+#     thresholds (p(95)<800 ms under spike). It is designed to
+#     run on a real production-class host with the budget the
+#     compose-comment names ("8 cores + 8 GB minimum"); on a
+#     GitHub-hosted ubuntu-latest runner (7 GB / 2 vCPU) the
+#     spike scenario would deliberately push past the runner's
+#     resource budget and produce noise, not signal.
+#   * k6/load-test-1m.js is the steady-state, constant-arrival-
+#     rate suite. Tight thresholds throughout (p(95)<50 ms POST,
+#     p(95)<10 ms balance) at a sustained arrival rate for 15
+#     minutes. This is the script the project's empirical
+#     verification rounds (WP7 through WP10) actually used to
+#     produce the green-bar SLO numbers; it is what "did the
+#     SLO hold under realistic sustained traffic" looks like
+#     in a single executable check, and it is the appropriate
+#     gate for nightly trend tracking.
+#
+# Strategy:
+#   1. `docker compose up -d --wait` brings the full stack up
+#      with healthcheck-gated start.
+#   2. `setup-probe.js` runs first — fails fast if the pipeline
+#      is wedged before VUs spin up (the existing
+#      end-to-end smoke probe).
+#   3. `load-test-1m.js` runs the steady-state suite (see note
+#      above). `--summary-export` writes the small summary JSON
+#      that trend tracking actually needs; the per-data-point
+#      `--out json=` output was multi-GB on a 15-min run (the
+#      WP10 outliers.json file the project captured for the
+#      tail-latency investigation), too large to retain nightly.
+#   4. Compose teardown is unconditional so a workflow failure
+#      does not leak containers on a self-hosted runner.
+
+name: k6 nightly
+
+on:
+  schedule:
+    # 04:00 UTC every day = 11:00 WIB. The project comment-bar
+    # in docker-compose.yml says "8 cores + 8 GB" minimum, which
+    # is at the upper edge of GitHub-hosted ubuntu-latest's
+    # 7 GB / 2 vCPU budget — if the stack OOMs in CI, the fix
+    # is `runs-on: ubuntu-latest-large` or a self-hosted
+    # runner. Documented here so a future workflow editor sees
+    # the trade-off.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: k6-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  load:
+    name: k6 sustained load
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # Bring up the full peakload-capstone compose stack. The
+      # repo's existing healthchecks (OPS-11) gate readiness;
+      # `--wait` blocks until every service reports healthy or
+      # the 5-minute compose default timeout elapses.
+      - name: docker compose up
+        run: docker compose up -d --wait
+
+      - name: Wait for /health to be ready
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080/health > /dev/null; then
+              echo "✓ /health ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "✗ /health not ready after 60s"
+          docker compose ps
+          docker compose logs --tail=50 app-1 || true
+          exit 1
+
+      - uses: grafana/setup-k6-action@v1
+
+      # End-to-end pipeline probe — POSTs a transaction and
+      # polls for terminal state. If this fails, the scenario
+      # phase would only waste minutes and produce noise.
+      - name: k6 setup probe
+        run: k6 run --quiet k6/setup-probe.js
+
+      # Summary export only — small JSON suitable for nightly
+      # retention. Per-data-point JSON (`--out json=`) would be
+      # multi-GB per run; the summary is ~5 KB and is what
+      # historical trend panels actually need.
+      #
+      # load-test-1m.js: 15-minute constant-arrival-rate steady-
+      # state run. See the workflow header for why this is the
+      # right choice for CI vs. load-test.js's spike/stress
+      # suite (which is meant for a production-class host).
+      - name: k6 load test
+        run: k6 run --quiet --summary-export=k6-summary.json k6/load-test-1m.js
+
+      - name: Upload k6 summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-${{ github.sha }}-${{ github.run_id }}
+          path: k6-summary.json
+          retention-days: 30
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: |
+          mkdir -p logs
+          docker compose ps > logs/ps.txt
+          docker compose logs --tail=200 > logs/all.log || true
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 7
+
+      - name: docker compose down
+        if: always()
+        run: docker compose down -v

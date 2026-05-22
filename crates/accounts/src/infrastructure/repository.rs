@@ -11,10 +11,10 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use sqlx::FromRow;
 
-use shared_kernel::db::failover::retry_transient;
+use shared_kernel::db::failover::retry_transient_with_breaker;
 use shared_kernel::db::shard::ShardRouter;
 
-use super::super::domain::{Account, AccountRepository};
+use super::super::domain::{Account, AccountRepository, RepoError};
 use super::super::ports::{AccountId, AccountStatus};
 
 /// Minimal row projection — we only read what the port DTO
@@ -42,7 +42,7 @@ impl SqlxAccountRepository {
 
 #[async_trait]
 impl AccountRepository for SqlxAccountRepository {
-    async fn find_active_by_id(&self, id: &AccountId) -> Result<Option<Account>, String> {
+    async fn find_active_by_id(&self, id: &AccountId) -> Result<Option<Account>, RepoError> {
         let shard = self.shards.shard_for_account(id.as_str());
         let account_number = id.as_str().to_owned();
         let router = &self.shards;
@@ -50,8 +50,12 @@ impl AccountRepository for SqlxAccountRepository {
         // Reads are idempotent — retry transient connection
         // errors over the read-replica pool. Matches the
         // semantics of the legacy handler in
-        // src/api/handlers::get_balance.
-        let row: Option<UsersRow> = retry_transient(
+        // src/api/handlers::get_balance. R-7: routes through the
+        // ShardRouter's DB breaker so a known-down DB fails fast
+        // (`AppError::DependencyDown { name: "db" }` -> 503 +
+        // Retry-After) instead of consuming the retry budget.
+        let row: Option<UsersRow> = retry_transient_with_breaker(
+            router.db_breaker(),
             || {
                 let account_number = account_number.clone();
                 async move {
@@ -73,7 +77,7 @@ impl AccountRepository for SqlxAccountRepository {
             "accounts.find_active_by_id",
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| RepoError::Other(e.to_string()))?;
 
         Ok(row.map(|r| {
             Account {

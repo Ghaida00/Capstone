@@ -164,6 +164,7 @@ pub(crate) async fn create(
         reference_id: req.reference_id,
         description: req.description,
         request_id,
+        traceparent: shared_kernel::queue::trace_propagation::current_traceparent(),
     };
     let accepted = deps.service.create(input).await?;
     metrics::counter!("transactions_created_total").increment(1);

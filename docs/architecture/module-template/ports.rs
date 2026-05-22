@@ -9,8 +9,8 @@
 //! Convert at the `infrastructure/` boundary if the internal repo
 //! returns richer types.
 //!
-//! See docs/architecture/module-anatomy.md §2 (ports.rs section)
-//! for the full shape rules.
+//! The port-adapter shape and full rule set are documented in
+//! `docs/adr/0003-port-adapter-shape.md`.
 
 // use std::sync::Arc;
 // use async_trait::async_trait;

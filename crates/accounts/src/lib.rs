@@ -6,13 +6,15 @@
 //! `users` → `accounts` was a resource rename, not just a version
 //! bump.
 //!
-//! See `docs/architecture/phase1-accounts-walkthrough.md` for a
-//! newbie/intern-friendly explanation of every file in this tree
-//! and why it exists.
+//! See the crate [`README.md`](../../README.md) for the per-module
+//! checklist (tables owned / ports exposed / ports consumed / events
+//! / operational notes).
 //!
 //! Dependency position: leaf of the module graph — no other
-//! module is imported from here. See
-//! `docs/architecture/dependency-rules.md`.
+//! module is imported from here. The rule is enforced at the
+//! workspace level: this crate's `Cargo.toml` declares no
+//! intra-workspace dependencies, so a regression that imports
+//! another module would not compile.
 
 pub mod ports;
 

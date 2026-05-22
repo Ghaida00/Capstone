@@ -7,8 +7,10 @@
 //! port DTOs and whatever the database row / cache entry shape
 //! happens to be.
 //!
-//! See `docs/architecture/module-anatomy.md` §2 (ports.rs
-//! section) for the rules this file obeys.
+//! The port-adapter shape this file obeys is documented in
+//! [ADR-0003](../../../docs/adr/0003-port-adapter-shape.md):
+//! `ports.rs` is the only file in the crate that other modules
+//! may import from.
 
 use std::sync::Arc;
 

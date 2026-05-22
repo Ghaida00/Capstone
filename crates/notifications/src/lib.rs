@@ -9,10 +9,9 @@
 //! `transactions.committed` events, and exposes the resulting
 //! ring-buffered log via `GET /api/v2/notifications/recent`.
 //!
-//! See `src/modules/notifications/README.md` for the planned
-//! shape (subscriptions, persistent log, dispatch channels) and
-//! `docs/architecture/phase3-notifications-walkthrough.md` for
-//! a file-by-file tour.
+//! See the crate [`README.md`](../../README.md) for the per-module
+//! checklist plus the planned shape (subscriptions, persistent log,
+//! dispatch channels) the in-memory ring-buffer is a placeholder for.
 
 pub mod ports;
 
@@ -22,4 +21,4 @@ pub(crate) mod domain;
 pub(crate) mod infrastructure;
 
 pub use api::router;
-pub use infrastructure::init;
+pub use infrastructure::{init, NotificationsDeps};

@@ -31,6 +31,20 @@ use super::ports::{AccountError, AccountId, AccountService, Balance};
 /// staleness.
 pub(crate) const BALANCE_CACHE_TTL_SECS: u64 = 10;
 
+/// Reject the one shape of `AccountId` that has no chance of
+/// hitting an active row — empty string. Kept as a pure helper
+/// (rather than inlined) so it carries a unit test (T-3) and so
+/// any future tightening (length cap, charset) lands here and not
+/// scattered across handlers.
+fn validate_account_id(id: &AccountId) -> Result<(), AccountError> {
+    if id.as_str().is_empty() {
+        return Err(AccountError::Validation(
+            "account id must not be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Implementation of [`AccountService`] backed by repo + Redis cache.
 ///
 /// `get_balance` reads through the `{v}:acc:{id}` Redis key on the
@@ -53,11 +67,7 @@ impl GetBalanceService {
 #[async_trait]
 impl AccountService for GetBalanceService {
     async fn get_balance(&self, id: &AccountId) -> Result<Balance, AccountError> {
-        if id.as_str().is_empty() {
-            return Err(AccountError::Validation(
-                "account id must not be empty".into(),
-            ));
-        }
+        validate_account_id(id)?;
 
         let cache_key = format!(
             "{}:acc:{}",
@@ -78,8 +88,38 @@ impl AccountService for GetBalanceService {
                 Ok(bal)
             }
             Ok(None) => Err(AccountError::NotFound(id.as_str().to_owned())),
-            Err(msg) => Err(AccountError::Infra(msg)),
+            // A-1: RepoError → AccountError::Infra via Display
+            Err(e) => Err(AccountError::Infra(e.to_string())),
         }
     }
 }
 
+// ─── Unit tests for pure domain helpers (T-3) ───────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_account_id_rejects_empty() {
+        let id = AccountId(String::new());
+        match validate_account_id(&id) {
+            Err(AccountError::Validation(msg)) => assert!(msg.contains("empty")),
+            other => panic!("expected Validation(empty), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_account_id_accepts_canonical() {
+        let id = AccountId("ACC_0000001".to_owned());
+        assert!(validate_account_id(&id).is_ok());
+    }
+
+    #[test]
+    fn validate_account_id_accepts_single_char() {
+        // No length-lower-bound rule today; the only invariant is
+        // "non-empty". Test pins the contract so future length
+        // caps cannot regress it silently.
+        let id = AccountId("a".to_owned());
+        assert!(validate_account_id(&id).is_ok());
+    }
+}

@@ -44,6 +44,7 @@ fnv = "1.0.7"
 sha2 = "0.10"
 url = "2.5"
 dotenvy = "0.15.7"
+futures = "0.3"
 
 # ── Auth ──
 jsonwebtoken = "9.3.1"
@@ -56,7 +57,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
 # ── OpenTelemetry ──
 opentelemetry = "0.31.0"
 opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
-opentelemetry-stdout = { version = "0.31.0", features = ["trace"] }
+opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.32.1"
 
 # ── Prometheus ──
@@ -80,5 +81,45 @@ testcontainers-modules = { version = "0.15.0", features = ["postgres", "redis"] 
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
-strip = true
+# A-5: panic = "unwind" (the Rust default, made explicit). Task
+# panics surface as `JoinError::is_panic()` instead of aborting
+# the process — the consumer's existing JoinError requeue branch
+# at consumer.rs (process_shard_batch) is now LIVE code rather
+# than dead-under-abort. A panicking spawned task kills only
+# that task; the orchestrator keeps serving.
+panic = "unwind"
+# A-5: line-tables-only carries function names + line numbers
+# in backtraces at ~5% binary-size cost. A coredump or
+# JoinError::is_panic() reaches operators with named frames
+# instead of bare addresses. For image-size-sensitive builds
+# use `--profile release-stripped` below.
+debug = "line-tables-only"
+strip = "none"
+
+# A-5: image-size-optimised variant — same codegen as release,
+# but strips symbols. Use for the runtime container layer when
+# binary size is the constraint; use `release` (above) for any
+# build where backtrace quality matters (single-tenant on-call
+# testing, local development).
+[profile.release-stripped]
+inherits = "release"
+debug = false
+strip = "symbols"
+
+# A-4: workspace-wide lint policy. Each crate opts in via
+# `[lints]\nworkspace = true`. Conservative high-signal set —
+# pedantic-grade lints (`clippy::pedantic = "warn"`) intentionally
+# NOT enabled here; they would produce ~100s of warnings on
+# existing code and need a separate clean-up sweep. Ratchet up
+# incrementally as the codebase is cleaned.
+[workspace.lints.rust]
+# 0 unsafe blocks in workspace today (grep-verified) — lock it.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Real-bug lints, not style.
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+let_underscore_future = "warn"
+mutex_atomic = "warn"
+result_large_err = "warn"

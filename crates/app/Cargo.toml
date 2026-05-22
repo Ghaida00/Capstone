@@ -3,6 +3,9 @@ name = "app"
 version = "0.1.0"
 edition = "2021"
 description = "Peakload Capstone — composition root binary. Wires every module crate."
+# Internal workspace binary — never published. Marks this for
+# cargo-deny's `[licenses.private] ignore = true` rule (WP4).
+publish = false
 
 [[bin]]
 name = "peakload-capstone"
@@ -48,8 +51,10 @@ once_cell = { workspace = true }
 # Logging / tracing
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-# OTel deps removed — sync stdout span exporter blocked the hot path.
-# Re-add + wire a batch OTLP exporter if/when traces are needed.
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 # Metrics
 metrics = { workspace = true }
@@ -60,7 +65,13 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+# proptest used to live here but no proptest! block in `app` exercised
+# it (T-2). The shared_kernel router properties and the transactions
+# domain properties cover the workspace's property-test surface; this
+# crate adds the dep back the day a property arrives.
 axum-test = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+
+[lints]
+workspace = true

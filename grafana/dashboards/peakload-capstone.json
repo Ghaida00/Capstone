@@ -9,214 +9,19 @@
   "links": [],
   "panels": [
     {
-      "title": "📊 System Overview",
+      "title": "📊 At-a-Glance",
       "type": "row",
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 0
-      },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
       "collapsed": false
     },
     {
-      "title": "Request Rate",
-      "description": "HTTP requests per second across all app replicas (excludes /health and /metrics scrape traffic)",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 0,
-        "y": 1
-      },
-      "targets": [
-        {
-          "expr": "sum(rate(http_requests_total{url_path!~\"/health|/metrics\"}[$__rate_interval]))",
-          "legendFormat": "Total",
-          "refId": "A"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{http_response_status_code=\"200\",url_path!~\"/health|/metrics\"}[$__rate_interval]))",
-          "legendFormat": "200 OK",
-          "refId": "B"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{http_response_status_code=\"202\",url_path!~\"/health|/metrics\"}[$__rate_interval]))",
-          "legendFormat": "202 Accepted",
-          "refId": "C"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{http_response_status_code=~\"4..\",url_path!~\"/health|/metrics\"}[$__rate_interval]))",
-          "legendFormat": "4xx Errors",
-          "refId": "D"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{http_response_status_code=~\"5..\",url_path!~\"/health|/metrics\"}[$__rate_interval]))",
-          "legendFormat": "5xx Errors",
-          "refId": "E"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "reqps",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "spanNulls": true
-          }
-        }
-      }
-    },
-    {
-      "title": "Response Time (p50 / p90 / p99)",
-      "description": "Worst-replica HTTP latency percentiles. Uses max() not avg() — averaging summary quantiles across replicas is mathematically invalid and hides tails.",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 1
-      },
-      "targets": [
-        {
-          "expr": "max(http_request_duration_seconds{quantile=\"0.5\",url_path!~\"/health|/metrics\"})",
-          "legendFormat": "p50 (worst replica)",
-          "refId": "A"
-        },
-        {
-          "expr": "max(http_request_duration_seconds{quantile=\"0.9\",url_path!~\"/health|/metrics\"})",
-          "legendFormat": "p90 (worst replica)",
-          "refId": "B"
-        },
-        {
-          "expr": "max(http_request_duration_seconds{quantile=\"0.99\",url_path!~\"/health|/metrics\"})",
-          "legendFormat": "p99 (worst replica)",
-          "refId": "C"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 10,
-            "spanNulls": true
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 0.1
-              },
-              {
-                "color": "red",
-                "value": 0.5
-              }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "title": "Error Rate",
-      "description": "4xx (client fault) and 5xx (server fault) split. Thresholds apply to 5xx only — 4xx during load tests is normal (validation, idempotency conflict).",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 1
-      },
-      "targets": [
-        {
-          "expr": "sum(rate(http_requests_total{http_response_status_code=~\"5..\",url_path!~\"/health|/metrics\"}[$__rate_interval])) / clamp_min(sum(rate(http_requests_total{url_path!~\"/health|/metrics\"}[$__rate_interval])), 0.001) * 100",
-          "legendFormat": "5xx %",
-          "refId": "A"
-        },
-        {
-          "expr": "sum(rate(http_requests_total{http_response_status_code=~\"4..\",url_path!~\"/health|/metrics\"}[$__rate_interval])) / clamp_min(sum(rate(http_requests_total{url_path!~\"/health|/metrics\"}[$__rate_interval])), 0.001) * 100",
-          "legendFormat": "4xx %",
-          "refId": "B"
-        },
-        {
-          "expr": "sum(rate(rate_limited_total[$__rate_interval])) / clamp_min(sum(rate(http_requests_total{url_path!~\"/health|/metrics\"}[$__rate_interval])), 0.001) * 100",
-          "legendFormat": "Rate Limited %",
-          "refId": "C"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 15,
-            "spanNulls": true
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 1
-              },
-              {
-                "color": "red",
-                "value": 5
-              }
-            ]
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {"id": "byName", "options": "5xx %"},
-            "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]
-          },
-          {
-            "matcher": {"id": "byName", "options": "4xx %"},
-            "properties": [{"id": "color", "value": {"fixedColor": "yellow", "mode": "fixed"}}]
-          },
-          {
-            "matcher": {"id": "byName", "options": "Rate Limited %"},
-            "properties": [{"id": "color", "value": {"fixedColor": "orange", "mode": "fixed"}}]
-          }
-        ]
-      }
-    },
-    {
-      "title": "🏦 Transaction Metrics",
-      "type": "row",
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 9
-      },
-      "collapsed": false
-    },
-    {
-      "title": "Transactions Created",
+      "title": "Active Replicas",
+      "description": "Number of app instances reporting metrics. Compose configures 2 replicas (see docker-compose.yml). Below 2 = degraded.",
       "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 0,
-        "y": 10
-      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
       "targets": [
         {
-          "expr": "sum(transactions_created_total)",
+          "expr": "count(up{job=\"peakload-capstone\"} == 1)",
           "refId": "A"
         }
       ],
@@ -225,68 +30,49 @@
           "unit": "short",
           "thresholds": {
             "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "green", "value": 2 }
             ]
           }
         }
       }
     },
     {
-      "title": "Transactions Processed",
+      "title": "Circuit Breaker",
       "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 4,
-        "y": 10
-      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
       "targets": [
-        {
-          "expr": "sum(transactions_processed_total)",
-          "refId": "A"
-        }
+        { "expr": "max(circuit_breaker_state)", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
-          "thresholds": {
-            "steps": [
-              {
-                "color": "blue",
-                "value": null
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "✅ CLOSED", "color": "green" },
+                "1": { "text": "🔴 OPEN", "color": "red" },
+                "2": { "text": "🟡 HALF-OPEN", "color": "yellow" }
               }
-            ]
-          }
+            }
+          ]
         }
       }
     },
     {
       "title": "Create Rate /s",
       "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 8,
-        "y": 10
-      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
       "targets": [
-        {
-          "expr": "sum(rate(transactions_created_total[$__rate_interval]))",
-          "refId": "A"
-        }
+        { "expr": "sum(rate(transactions_created_total[$__rate_interval]))", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
           "thresholds": {
             "steps": [
-              {
-                "color": "purple",
-                "value": null
-              }
+              { "color": "purple", "value": null }
             ]
           }
         }
@@ -295,45 +81,29 @@
     {
       "title": "Process Rate /s",
       "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 12,
-        "y": 10
-      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
       "targets": [
-        {
-          "expr": "sum(rate(transactions_processed_total[$__rate_interval]))",
-          "refId": "A"
-        }
+        { "expr": "sum(rate(transactions_processed_total[$__rate_interval]))", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
           "thresholds": {
             "steps": [
-              {
-                "color": "semi-dark-blue",
-                "value": null
-              }
+              { "color": "semi-dark-blue", "value": null }
             ]
           }
         }
       }
     },
     {
-      "title": "Created − Processed (lifetime delta)",
-      "description": "Lifetime created_total − processed_total. NOT real RabbitMQ queue depth — ignores DLQ, asymmetric restarts, and counter resets. Use as a coarse drift indicator only.",
+      "title": "Drift (replay-adjusted)",
+      "description": "Lifetime created − processed − idempotency_replays (both Redis and PG paths). Should be ~0 in steady state. A non-zero reading is real loss to investigate: DLQ, requeued, or cross-shard terminal-failed. The raw created − processed includes idempotency replays — those are accepted POSTs that intentionally short-circuit to the cached response and never reach the consumer, so they accumulate in the delta despite being correct behaviour.",
       "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 16,
-        "y": 10
-      },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
       "targets": [
         {
-          "expr": "sum(transactions_created_total) - sum(transactions_processed_total)",
+          "expr": "sum(transactions_created_total) - sum(transactions_processed_total) - sum(idempotency_redis_replay_total) - sum(idempotency_hits_total)",
           "refId": "A"
         }
       ],
@@ -342,18 +112,9 @@
           "unit": "short",
           "thresholds": {
             "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 100
-              },
-              {
-                "color": "red",
-                "value": 1000
-              }
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 100 },
+              { "color": "red", "value": 1000 }
             ]
           }
         }
@@ -361,16 +122,12 @@
     },
     {
       "title": "Idempotency Hits",
+      "description": "Replay attempts detected and short-circuited (cached response returned without reaching the consumer). Sums both backend paths: idempotency_hits_total (PG path, IDEMPOTENCY_BACKEND=pg) and idempotency_redis_replay_total (Redis/hybrid path). Under the default hybrid backend the Redis counter is the active one.",
       "type": "stat",
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 20,
-        "y": 10
-      },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
       "targets": [
         {
-          "expr": "sum(idempotency_hits_total)",
+          "expr": "sum(idempotency_hits_total) + sum(idempotency_redis_replay_total)",
           "refId": "A"
         }
       ],
@@ -379,35 +136,25 @@
           "unit": "short",
           "thresholds": {
             "steps": [
-              {
-                "color": "orange",
-                "value": null
-              }
+              { "color": "orange", "value": null }
             ]
           }
         }
       }
     },
     {
+      "title": "🏦 Throughput",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false
+    },
+    {
       "title": "Transaction Throughput Over Time",
       "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 14
-      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
       "targets": [
-        {
-          "expr": "sum(rate(transactions_created_total[$__rate_interval]))",
-          "legendFormat": "Created /s",
-          "refId": "A"
-        },
-        {
-          "expr": "sum(rate(transactions_processed_total[$__rate_interval]))",
-          "legendFormat": "Processed /s",
-          "refId": "B"
-        }
+        { "expr": "sum(rate(transactions_created_total[$__rate_interval]))", "legendFormat": "Created /s", "refId": "A" },
+        { "expr": "sum(rate(transactions_processed_total[$__rate_interval]))", "legendFormat": "Processed /s", "refId": "B" }
       ],
       "fieldConfig": {
         "defaults": {
@@ -423,25 +170,12 @@
     },
     {
       "title": "Batch Size Distribution",
-      "description": "Consumer batch sizes — closer to 50 = better batching efficiency",
+      "description": "Per-shard consumer batch sizes (O-10). Closer to the flush cap = better batching efficiency. Split by shard so one lagging shard is not hidden by the other.",
       "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 14
-      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
       "targets": [
-        {
-          "expr": "avg(transactions_batch_size{quantile=\"0.5\"})",
-          "legendFormat": "p50 batch",
-          "refId": "A"
-        },
-        {
-          "expr": "avg(transactions_batch_size{quantile=\"0.99\"})",
-          "legendFormat": "p99 batch",
-          "refId": "B"
-        }
+        { "expr": "avg by (shard) (transactions_batch_size{quantile=\"0.5\"})", "legendFormat": "p50 shard {{shard}}", "refId": "A" },
+        { "expr": "avg by (shard) (transactions_batch_size{quantile=\"0.99\"})", "legendFormat": "p99 shard {{shard}}", "refId": "B" }
       ],
       "fieldConfig": {
         "defaults": {
@@ -456,383 +190,149 @@
       }
     },
     {
-      "title": "🛡️ Resilience & Protection",
+      "title": "Transactions Created (lifetime)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        { "expr": "sum(transactions_created_total)", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Transactions Processed (lifetime)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 14 },
+      "targets": [
+        { "expr": "sum(transactions_processed_total)", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "steps": [
+              { "color": "blue", "value": null }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "🌐 HTTP Performance",
       "type": "row",
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 22
-      },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
       "collapsed": false
     },
     {
-      "title": "Circuit Breaker",
-      "type": "stat",
-      "gridPos": {
-        "h": 5,
-        "w": 4,
-        "x": 0,
-        "y": 23
-      },
-      "targets": [
-        {
-          "expr": "max(circuit_breaker_state)",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "0": {
-                  "text": "✅ CLOSED",
-                  "color": "green"
-                },
-                "1": {
-                  "text": "🔴 OPEN",
-                  "color": "red"
-                },
-                "2": {
-                  "text": "🟡 HALF-OPEN",
-                  "color": "yellow"
-                }
-              }
-            }
-          ]
-        }
-      }
-    },
-    {
-      "title": "In-Flight Requests",
-      "description": "Sum across replicas. Theoretical max = MAX_CONCURRENT_REQUESTS (2000) × replicas (2) = 4000. Beyond green band means queue is filling.",
-      "type": "gauge",
-      "gridPos": {
-        "h": 5,
-        "w": 4,
-        "x": 4,
-        "y": 23
-      },
-      "targets": [
-        {
-          "expr": "sum(backpressure_in_flight)",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "max": 4000,
-          "thresholds": {
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 2000
-              },
-              {
-                "color": "red",
-                "value": 3500
-              }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "title": "Rate Limited /s",
-      "type": "stat",
-      "gridPos": {
-        "h": 5,
-        "w": 4,
-        "x": 8,
-        "y": 23
-      },
-      "targets": [
-        {
-          "expr": "sum(rate(rate_limited_total[$__rate_interval]))",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "reqps",
-          "thresholds": {
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 10
-              },
-              {
-                "color": "red",
-                "value": 100
-              }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "title": "Backpressure Shed /s",
-      "type": "stat",
-      "gridPos": {
-        "h": 5,
-        "w": 4,
-        "x": 12,
-        "y": 23
-      },
-      "targets": [
-        {
-          "expr": "sum(rate(backpressure_shed_total[$__rate_interval]))",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "reqps",
-          "thresholds": {
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 5
-              },
-              {
-                "color": "red",
-                "value": 50
-              }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "title": "RabbitMQ Reconnections",
-      "type": "stat",
-      "gridPos": {
-        "h": 5,
-        "w": 4,
-        "x": 16,
-        "y": 23
-      },
-      "targets": [
-        {
-          "expr": "sum(rabbitmq_reconnections_total)",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "thresholds": {
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 1
-              },
-              {
-                "color": "red",
-                "value": 5
-              }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "title": "Active Replicas",
-      "description": "Number of app instances reporting metrics. Compose configures 2 replicas (see docker-compose.yml). Below 2 = degraded.",
-      "type": "stat",
-      "gridPos": {
-        "h": 5,
-        "w": 4,
-        "x": 20,
-        "y": 23
-      },
-      "targets": [
-        {
-          "expr": "count(up{job=\"peakload-capstone\"} == 1)",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "thresholds": {
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 1
-              },
-              {
-                "color": "green",
-                "value": 2
-              }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "title": "Protection Over Time",
+      "title": "Request Rate",
+      "description": "HTTP requests per second across all app replicas (excludes /health and /metrics scrape traffic)",
       "type": "timeseries",
-      "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 0,
-        "y": 28
-      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 19 },
       "targets": [
-        {
-          "expr": "sum(rate(rate_limited_total[$__rate_interval]))",
-          "legendFormat": "Rate Limited",
-          "refId": "A"
-        },
-        {
-          "expr": "sum(rate(backpressure_shed_total[$__rate_interval]))",
-          "legendFormat": "Load Shed",
-          "refId": "B"
-        }
+        { "expr": "sum(rate(http_requests_total{url_path!~\"/health|/metrics\"}[$__rate_interval]))", "legendFormat": "Total", "refId": "A" },
+        { "expr": "sum(rate(http_requests_total{http_response_status_code=\"200\",url_path!~\"/health|/metrics\"}[$__rate_interval]))", "legendFormat": "200 OK", "refId": "B" },
+        { "expr": "sum(rate(http_requests_total{http_response_status_code=\"202\",url_path!~\"/health|/metrics\"}[$__rate_interval]))", "legendFormat": "202 Accepted", "refId": "C" },
+        { "expr": "sum(rate(http_requests_total{http_response_status_code=~\"4..\",url_path!~\"/health|/metrics\"}[$__rate_interval]))", "legendFormat": "4xx Errors", "refId": "D" },
+        { "expr": "sum(rate(http_requests_total{http_response_status_code=~\"5..\",url_path!~\"/health|/metrics\"}[$__rate_interval]))", "legendFormat": "5xx Errors", "refId": "E" }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
-          "custom": {
-            "drawStyle": "bars",
-            "lineWidth": 1,
-            "fillOpacity": 50,
-            "spanNulls": true
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Rate Limited"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "orange",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Load Shed"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "red",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
-      }
-    },
-    {
-      "title": "Cache Hit Rate",
-      "description": "Redis cache efficiency: hits / (hits + misses)",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 7,
-        "w": 12,
-        "x": 12,
-        "y": 28
-      },
-      "targets": [
-        {
-          "expr": "sum(rate(cache_hits_total[$__rate_interval])) / (sum(rate(cache_hits_total[$__rate_interval])) + sum(rate(cache_misses_total[$__rate_interval])))",
-          "legendFormat": "Hit Rate",
-          "refId": "A"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
           "custom": {
             "drawStyle": "line",
             "lineWidth": 2,
-            "fillOpacity": 20,
+            "fillOpacity": 10,
+            "spanNulls": true
+          }
+        }
+      }
+    },
+    {
+      "title": "Response Time (p50 / p90 / p99)",
+      "description": "Fleet-aggregate HTTP request latency percentiles via histogram_quantile() over the cross-replica bucket sum. This is the correct way to combine histogram quantiles across replicas (summing buckets is associative; averaging quantiles is not).",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 19 },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.9, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))", "legendFormat": "p90", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))", "legendFormat": "p99", "refId": "C" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
             "spanNulls": true
           },
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 0.5
-              },
-              {
-                "color": "green",
-                "value": 0.8
-              }
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.1 },
+              { "color": "red", "value": 0.5 }
             ]
           }
         }
       }
     },
     {
+      "title": "Error Rate",
+      "description": "4xx (client fault) and 5xx (server fault) split. Thresholds apply to 5xx only — 4xx during load tests is normal (validation, idempotency conflict).",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 19 },
+      "targets": [
+        { "expr": "sum(rate(http_requests_total{http_response_status_code=~\"5..\",url_path!~\"/health|/metrics\"}[$__rate_interval])) / clamp_min(sum(rate(http_requests_total{url_path!~\"/health|/metrics\"}[$__rate_interval])), 0.001) * 100", "legendFormat": "5xx %", "refId": "A" },
+        { "expr": "sum(rate(http_requests_total{http_response_status_code=~\"4..\",url_path!~\"/health|/metrics\"}[$__rate_interval])) / clamp_min(sum(rate(http_requests_total{url_path!~\"/health|/metrics\"}[$__rate_interval])), 0.001) * 100", "legendFormat": "4xx %", "refId": "B" },
+        { "expr": "sum(rate(rate_limited_total[$__rate_interval])) / clamp_min(sum(rate(http_requests_total{url_path!~\"/health|/metrics\"}[$__rate_interval])), 0.001) * 100", "legendFormat": "Rate Limited %", "refId": "C" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "spanNulls": true
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "5xx %" }, "properties": [ { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } } ] },
+          { "matcher": { "id": "byName", "options": "4xx %" }, "properties": [ { "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } } ] },
+          { "matcher": { "id": "byName", "options": "Rate Limited %" }, "properties": [ { "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } } ] }
+        ]
+      }
+    },
+    {
       "title": "📈 Per-Endpoint Breakdown",
       "type": "row",
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 35
-      },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
       "collapsed": false
     },
     {
       "title": "Latency by Endpoint",
       "description": "p90 latency split by HTTP method and path",
       "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 36
-      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
       "targets": [
-        {
-          "expr": "avg by (http_request_method, url_path) (http_request_duration_seconds{quantile=\"0.9\",url_path!~\"/health|/metrics\"})",
-          "legendFormat": "{{http_request_method}} {{url_path}}",
-          "refId": "A"
-        }
+        { "expr": "histogram_quantile(0.9, sum by (le, http_request_method, url_path) (rate(http_request_duration_seconds_bucket[5m])))", "legendFormat": "{{http_request_method}} {{url_path}}", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
@@ -850,18 +350,9 @@
       "title": "Request Count by Endpoint",
       "description": "Requests per second by endpoint",
       "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 36
-      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
       "targets": [
-        {
-          "expr": "sum by (http_request_method, url_path) (rate(http_requests_total{url_path!~\"/health|/metrics\"}[$__rate_interval]))",
-          "legendFormat": "{{http_request_method}} {{url_path}}",
-          "refId": "A"
-        }
+        { "expr": "sum by (http_request_method, url_path) (rate(http_requests_total{url_path!~\"/health|/metrics\"}[$__rate_interval]))", "legendFormat": "{{http_request_method}} {{url_path}}", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
@@ -870,36 +361,408 @@
             "drawStyle": "bars",
             "lineWidth": 1,
             "fillOpacity": 50,
-            "stacking": {
-              "mode": "normal"
-            },
+            "stacking": { "mode": "normal" },
             "spanNulls": true
           }
         }
       }
     },
     {
-      "title": "🔧 Failover & Resilience Events",
+      "title": "🛡️ Resilience & Protection",
       "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 44},
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 },
       "collapsed": false
     },
     {
-      "title": "DB Replica Failovers",
-      "description": "Replica transitions healthy → unhealthy (cumulative)",
-      "type": "stat",
-      "gridPos": {"h": 5, "w": 4, "x": 0, "y": 45},
+      "title": "In-Flight Requests",
+      "description": "Sum across replicas. Theoretical max = MAX_CONCURRENT_REQUESTS (2000) × replicas (2) = 4000. Beyond green band means queue is filling.",
+      "type": "gauge",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 37 },
       "targets": [
-        {"expr": "sum(db_replica_failover_total)", "refId": "A"}
+        { "expr": "sum(backpressure_in_flight)", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "max": 4000,
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 2000 },
+              { "color": "red", "value": 3500 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Rate Limited /s",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 37 },
+      "targets": [
+        { "expr": "sum(rate(rate_limited_total[$__rate_interval]))", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 10 },
+              { "color": "red", "value": 100 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Backpressure Shed /s",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 37 },
+      "targets": [
+        { "expr": "sum(rate(backpressure_shed_total[$__rate_interval]))", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 5 },
+              { "color": "red", "value": 50 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "RabbitMQ Reconnections",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 37 },
+      "targets": [
+        { "expr": "sum(rabbitmq_reconnections_total)", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "thresholds": {
             "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 1},
-              {"color": "red", "value": 5}
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Protection Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 42 },
+      "targets": [
+        { "expr": "sum(rate(rate_limited_total[$__rate_interval]))", "legendFormat": "Rate Limited", "refId": "A" },
+        { "expr": "sum(rate(backpressure_shed_total[$__rate_interval]))", "legendFormat": "Load Shed", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 50,
+            "spanNulls": true
+          }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Rate Limited" }, "properties": [ { "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } } ] },
+          { "matcher": { "id": "byName", "options": "Load Shed" }, "properties": [ { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } } ] }
+        ]
+      }
+    },
+    {
+      "title": "Cache Hit Rate",
+      "description": "Redis cache efficiency: hits / (hits + misses)",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 42 },
+      "targets": [
+        { "expr": "sum(rate(cache_hits_total[$__rate_interval])) / (sum(rate(cache_hits_total[$__rate_interval])) + sum(rate(cache_misses_total[$__rate_interval])))", "legendFormat": "Hit Rate", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "spanNulls": true
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "green", "value": 0.8 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "💸 Money Safety",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 },
+      "collapsed": false
+    },
+    {
+      "title": "Cross-Shard Step Failures (cumulative)",
+      "description": "Cross-shard outbox step failures by `step` label: `credit` = receiver UPDATE failed AFTER sender's tx committed (money mid-air); `refund` = compensating refund failed (sender debited, no compensation). Both are money-safety events and should stay flat at 0.",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 8, "x": 0, "y": 50 },
+      "targets": [
+        { "expr": "sum(cross_shard_step_failures_total)", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Cross-Shard Step Failure Rate",
+      "description": "Cross-shard outbox step failures per second, split by `step` label. `credit` failures point to receiver-shard issues; `refund` failures point to a sender-shard refund path that cannot complete. Either is a money-mid-air event stream.",
+      "type": "timeseries",
+      "gridPos": { "h": 5, "w": 16, "x": 8, "y": 50 },
+      "targets": [
+        { "expr": "sum by (step) (rate(cross_shard_step_failures_total[$__rate_interval]))", "legendFormat": "{{step}} /s", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 80,
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "red"
+          }
+        }
+      }
+    },
+    {
+      "title": "Cross-Shard Terminal Failures & Refund-Stuck (R-2)",
+      "description": "cross_shard_outbox_terminal_failures_total{step} = credit retries exhausted, sender debited + recipient un-credited, audit row now 'failed' (R-8). cross_shard_refund_stuck_total = refund past MAX_ATTEMPTS, sender owed compensation. These are exactly what the R-2 page/ticket alerts fire on.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 55 },
+      "targets": [
+        { "expr": "sum by (step) (rate(cross_shard_outbox_terminal_failures_total[$__rate_interval]))", "legendFormat": "terminal-fail {{step}} /s", "refId": "A" },
+        { "expr": "sum(rate(cross_shard_refund_stuck_total[$__rate_interval]))", "legendFormat": "refund-stuck /s", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "red"
+          }
+        }
+      }
+    },
+    {
+      "title": "DLQ Messages /s",
+      "description": "Rate of messages routed to dead-letter queue",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 12, "x": 0, "y": 63 },
+      "targets": [
+        { "expr": "sum(rate(dlq_messages_total[$__rate_interval]))", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.1 },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Error budget remaining (30d)",
+      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 63 },
+      "options": {
+        "reduceOptions": {
+          "calcs": [ "lastNotNull" ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 20 },
+              { "color": "green", "value": 80 }
+            ]
+          },
+          "min": 0,
+          "max": 100
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "100 * (1 - (sum(increase(http_requests_total{http_response_status_code=~\"5..\"}[30d])) / clamp_min(sum(increase(http_requests_total[30d])), 1)) / 0.001)",
+          "refId": "A",
+          "legendFormat": "budget remaining %"
+        }
+      ]
+    },
+    {
+      "title": "🚨 Write Path Diagnostics",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
+      "collapsed": false
+    },
+    {
+      "title": "Outbox Ship Rate (per shard)",
+      "description": "Rows the publish-outbox worker shipped to the broker, per shard. A shard flatlining while the other ships = that shard's worker stalled or its primary is unreachable (O-10).",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 68 },
+      "targets": [
+        { "expr": "sum by (shard) (rate(publish_outbox_shipped_total[$__rate_interval]))", "legendFormat": "shard {{shard}} /s", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "spanNulls": true
+          }
+        }
+      }
+    },
+    {
+      "title": "Outbox Publish Failures (per shard)",
+      "description": "publish_outbox_publish_failures_total (broker-side publish failed; rows retried after lease expiry) and publish_outbox_iteration_errors_total (worker iteration error), per shard (O-10).",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 68 },
+      "targets": [
+        { "expr": "sum by (shard) (rate(publish_outbox_publish_failures_total[$__rate_interval]))", "legendFormat": "publish-fail shard {{shard}} /s", "refId": "A" },
+        { "expr": "sum by (shard) (rate(publish_outbox_iteration_errors_total[$__rate_interval]))", "legendFormat": "iter-err shard {{shard}} /s", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "spanNulls": true
+          }
+        }
+      }
+    },
+    {
+      "title": "Broker Rejections (NACK / unrouteable return)",
+      "description": "amqp_publish_nack_total = broker NACKed a confirmed publish; amqp_publish_return_total = mandatory publish was unrouteable (silent message drop on a misconfigured exchange). Either is a lost-message signal (O-10/O-14).",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 76 },
+      "targets": [
+        { "expr": "sum(rate(amqp_publish_nack_total[$__rate_interval]))", "legendFormat": "nack /s", "refId": "A" },
+        { "expr": "sum(rate(amqp_publish_return_total[$__rate_interval]))", "legendFormat": "return /s", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "orange"
+          }
+        }
+      }
+    },
+    {
+      "title": "Broker-Initiated Cancel / Channel Close",
+      "description": "amqp_consumer_cancel_total = broker cancelled our consumer (queue deleted, mirror failover); amqp_channel_close_total by side = broker closed a channel. The consumer goes deaf until the orchestrator restarts (O-14).",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 76 },
+      "targets": [
+        { "expr": "sum(rate(amqp_consumer_cancel_total[$__rate_interval]))", "legendFormat": "consumer-cancel /s", "refId": "A" },
+        { "expr": "sum by (side) (rate(amqp_channel_close_total[$__rate_interval]))", "legendFormat": "channel-close {{side}} /s", "refId": "B" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "orange"
+          }
+        }
+      }
+    },
+    {
+      "title": "🔧 Failover & Recovery Events",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 84 },
+      "collapsed": false
+    },
+    {
+      "title": "DB Replica Failovers",
+      "description": "Replica transitions healthy → unhealthy (cumulative)",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 85 },
+      "targets": [
+        { "expr": "sum(db_replica_failover_total)", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
             ]
           }
         }
@@ -909,15 +772,17 @@
       "title": "DB Replicas Recovered",
       "description": "Replica transitions unhealthy → healthy (cumulative)",
       "type": "stat",
-      "gridPos": {"h": 5, "w": 4, "x": 4, "y": 45},
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 85 },
       "targets": [
-        {"expr": "sum(db_replica_recovered_total)", "refId": "A"}
+        { "expr": "sum(db_replica_recovered_total)", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "thresholds": {
-            "steps": [{"color": "blue", "value": null}]
+            "steps": [
+              { "color": "blue", "value": null }
+            ]
           }
         }
       }
@@ -926,39 +791,18 @@
       "title": "Redis Master Failovers",
       "description": "Sentinel-detected master address changes (cumulative)",
       "type": "stat",
-      "gridPos": {"h": 5, "w": 4, "x": 8, "y": 45},
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 85 },
       "targets": [
-        {"expr": "sum(redis_master_failover_total)", "refId": "A"}
+        { "expr": "sum(redis_master_failover_total)", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "short",
           "thresholds": {
             "steps": [
-              {"color": "green", "value": null},
-              {"color": "yellow", "value": 1},
-              {"color": "red", "value": 3}
-            ]
-          }
-        }
-      }
-    },
-    {
-      "title": "DLQ Messages /s",
-      "description": "Rate of messages routed to dead-letter queue",
-      "type": "stat",
-      "gridPos": {"h": 5, "w": 4, "x": 12, "y": 45},
-      "targets": [
-        {"expr": "sum(rate(dlq_messages_total[$__rate_interval]))", "refId": "A"}
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "reqps",
-          "thresholds": {
-            "steps": [
-              {"color": "green", "value": null},
-              {"color": "orange", "value": 0.1},
-              {"color": "red", "value": 1}
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 3 }
             ]
           }
         }
@@ -968,17 +812,17 @@
       "title": "Notif Events Lagged /s",
       "description": "Notifications dispatcher events dropped due to broadcast lag",
       "type": "stat",
-      "gridPos": {"h": 5, "w": 4, "x": 16, "y": 45},
+      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 85 },
       "targets": [
-        {"expr": "sum(rate(notifications_events_lagged_total[$__rate_interval]))", "refId": "A"}
+        { "expr": "sum(rate(notifications_events_lagged_total[$__rate_interval]))", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
           "thresholds": {
             "steps": [
-              {"color": "green", "value": null},
-              {"color": "orange", "value": 1}
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
             ]
           }
         }
@@ -988,18 +832,18 @@
       "title": "Event Publish Errors /s",
       "description": "shared_kernel::events bus publish failures",
       "type": "stat",
-      "gridPos": {"h": 5, "w": 4, "x": 20, "y": 45},
+      "gridPos": { "h": 5, "w": 4, "x": 16, "y": 85 },
       "targets": [
-        {"expr": "sum(rate(events_publish_errors_total[$__rate_interval]))", "refId": "A"}
+        { "expr": "sum(rate(events_publish_errors_total[$__rate_interval]))", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
           "thresholds": {
             "steps": [
-              {"color": "green", "value": null},
-              {"color": "orange", "value": 0.1},
-              {"color": "red", "value": 1}
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.1 },
+              { "color": "red", "value": 1 }
             ]
           }
         }
@@ -1009,11 +853,11 @@
       "title": "DB Retry Activity",
       "description": "Transient DB errors retried — attempts vs successes vs exhausted",
       "type": "timeseries",
-      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 50},
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 90 },
       "targets": [
-        {"expr": "sum(rate(db_retry_attempt_total[$__rate_interval]))", "legendFormat": "Attempts", "refId": "A"},
-        {"expr": "sum(rate(db_retry_success_total[$__rate_interval]))", "legendFormat": "Recovered", "refId": "B"},
-        {"expr": "sum(rate(db_retry_exhausted_total[$__rate_interval]))", "legendFormat": "Exhausted", "refId": "C"}
+        { "expr": "sum(rate(db_retry_attempt_total[$__rate_interval]))", "legendFormat": "Attempts", "refId": "A" },
+        { "expr": "sum(rate(db_retry_success_total[$__rate_interval]))", "legendFormat": "Recovered", "refId": "B" },
+        { "expr": "sum(rate(db_retry_exhausted_total[$__rate_interval]))", "legendFormat": "Exhausted", "refId": "C" }
       ],
       "fieldConfig": {
         "defaults": {
@@ -1026,18 +870,9 @@
           }
         },
         "overrides": [
-          {
-            "matcher": {"id": "byName", "options": "Exhausted"},
-            "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]
-          },
-          {
-            "matcher": {"id": "byName", "options": "Recovered"},
-            "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]
-          },
-          {
-            "matcher": {"id": "byName", "options": "Attempts"},
-            "properties": [{"id": "color", "value": {"fixedColor": "yellow", "mode": "fixed"}}]
-          }
+          { "matcher": { "id": "byName", "options": "Exhausted" }, "properties": [ { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } } ] },
+          { "matcher": { "id": "byName", "options": "Recovered" }, "properties": [ { "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } } ] },
+          { "matcher": { "id": "byName", "options": "Attempts" }, "properties": [ { "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } } ] }
         ]
       }
     },
@@ -1045,10 +880,10 @@
       "title": "Notifications Appended /s",
       "description": "Notifications appended by the dispatcher",
       "type": "timeseries",
-      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 50},
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 90 },
       "targets": [
-        {"expr": "sum(rate(notifications_appended_total[$__rate_interval]))", "legendFormat": "Appended", "refId": "A"},
-        {"expr": "sum(rate(events_published_total[$__rate_interval]))", "legendFormat": "Events Published", "refId": "B"}
+        { "expr": "sum(rate(notifications_appended_total[$__rate_interval]))", "legendFormat": "Appended", "refId": "A" },
+        { "expr": "sum(rate(events_published_total[$__rate_interval]))", "legendFormat": "Events Published", "refId": "B" }
       ],
       "fieldConfig": {
         "defaults": {
@@ -1059,53 +894,6 @@
             "fillOpacity": 10,
             "spanNulls": true
           }
-        }
-      }
-    },
-    {
-      "title": "💸 Money Safety",
-      "type": "row",
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 57},
-      "collapsed": false
-    },
-    {
-      "title": "Cross-Shard Step Failures (cumulative)",
-      "description": "Cross-shard outbox step failures by `step` label: `credit` = receiver UPDATE failed AFTER sender's tx committed (money mid-air); `refund` = compensating refund failed (sender debited, no compensation). Both are money-safety events and should stay flat at 0.",
-      "type": "stat",
-      "gridPos": {"h": 5, "w": 8, "x": 0, "y": 58},
-      "targets": [
-        {"expr": "sum(cross_shard_step_failures_total)", "refId": "A"}
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "thresholds": {
-            "steps": [
-              {"color": "green", "value": null},
-              {"color": "red", "value": 1}
-            ]
-          }
-        }
-      }
-    },
-    {
-      "title": "Cross-Shard Step Failure Rate",
-      "description": "Cross-shard outbox step failures per second, split by `step` label. `credit` failures point to receiver-shard issues; `refund` failures point to a sender-shard refund path that cannot complete. Either is a money-mid-air event stream.",
-      "type": "timeseries",
-      "gridPos": {"h": 5, "w": 16, "x": 8, "y": 58},
-      "targets": [
-        {"expr": "sum by (step) (rate(cross_shard_step_failures_total[$__rate_interval]))", "legendFormat": "{{step}} /s", "refId": "A"}
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "reqps",
-          "custom": {
-            "drawStyle": "bars",
-            "lineWidth": 1,
-            "fillOpacity": 80,
-            "spanNulls": true
-          },
-          "color": {"mode": "fixed", "fixedColor": "red"}
         }
       }
     }
@@ -1128,5 +916,5 @@
   "timezone": "browser",
   "title": "Peakload Capstone — Performance Dashboard",
   "uid": "peakload-capstone-perf",
-  "version": 5
+  "version": 7
 }

@@ -101,3 +101,61 @@ pub async fn backpressure_middleware(
 
     response
 }
+
+// ─── Integration tests for backpressure_middleware (T-4) ─────
+//
+// Both tests use `wait_ms = 0` so the fast-shed path runs (no
+// timer, instant try_acquire) and the test does not depend on
+// real time.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{middleware::from_fn_with_state, routing::get, Router};
+    use axum_test::TestServer;
+
+    fn router_under_bp(controller: BackpressureController) -> Router {
+        Router::new()
+            .route(
+                "/x",
+                get(|| async {
+                    // Yield once so the handler is async-shaped but
+                    // returns quickly enough that a same-test second
+                    // request never races with permit-drop.
+                    tokio::task::yield_now().await;
+                    "ok"
+                }),
+            )
+            .layer(from_fn_with_state(controller, backpressure_middleware))
+    }
+
+    #[tokio::test]
+    async fn under_capacity_allows_request() {
+        let bp = BackpressureController::new(4, 0);
+        let server = TestServer::new(router_under_bp(bp));
+        let res = server.get("/x").await;
+        assert_eq!(res.status_code(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn saturated_returns_503_with_overload_body() {
+        // Pre-saturate the semaphore: acquire all permits and hold
+        // them; the middleware's try_acquire then fails fast.
+        let bp = BackpressureController::new(2, 0);
+        let p1 = bp.semaphore.clone().acquire_owned().await.unwrap();
+        let p2 = bp.semaphore.clone().acquire_owned().await.unwrap();
+        assert_eq!(bp.semaphore.available_permits(), 0);
+
+        let server = TestServer::new(router_under_bp(bp.clone()));
+        let res = server.get("/x").await;
+        assert_eq!(res.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = res.json();
+        assert_eq!(body["error"], "service_overloaded");
+
+        // Releasing the permits lets the next request succeed —
+        // proves the layer is not "stuck" after a shed.
+        drop(p1);
+        drop(p2);
+        let res = server.get("/x").await;
+        assert_eq!(res.status_code(), StatusCode::OK);
+    }
+}

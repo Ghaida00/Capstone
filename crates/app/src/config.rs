@@ -21,12 +21,25 @@ pub struct Config {
     pub database_shard0_read_urls: Vec<String>,
     pub database_shard1_write_url: String,
     pub database_shard1_read_urls: Vec<String>,
-    pub database_shard2_write_url: String,
+    /// Disabled shard 2 — kept as `Option` after S-6 dropped
+    /// credentialed defaults from `from_env`. `None` is the
+    /// normal state (the compose service for shard 2 is
+    /// commented out); re-enabling shard 2 requires the env var
+    /// AND a corresponding pgBouncer/Patroni stack.
+    pub database_shard2_write_url: Option<String>,
     pub db_write_pool_size: u32,
     pub db_read_pool_size: u32,
 
-    // Timeouts (seconds)
-    pub db_query_timeout_secs: u64,
+    // Timeouts (seconds). NOTE: `DB_QUERY_TIMEOUT_SECS` is NOT a
+    // field on this struct. The Postgres statement timeout is
+    // enforced server-side as an `ALTER DATABASE` default by
+    // `db/bootstrap/bootstrap-schema.sh` (D-1/R-3 in the audit) —
+    // required because the write path is pooled by pgBouncer in
+    // transaction mode, which rejects client-supplied connection
+    // options. The carried `db_query_timeout_secs` knob from the
+    // pre-WP1b design was removed in WP10 because it was dead
+    // config — never read by any pool constructor, but its
+    // presence implied a control surface that did not exist.
     pub redis_command_timeout_secs: u64,
     pub api_timeout_secs: u64,
 
@@ -61,9 +74,25 @@ pub struct Config {
     // CORS
     pub cors_allowed_origins: Vec<String>,
 
+    // R-9: startup degradation posture. One of normal |
+    // read_only | essential_only. Runtime-flippable via
+    // `PUT /api/v2/admin/degradation`; this is only the seed.
+    pub degradation_mode: String,
+
     // Authentication (disabled by default for load testing)
     pub enable_auth: bool,
     pub auth_secret: Option<String>,
+    /// S-2: required when ENABLE_AUTH=true — the validator rejects
+    /// tokens whose `iss` does not match. `None` allowed only when
+    /// auth is off (the validator is never constructed).
+    pub auth_expected_issuer: Option<String>,
+    /// S-2: same shape for the `aud` claim.
+    pub auth_expected_audience: Option<String>,
+    /// S-2: tunable JWT clock-skew leeway (the lib default is 60 s
+    /// — tuned down here to 30 s and made explicit so the choice
+    /// is reader-visible rather than a library implementation
+    /// detail).
+    pub auth_leeway_secs: u64,
 
     /// Toggle the cross-module `accounts.get_balance` check inside
     /// the transactions create hot path. Default OFF: every create
@@ -96,6 +125,21 @@ pub struct Config {
     ///     fall back to the PG path so a Redis outage degrades
     ///     latency rather than rejecting requests.
     pub idempotency_backend: IdempotencyBackend,
+
+    /// Number of redis-intake workers to run per shard. Each worker
+    /// is an independent serial drain of that shard's
+    /// `idempotency:pending` list; running several multiplies stage-2
+    /// publish throughput. Atomic `RPOPLPUSH` makes the workers pull
+    /// disjoint keys, so no coordination is needed. Env:
+    /// `REDIS_INTAKE_CONCURRENCY`, default 4.
+    pub redis_intake_concurrency: usize,
+
+    /// Number of reservation keys claimed and processed as one batch
+    /// by each redis-intake worker iteration. Larger batches amortise
+    /// fixed round-trip latency over more messages but coarsen the
+    /// failure granularity (a crash reprocesses the whole batch).
+    /// Env: `REDIS_INTAKE_BATCH_SIZE`, default 25.
+    pub redis_intake_batch_size: usize,
 }
 
 /// Parse `IDEMPOTENCY_BACKEND` from env. Defaults to `hybrid` and
@@ -112,6 +156,22 @@ fn idempotency_backend_from_env() -> IdempotencyBackend {
 }
 
 impl Config {
+    /// `rate_limit_per_second` at or above this is effectively no
+    /// limit for human traffic (it only ever trips a deliberate
+    /// load generator). `validate()` emits a startup WARN so an
+    /// operator running with a benchmark override in production
+    /// sees it in the logs rather than discovering it during an
+    /// abuse incident. 50 000 r/s/IP ≈ 4.3 billion requests/day
+    /// from one source — far past any legitimate client.
+    pub const RATE_LIMIT_WARN_THRESHOLD: u64 = 50_000;
+
+    /// True when the per-IP limiter is set so high it is a no-op
+    /// for real traffic (R-5). Extracted as a predicate so the
+    /// threshold is unit-testable without capturing log output.
+    pub fn rate_limit_effectively_off(&self) -> bool {
+        self.rate_limit_per_second >= Self::RATE_LIMIT_WARN_THRESHOLD
+    }
+
     /// Load configuration from environment variables with sensible defaults.
     pub fn from_env() -> Self {
         Self {
@@ -138,29 +198,27 @@ impl Config {
             // the Patroni migration path (under which these defaults
             // stay unchanged because the HA tool sits behind HAProxy).
 
+            // S-6: credentialed defaults removed — env vars are
+            // REQUIRED. The compose stack supplies them via .env
+            // (which substitutes ${POSTGRES_USER}/${POSTGRES_PASSWORD}
+            // into each URL), so the running stack continues to
+            // boot; a deployment that forgets to set them fails
+            // closed at process start rather than silently embedding
+            // the demo password. Pairs with the Twelve-Factor "open-
+            // source-the-code without leaking credentials" litmus
+            // test (audit S-6).
+            //
             // Shard 0
-            database_shard0_write_url: env_or(
-                "DATABASE_SHARD0_WRITE_URL",
-                "postgres://peakload_user:peakload_secure_pass@pgbouncer-shard0:5432/peakload_db",
-            ),
-            database_shard0_read_urls: parse_csv_env(
-                "DATABASE_SHARD0_READ_URLS",
-                "postgres://peakload_user:peakload_secure_pass@pg-shard0-node-a:5432/peakload_db,postgres://peakload_user:peakload_secure_pass@pg-shard0-node-b:5432/peakload_db",
-            ),
+            database_shard0_write_url: must_env("DATABASE_SHARD0_WRITE_URL"),
+            database_shard0_read_urls: must_csv_env("DATABASE_SHARD0_READ_URLS"),
             // Shard 1
-            database_shard1_write_url: env_or(
-                "DATABASE_SHARD1_WRITE_URL",
-                "postgres://peakload_user:peakload_secure_pass@pgbouncer-shard1:5432/peakload_db",
-            ),
-            database_shard1_read_urls: parse_csv_env(
-                "DATABASE_SHARD1_READ_URLS",
-                "postgres://peakload_user:peakload_secure_pass@pg-shard1-node-a:5432/peakload_db,postgres://peakload_user:peakload_secure_pass@pg-shard1-node-b:5432/peakload_db",
-            ),
-            // Shard 2
-            database_shard2_write_url: env_or(
-                "DATABASE_SHARD2_WRITE_URL",
-                "postgres://peakload_user:peakload_secure_pass@pgbouncer-shard2:5432/peakload_db",
-            ),
+            database_shard1_write_url: must_env("DATABASE_SHARD1_WRITE_URL"),
+            database_shard1_read_urls: must_csv_env("DATABASE_SHARD1_READ_URLS"),
+            // Shard 2 — disabled in compose; .env does not define
+            // the URL. Optional so unset is the normal case, not
+            // a boot failure. Re-enabling shard 2 requires setting
+            // the env var alongside the corresponding compose service.
+            database_shard2_write_url: std::env::var("DATABASE_SHARD2_WRITE_URL").ok(),
             // Pool sizes raised: previous defaults bottlenecked at the
             // app↔pgBouncer hop. With 4 replicas each pool is now sized
             // to soak its share of 1000 concurrent VUs without queueing.
@@ -173,10 +231,8 @@ impl Config {
 
             // Tighter outer→inner timeouts: under load we'd rather fail
             // fast (and let the client retry / get a 503) than block a
-            // request thread for 5–30 s.
-            db_query_timeout_secs: env_or("DB_QUERY_TIMEOUT_SECS", "2")
-                .parse()
-                .expect("DB_QUERY_TIMEOUT_SECS must be a number"),
+            // request thread for 5–30 s. (Postgres statement_timeout
+            // is server-side now — see field comment above.)
             redis_command_timeout_secs: env_or("REDIS_COMMAND_TIMEOUT_SECS", "1")
                 .parse()
                 .expect("REDIS_COMMAND_TIMEOUT_SECS must be a number"),
@@ -191,10 +247,7 @@ impl Config {
                 .expect("REDIS_POOL_SIZE must be a number"),
 
             redis_sentinel_nodes: parse_csv_env("REDIS_SENTINEL_NODES", ""),
-            redis_sentinel_master_name: env_or(
-                "REDIS_SENTINEL_MASTER_NAME",
-                "peakload-master",
-            ),
+            redis_sentinel_master_name: env_or("REDIS_SENTINEL_MASTER_NAME", "peakload-master"),
             redis_sentinel_monitor_interval_secs: env_or(
                 "REDIS_SENTINEL_MONITOR_INTERVAL_SECS",
                 "5",
@@ -216,23 +269,25 @@ impl Config {
                 .parse()
                 .expect("DB_WRITE_RETRY_MAX_ATTEMPTS must be a number"),
 
-            rabbitmq_url: env_or(
-                "RABBITMQ_URL",
-                "amqp://peakload_user:peakload_secure_pass@localhost:5672",
-            ),
+            // S-6: same fail-closed treatment as the DB URLs.
+            rabbitmq_url: must_env("RABBITMQ_URL"),
 
-            // Per-IP limiter ceiling. Old defaults (10 000 / 20 000)
-            // were modelled for many distinct clients; under a
-            // single-source load test the entire k6 fleet shares
-            // one IP and routinely overshoots, producing the
-            // `not rate limited` failures seen in the spike
-            // scenario. Bumped so the limiter is effectively a
-            // safety belt during benchmarks; keep an eye on it
-            // before exposing the service publicly.
-            rate_limit_per_second: env_or("RATE_LIMIT_PER_SECOND", "100000")
+            // Per-IP limiter ceiling. R-5: the *default* is the
+            // production-safe value; benchmarks override it via
+            // env (the load-test `.env` / compose sets a high
+            // value explicitly). Shipping the bench value as the
+            // default is "dangerous defaults, safe overrides" —
+            // the limiter is then effectively off in every
+            // environment where someone forgot to set the env var,
+            // which is the normal case, not the exception. 2000
+            // r/s per IP is a defensible starting point for this
+            // API; `validate()` WARNs if it is ever raised to a
+            // level where the limiter is a no-op for human traffic
+            // (see RATE_LIMIT_WARN_THRESHOLD).
+            rate_limit_per_second: env_or("RATE_LIMIT_PER_SECOND", "2000")
                 .parse()
                 .expect("RATE_LIMIT_PER_SECOND must be a number"),
-            rate_limit_burst: env_or("RATE_LIMIT_BURST", "200000")
+            rate_limit_burst: env_or("RATE_LIMIT_BURST", "4000")
                 .parse()
                 .expect("RATE_LIMIT_BURST must be a number"),
 
@@ -256,12 +311,29 @@ impl Config {
                 .parse()
                 .expect("MAX_CONCURRENT_REQUESTS must be a number"),
 
-            cors_allowed_origins: parse_csv_env("CORS_ALLOWED_ORIGINS", "*"),
+            // S-3: default is empty, NOT "*". `validate()` rejects
+            // an empty allowlist so the deployment must make the
+            // wildcard decision explicit. Existing `.env` files
+            // already set `CORS_ALLOWED_ORIGINS=*` (running stack)
+            // — no regression; `validate()` additionally emits a
+            // WARN when the resolved list contains `*` so a
+            // production deploy that left the dev wildcard in
+            // place is visible in logs.
+            cors_allowed_origins: parse_csv_env("CORS_ALLOWED_ORIGINS", ""),
 
-            enable_auth: env_or("ENABLE_AUTH", "false")
-                .parse()
-                .unwrap_or(false),
+            degradation_mode: env_or("DEGRADATION_MODE", "normal"),
+
+            enable_auth: env_or("ENABLE_AUTH", "false").parse().unwrap_or(false),
             auth_secret: std::env::var("AUTH_SECRET").ok(),
+            auth_expected_issuer: std::env::var("AUTH_EXPECTED_ISSUER")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            auth_expected_audience: std::env::var("AUTH_EXPECTED_AUDIENCE")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            auth_leeway_secs: env_or("AUTH_LEEWAY_SECS", "30")
+                .parse()
+                .expect("AUTH_LEEWAY_SECS must be a number"),
 
             verify_from_account_exists: env_or("TX_VERIFY_FROM_ACCOUNT", "false")
                 .parse()
@@ -272,6 +344,14 @@ impl Config {
                 .expect("BACKPRESSURE_WAIT_MS must be a number"),
 
             idempotency_backend: idempotency_backend_from_env(),
+
+            redis_intake_concurrency: env_or("REDIS_INTAKE_CONCURRENCY", "4")
+                .parse()
+                .expect("REDIS_INTAKE_CONCURRENCY must be a number"),
+
+            redis_intake_batch_size: env_or("REDIS_INTAKE_BATCH_SIZE", "25")
+                .parse()
+                .expect("REDIS_INTAKE_BATCH_SIZE must be a number"),
         }
     }
 
@@ -300,22 +380,15 @@ impl Config {
             self.redis_pool_size
         );
 
-        // Timeouts — downstream timeouts must be shorter than the API timeout
-        ensure!(
-            self.db_query_timeout_secs > 0,
-            "DB_QUERY_TIMEOUT_SECS must be > 0"
-        );
+        // Timeouts — downstream timeouts must be shorter than the
+        // API timeout. (Postgres statement_timeout is server-side
+        // now and not represented in this struct — see the field
+        // comment in the timeouts block.)
         ensure!(
             self.redis_command_timeout_secs > 0,
             "REDIS_COMMAND_TIMEOUT_SECS must be > 0"
         );
         ensure!(self.api_timeout_secs > 0, "API_TIMEOUT_SECS must be > 0");
-        ensure!(
-            self.db_query_timeout_secs < self.api_timeout_secs,
-            "DB_QUERY_TIMEOUT_SECS ({}) must be < API_TIMEOUT_SECS ({})",
-            self.db_query_timeout_secs,
-            self.api_timeout_secs
-        );
         ensure!(
             self.redis_command_timeout_secs < self.api_timeout_secs,
             "REDIS_COMMAND_TIMEOUT_SECS ({}) must be < API_TIMEOUT_SECS ({})",
@@ -329,11 +402,72 @@ impl Config {
             "MAX_CONCURRENT_REQUESTS must be >= 1"
         );
 
+        // S-2: when JWT enforcement is on, the validator REQUIRES
+        // expected issuer + audience values — without them every
+        // token's iss/aud check is implicitly skipped (or rejects
+        // every token, depending on lib defaults). Fail-closed at
+        // boot rather than discovering at first auth'd request.
+        if self.enable_auth {
+            ensure!(
+                self.auth_secret.as_deref().is_some_and(|s| !s.is_empty()),
+                "AUTH_SECRET must be set (and non-empty) when ENABLE_AUTH=true"
+            );
+            ensure!(
+                self.auth_expected_issuer.is_some(),
+                "AUTH_EXPECTED_ISSUER must be set (and non-empty) when ENABLE_AUTH=true (S-2)"
+            );
+            ensure!(
+                self.auth_expected_audience.is_some(),
+                "AUTH_EXPECTED_AUDIENCE must be set (and non-empty) when ENABLE_AUTH=true (S-2)"
+            );
+        }
+
+        // S-3: CORS allowlist must be explicitly set. An empty
+        // list is the unsafe-by-default state (would either reject
+        // every cross-origin browser request OR — in the old wide-
+        // open default — accept every one). Force the deployment
+        // to make the decision.
+        ensure!(
+            !self.cors_allowed_origins.is_empty(),
+            "CORS_ALLOWED_ORIGINS must be set (non-empty list, or \"*\" for development)"
+        );
+        if self.cors_allowed_origins.iter().any(|o| o == "*") {
+            tracing::warn!(
+                origins = ?self.cors_allowed_origins,
+                "CORS_ALLOWED_ORIGINS contains \"*\" — every origin is allowed. \
+                 Expected only in development; restrict to an explicit allowlist \
+                 in production (S-3)."
+            );
+        }
+
+        // R-9: degradation posture must be a recognised value, or
+        // the process would silently fall back to Normal and an
+        // operator who set DEGRADATION_MODE=read_only for a
+        // maintenance window would be serving writes anyway.
+        ensure!(
+            crate::degradation::DegradationMode::parse(&self.degradation_mode).is_some(),
+            "DEGRADATION_MODE must be one of: normal | read_only | essential_only (got {:?})",
+            self.degradation_mode
+        );
+
         // Rate limiting
         ensure!(
             self.rate_limit_per_second > 0,
             "RATE_LIMIT_PER_SECOND must be > 0"
         );
+        // R-5: not a hard failure (benchmarks legitimately raise
+        // it) but it must never pass silently — an unbounded
+        // limiter in production is a security gap, not a config
+        // typo.
+        if self.rate_limit_effectively_off() {
+            tracing::warn!(
+                rate_limit_per_second = self.rate_limit_per_second,
+                threshold = Self::RATE_LIMIT_WARN_THRESHOLD,
+                "RATE_LIMIT_PER_SECOND is at or above the no-op threshold — the per-IP \
+                 limiter is effectively OFF for human traffic. Expected only on a \
+                 load-test host; if this is production, an override leaked."
+            );
+        }
 
         // Circuit breaker
         ensure!(
@@ -359,6 +493,25 @@ impl Config {
             "REDIS_SENTINEL_MONITOR_INTERVAL_SECS must be > 0"
         );
 
+        // Stage-2 intake worker fan-out. Lower bound 1 (zero workers
+        // would silently strand the pending list); upper bound 64
+        // guards a typo'd value from oversubscribing the PG pool and
+        // AMQP channels.
+        ensure!(
+            self.redis_intake_concurrency >= 1 && self.redis_intake_concurrency <= 64,
+            "REDIS_INTAKE_CONCURRENCY must be 1-64, got {}",
+            self.redis_intake_concurrency
+        );
+
+        // Batched intake size. Lower bound 1 (zero is meaningless);
+        // upper bound 500 mirrors the pool-size cap — past that the
+        // PG bulk INSERT/UPDATE arrays grow without payoff.
+        ensure!(
+            self.redis_intake_batch_size >= 1 && self.redis_intake_batch_size <= 500,
+            "REDIS_INTAKE_BATCH_SIZE must be 1-500, got {}",
+            self.redis_intake_batch_size
+        );
+
         Ok(())
     }
 }
@@ -378,11 +531,6 @@ impl fmt::Display for Config {
             f,
             "  db_read_pool_size:            {}",
             self.db_read_pool_size
-        )?;
-        writeln!(
-            f,
-            "  db_query_timeout_secs:        {}",
-            self.db_query_timeout_secs
         )?;
         writeln!(
             f,
@@ -429,7 +577,27 @@ impl fmt::Display for Config {
             "  cors_allowed_origins:         {:?}",
             self.cors_allowed_origins
         )?;
+        writeln!(
+            f,
+            "  degradation_mode:             {}",
+            self.degradation_mode
+        )?;
         writeln!(f, "  enable_auth:                  {}", self.enable_auth)?;
+        writeln!(
+            f,
+            "  auth_expected_issuer:         {}",
+            self.auth_expected_issuer.as_deref().unwrap_or("(unset)")
+        )?;
+        writeln!(
+            f,
+            "  auth_expected_audience:       {}",
+            self.auth_expected_audience.as_deref().unwrap_or("(unset)")
+        )?;
+        writeln!(
+            f,
+            "  auth_leeway_secs:             {}",
+            self.auth_leeway_secs
+        )?;
         writeln!(
             f,
             "  idempotency_backend:          {}",
@@ -448,7 +616,10 @@ impl fmt::Display for Config {
         writeln!(
             f,
             "  database_shard2_write_url:    {}",
-            mask_url(&self.database_shard2_write_url)
+            self.database_shard2_write_url
+                .as_deref()
+                .map(mask_url)
+                .unwrap_or_else(|| "(unset — shard 2 disabled)".to_string())
         )?;
         writeln!(
             f,
@@ -459,6 +630,16 @@ impl fmt::Display for Config {
             f,
             "  rabbitmq_url:                 {}",
             mask_url(&self.rabbitmq_url)
+        )?;
+        writeln!(
+            f,
+            "  redis_intake_concurrency:     {}",
+            self.redis_intake_concurrency
+        )?;
+        writeln!(
+            f,
+            "  redis_intake_batch_size:      {}",
+            self.redis_intake_batch_size
         )?;
         Ok(())
     }
@@ -486,6 +667,26 @@ fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// S-6: env var with NO compiled-in fallback. Aborts process
+/// startup if unset — the failure message names the variable so
+/// the operator sees it in stderr instead of an opaque "boot
+/// failed".
+fn must_env(key: &str) -> String {
+    env::var(key).unwrap_or_else(|_| {
+        panic!("{key} must be set (S-6: no credentialed defaults; see .env.example)")
+    })
+}
+
+/// S-6: comma-separated env var with NO fallback (same fail-closed
+/// posture as `must_env` for the read-replica URL lists).
+fn must_csv_env(key: &str) -> Vec<String> {
+    must_env(key)
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn parse_csv_env(key: &str, default: &str) -> Vec<String> {
     let raw = env::var(key).unwrap_or_else(|_| default.to_string());
     raw.split(',')
@@ -507,10 +708,9 @@ mod tests {
             database_shard0_read_urls: vec!["postgres://user:pass@host:5432/db".to_string()],
             database_shard1_write_url: "postgres://user:pass@host:5432/db".to_string(),
             database_shard1_read_urls: vec!["postgres://user:pass@host:5432/db".to_string()],
-            database_shard2_write_url: "postgres://user:pass@host:5432/db".to_string(),
+            database_shard2_write_url: Some("postgres://user:pass@host:5432/db".to_string()),
             db_write_pool_size: 30,
             db_read_pool_size: 50,
-            db_query_timeout_secs: 5,
             redis_command_timeout_secs: 3,
             api_timeout_secs: 30,
             redis_url: "redis://127.0.0.1:6379".to_string(),
@@ -528,11 +728,17 @@ mod tests {
             circuit_breaker_recovery_timeout_secs: 10,
             max_concurrent_requests: 20000,
             cors_allowed_origins: vec!["*".to_string()],
+            degradation_mode: "normal".to_string(),
             enable_auth: false,
             auth_secret: None,
+            auth_expected_issuer: None,
+            auth_expected_audience: None,
+            auth_leeway_secs: 30,
             verify_from_account_exists: false,
             backpressure_wait_ms: 50,
             idempotency_backend: IdempotencyBackend::Pg,
+            redis_intake_concurrency: 4,
+            redis_intake_batch_size: 25,
         }
     }
 
@@ -556,14 +762,6 @@ mod tests {
     }
 
     #[test]
-    fn db_timeout_greater_than_api_timeout_fails() {
-        let mut cfg = test_config();
-        cfg.db_query_timeout_secs = 31;
-        cfg.api_timeout_secs = 30;
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
     fn redis_timeout_greater_than_api_timeout_fails() {
         let mut cfg = test_config();
         cfg.redis_command_timeout_secs = 30;
@@ -583,6 +781,54 @@ mod tests {
         let mut cfg = test_config();
         cfg.rate_limit_per_second = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn empty_cors_allowlist_fails_validation() {
+        // S-3: an unset CORS_ALLOWED_ORIGINS env var must abort
+        // boot rather than silently default to "deny everything"
+        // (or, worse, the prior "*" default).
+        let mut cfg = test_config();
+        cfg.cors_allowed_origins = vec![];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn wildcard_cors_allowlist_validates_with_warn() {
+        // S-3: "*" is a legitimate dev/test setting; validate()
+        // accepts it but emits a startup WARN (side-effect not
+        // captured here — covered by the integration boot probe).
+        let mut cfg = test_config();
+        cfg.cors_allowed_origins = vec!["*".to_string()];
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn safe_rate_limit_not_flagged_as_effectively_off() {
+        let mut cfg = test_config();
+        cfg.rate_limit_per_second = 2000; // the new production-safe default
+        assert!(!cfg.rate_limit_effectively_off());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn benchmark_rate_limit_is_flagged_but_still_valid() {
+        // R-5: a benchmark override is allowed (validate still Ok —
+        // it is a WARN, not a hard failure) but MUST be flagged so
+        // it cannot pass silently into production.
+        let mut cfg = test_config();
+        cfg.rate_limit_per_second = 100_000;
+        assert!(cfg.rate_limit_effectively_off());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rate_limit_warn_threshold_boundary() {
+        let mut cfg = test_config();
+        cfg.rate_limit_per_second = Config::RATE_LIMIT_WARN_THRESHOLD - 1;
+        assert!(!cfg.rate_limit_effectively_off());
+        cfg.rate_limit_per_second = Config::RATE_LIMIT_WARN_THRESHOLD;
+        assert!(cfg.rate_limit_effectively_off());
     }
 
     #[test]
@@ -615,5 +861,47 @@ mod tests {
             output.contains("****"),
             "Display should contain masked markers"
         );
+    }
+
+    #[test]
+    fn zero_redis_intake_concurrency_fails() {
+        let mut cfg = test_config();
+        cfg.redis_intake_concurrency = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn over_max_redis_intake_concurrency_fails() {
+        let mut cfg = test_config();
+        cfg.redis_intake_concurrency = 65;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn default_redis_intake_concurrency_passes() {
+        let mut cfg = test_config();
+        cfg.redis_intake_concurrency = 4;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_redis_intake_batch_size_fails() {
+        let mut cfg = test_config();
+        cfg.redis_intake_batch_size = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn over_max_redis_intake_batch_size_fails() {
+        let mut cfg = test_config();
+        cfg.redis_intake_batch_size = 501;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn default_redis_intake_batch_size_passes() {
+        let mut cfg = test_config();
+        cfg.redis_intake_batch_size = 25;
+        assert!(cfg.validate().is_ok());
     }
 }

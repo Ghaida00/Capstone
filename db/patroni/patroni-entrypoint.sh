@@ -39,6 +39,15 @@
 #                         replication between the two nodes
 #                         of a shard.
 #
+# Optional environment (safe defaults applied below if unset):
+#   PG_SYNCHRONOUS_COMMIT   Durability posture rendered into
+#                           the node's local PG parameters.
+#                           Default: remote_write.
+#   PG_COMMIT_DELAY         Group-commit nap, microseconds.
+#                           Default: 0.
+#   PG_COMMIT_SIBLINGS      commit_delay concurrency floor.
+#                           Default: 5.
+#
 # The template at /etc/patroni/patroni.yml.tmpl is rendered
 # once per container start via `envsubst` and written to
 # /var/lib/patroni/patroni.yml. Re-renders on restart are
@@ -59,9 +68,35 @@ set -eu
 : "${POSTGRES_DB:?POSTGRES_DB must be set}"
 : "${REPL_PASSWORD:?REPL_PASSWORD must be set}"
 
+# ------------------------------------------------------------
+# Optional PG durability knobs — env-driven, with defaults.
+# ------------------------------------------------------------
+# Unlike the required vars above these have safe defaults, so
+# a stack brought up without them in .env still boots. They
+# render into the LOCAL `postgresql.parameters` block of the
+# template (not bootstrap.dcs), which is what makes them take
+# effect on every container recreate rather than only at the
+# first cluster bootstrap.
+# ------------------------------------------------------------
+: "${PG_SYNCHRONOUS_COMMIT:=remote_write}"
+: "${PG_COMMIT_DELAY:=0}"
+: "${PG_COMMIT_SIBLINGS:=5}"
+
+# Fail fast on a typo'd posture — otherwise Postgres rejects
+# the GUC with a less obvious error several layers down.
+case "$PG_SYNCHRONOUS_COMMIT" in
+    on|off|local|remote_write|remote_apply) ;;
+    *)
+        echo "[patroni-entrypoint] FATAL: PG_SYNCHRONOUS_COMMIT='$PG_SYNCHRONOUS_COMMIT'" \
+             "must be one of: on off local remote_write remote_apply" >&2
+        exit 1
+        ;;
+esac
+
 export PGDATA PATRONI_SCOPE PATRONI_NAME PATRONI_HOSTNAME ETCD_HOSTS \
        POSTGRES_SUPERUSER_PASSWORD POSTGRES_USER POSTGRES_PASSWORD \
-       POSTGRES_DB REPL_PASSWORD
+       POSTGRES_DB REPL_PASSWORD \
+       PG_SYNCHRONOUS_COMMIT PG_COMMIT_DELAY PG_COMMIT_SIBLINGS
 
 # ------------------------------------------------------------
 # 1. Render the Patroni config from the template.
@@ -84,10 +119,13 @@ envsubst '
     ${POSTGRES_PASSWORD}
     ${POSTGRES_DB}
     ${REPL_PASSWORD}
+    ${PG_SYNCHRONOUS_COMMIT}
+    ${PG_COMMIT_DELAY}
+    ${PG_COMMIT_SIBLINGS}
 ' < /etc/patroni/patroni.yml.tmpl > "$RENDERED"
 
 # ------------------------------------------------------------
-# 2. Ensure PGDATA is owned by postgres.
+# 2. Ensure PGDATA (and its parent) are owned by postgres.
 # ------------------------------------------------------------
 # This script runs as root specifically so we can fix volume
 # ownership here. On Docker Desktop / WSL2 a freshly-created
@@ -96,8 +134,18 @@ envsubst '
 #     "could not change permissions of directory
 #      /var/lib/postgresql/data: Operation not permitted"
 # Chown is idempotent and cheap on a populated PGDATA.
+#
+# The compose mount sits at /var/lib/postgresql (the parent of
+# PGDATA) to absorb the base image's inherited
+# `VOLUME /var/lib/postgresql` declaration — without that,
+# Docker would create a fresh anonymous volume for the parent
+# on every recreate. The parent dir is also `postgres`'s HOME,
+# so it needs to be owned by postgres for tools that touch
+# HOME (psql history, etc.). Non-recursive on the parent to
+# stay cheap; -R on PGDATA only.
 # ------------------------------------------------------------
 echo "[patroni-entrypoint] Ensuring $PGDATA owned by postgres"
+chown postgres:postgres /var/lib/postgresql
 mkdir -p "$PGDATA"
 chown -R postgres:postgres "$PGDATA"
 chmod 0700 "$PGDATA"

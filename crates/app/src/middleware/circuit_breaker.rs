@@ -204,7 +204,6 @@ impl CircuitBreaker {
             _ => {}
         }
     }
-
 }
 
 /// Axum middleware function for circuit breaker.
@@ -233,4 +232,105 @@ pub async fn circuit_breaker_middleware(
     }
 
     response
+}
+
+// ─── Integration tests for circuit_breaker_middleware (T-4) ──
+//
+// Each test mounts only the breaker layer on a deterministic
+// handler (always 200, always 500, or sequenced via shared atomic),
+// then asserts the protocol contract end-to-end via axum-test —
+// not the bare atomic transitions.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{middleware::from_fn_with_state, routing::get, Router};
+    use axum_test::TestServer;
+
+    fn router_under_breaker(cb: CircuitBreaker, handler_status: StatusCode) -> Router {
+        Router::new()
+            .route(
+                "/x",
+                get(move || async move { (handler_status, "ok").into_response() }),
+            )
+            .layer(from_fn_with_state(cb, circuit_breaker_middleware))
+    }
+
+    #[tokio::test]
+    async fn closed_breaker_lets_requests_through_with_handler_status() {
+        let cb = CircuitBreaker::new(3, 60);
+        let server = TestServer::new(router_under_breaker(cb, StatusCode::OK));
+        let res = server.get("/x").await;
+        assert_eq!(res.status_code(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn breaker_opens_after_threshold_consecutive_5xx() {
+        let cb = CircuitBreaker::new(3, 60);
+        let server = TestServer::new(router_under_breaker(
+            cb.clone(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ));
+
+        // First 3 requests reach the handler and return 500;
+        // each is recorded as a failure, tripping the breaker on
+        // the 3rd record_failure.
+        for i in 0..3 {
+            let res = server.get("/x").await;
+            assert_eq!(
+                res.status_code(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "attempt {i}: expected 500 from handler"
+            );
+        }
+        // 4th request short-circuits with 503 BEFORE reaching the
+        // handler — the body shape is the documented breaker JSON.
+        let res = server.get("/x").await;
+        assert_eq!(res.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = res.json();
+        assert_eq!(body["error"], "circuit_breaker_open");
+    }
+
+    #[tokio::test]
+    async fn half_open_admits_bounded_probes_after_recovery() {
+        // recovery_timeout_secs=0 → next allow_request after Open
+        // immediately CASes to HalfOpen and starts admitting up to
+        // `half_open_max_requests` (=5 in the constructor).
+        let cb = CircuitBreaker::new(2, 0);
+        cb.record_failure();
+        cb.record_failure(); // now Open
+        assert!(
+            matches!(
+                state_from_u8(cb.inner.state.load(Ordering::Acquire)),
+                CircuitState::Open
+            ),
+            "expected Open after threshold failures"
+        );
+
+        // `last_failure_ms == 0` is the breaker's "never failed"
+        // sentinel; if `record_failure` ran at process-epoch +0ms
+        // the field is still 0 and `allow_request` would short-
+        // circuit `false`. The 2 ms sleep guarantees the next
+        // failure-recorded value is > 0 so the open→half-open path
+        // is reachable. This is the real production semantics —
+        // a breaker that opens in the first millisecond of the
+        // process lifetime never recovers either, which is
+        // documented in the now_ms / last_failure_ms comments.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        cb.record_failure();
+
+        // First allow_request after Open with elapsed >= recovery
+        // CASes to HalfOpen and admits this probe; subsequent probes
+        // are admitted up to half_open_max_requests, then refused.
+        let max = cb.inner.half_open_max_requests as usize;
+        for i in 0..max {
+            assert!(
+                cb.allow_request(),
+                "probe {i} of {max} should be admitted in HalfOpen"
+            );
+        }
+        assert!(
+            !cb.allow_request(),
+            "probe beyond half_open_max_requests must be refused"
+        );
+    }
 }

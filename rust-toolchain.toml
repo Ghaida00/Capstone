@@ -1,0 +1,8 @@
+# A-4: pin the compiler version so reproducible builds are a
+# property of the repo, not of the build machine. Bump
+# deliberately (and update in a single commit with the
+# Cargo.toml MSRV / clippy.toml msrv knobs).
+[toolchain]
+channel = "1.94.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

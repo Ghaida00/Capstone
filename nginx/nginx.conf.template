@@ -1,3 +1,31 @@
+# ============================================================
+# nginx.conf TEMPLATE (OPS-2 / S-5)
+# ============================================================
+# Rendered at container start by the official nginx image's
+# built-in envsubst step (files in /etc/nginx/templates/*.template
+# with NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx). Only variables that
+# exist in the container environment are substituted — nginx
+# runtime vars ($binary_remote_addr, $server_name, $host, …) are
+# left untouched because they are not env vars.
+#
+# Rate-limit knobs (safe defaults set in docker-compose.yml via
+# ${VAR:-default}; benchmarks override by exporting the high
+# value, e.g. in .env or the shell, before `docker compose up`):
+#
+#   NGINX_PER_IP_RATE    per-IP req/s   (safe 2000  | bench 50000)
+#   NGINX_GLOBAL_RATE    global req/s   (safe 50000 | bench 100000)
+#   NGINX_PER_IP_BURST   per-IP burst   (safe 2000  | bench 10000)
+#   NGINX_GLOBAL_BURST   global burst   (safe 10000 | bench 50000)
+#
+# The edge limiter is the first line of abuse defence (OWASP
+# API4:2023). Shipping the bench value as the default is
+# "dangerous defaults, safe overrides" — the edge ends up
+# effectively off in every environment where someone forgot to
+# swap it back, which is the normal case. The default is now the
+# production-safe value; load tests opt INTO the high ceiling
+# explicitly.
+# ============================================================
+
 worker_processes auto;
 worker_rlimit_nofile 65535;
 
@@ -30,16 +58,28 @@ http {
     # ─── Response Cache ──────────────────────────────────
     proxy_cache_path /tmp/nginx_cache levels=1:2 keys_zone=api_cache:10m max_size=100m inactive=2s;
 
-    # ─── Rate Limiting Zones ────────────────────────────
-    # Per-IP cap was 2000 r/s — fine for real traffic but
-    # single-source load tests (k6 on the host) trip it
-    # immediately and produce the spike-scenario 429 storm
-    # we observed (24 % failures, 3.4 % rate_limited).
-    # Bumped to 50 000 r/s so the app-level limiter is the
-    # only ceiling under benchmarking. Lower this back to
-    # 2000 r/s before exposing the service publicly.
-    limit_req_zone $binary_remote_addr zone=per_ip:20m rate=50000r/s;
-    limit_req_zone $server_name zone=global:2m rate=100000r/s;
+    # ─── Edge Security Headers (S-4) ────────────────────
+    # Free defence-in-depth layer. `always` makes the header
+    # ride error responses too. HSTS is a no-op under the current
+    # plain-HTTP `listen 80` but costs nothing and prevents a
+    # regression when TLS lands. Frame-ancestors + X-Frame-Options
+    # are double-belted: legacy browsers honour the latter, modern
+    # ones the former. `default-src 'none'` is correct for a
+    # JSON-only API (no UI to break).
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'" always;
+    add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+
+    # ─── Rate Limiting Zones (OPS-2 / S-5) ──────────────
+    # Values come from the environment (see the template header).
+    # Default is the production-safe ceiling; benchmarks export
+    # the high value explicitly rather than the config shipping
+    # it as the default.
+    limit_req_zone $binary_remote_addr zone=per_ip:20m rate=${NGINX_PER_IP_RATE}r/s;
+    limit_req_zone $server_name zone=global:2m rate=${NGINX_GLOBAL_RATE}r/s;
     limit_conn_zone $binary_remote_addr zone=conn_per_ip:10m;
     limit_req_status 429;
     limit_conn_status 429;
@@ -85,8 +125,8 @@ http {
 
         # GET API routes (cached 1s, rate limited)
         location ~ ^/api/v2/transactions$ {
-            limit_req zone=per_ip burst=10000 nodelay;
-            limit_req zone=global burst=50000 nodelay;
+            limit_req zone=per_ip burst=${NGINX_PER_IP_BURST} nodelay;
+            limit_req zone=global burst=${NGINX_GLOBAL_BURST} nodelay;
             limit_conn conn_per_ip 5000;
 
             # Cache GET responses for 1 second
@@ -116,10 +156,10 @@ http {
 
         # All other API routes (no cache, rate limited)
         location /api/ {
-            limit_req zone=per_ip burst=10000 nodelay;
-            limit_req zone=global burst=50000 nodelay;
+            limit_req zone=per_ip burst=${NGINX_PER_IP_BURST} nodelay;
+            limit_req zone=global burst=${NGINX_GLOBAL_BURST} nodelay;
             limit_conn conn_per_ip 5000;
-            
+
             # Stream request body directly to upstream, do not buffer to disk
             proxy_request_buffering off;
 

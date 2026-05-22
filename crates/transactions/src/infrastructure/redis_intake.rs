@@ -1,25 +1,29 @@
-//! Redis-intake background worker — drains the Tier-2 pending list.
+//! Redis-intake background worker — batched drain of the Tier-2
+//! pending list.
 //!
-//! Consumes one entry at a time from `idempotency:pending:s{shard}`
-//! via non-blocking `RPOPLPUSH` (atomic move to `idempotency:inflight:s{shard}`),
-//! GETs the full reservation from Redis master, INSERTs into PG
-//! `idempotency_keys` with `claimed_at = NOW()` so the publish-outbox
-//! worker leaves the row alone, publishes the outbox payload to
-//! RabbitMQ, flips `published = true` (clearing the lease), and
-//! removes the key from the in-flight list.
+//! Each worker iteration claims up to `batch_size` keys from
+//! `idempotency:pending:s{shard}` via pipelined `RPOPLPUSH` to
+//! `idempotency:inflight:s{shard}`, then processes the batch as a
+//! unit: `MGET` the reservations, bulk `INSERT ... ON CONFLICT DO
+//! NOTHING RETURNING`, parallel publishes via `buffer_unordered`,
+//! bulk `UPDATE`, pipelined `LREM`. ~5 round-trips per batch + N
+//! parallel publishes — amortising fixed latency over N messages.
 //!
-//! Crash recovery: on worker start the inflight list is drained
-//! first. `process_one` is idempotent across crashes for two cases:
-//!   * Crash before publish — recovery sees `published = false`,
-//!     publishes once.
-//!   * Crash after `published = true` UPDATE — recovery sees the
-//!     flag, skips publish, releases the inflight slot.
-//!
-//! The remaining at-least-once window — crash AFTER broker confirm
-//! but BEFORE the `published = true` UPDATE — matches the
-//! publish-outbox worker's own model: the next iteration re-publishes
-//! the row, and the consumer's `(reference_id, from_account)` UNIQUE
-//! constraint absorbs the duplicate at `bulk_claim_slots`.
+//! Money-safety invariants:
+//!   * Atomic claim — each `RPOPLPUSH` moves one key
+//!     `pending → inflight` atomically. A crash mid-batch leaves
+//!     all claimed keys in `inflight`; `drain_inflight_batched`
+//!     reprocesses them on restart.
+//!   * Idempotent reprocessing — `ON CONFLICT DO NOTHING` skips
+//!     already-inserted rows; the `published` check skips rows a
+//!     prior attempt finished.
+//!   * At-least-once — a crash after broker-confirm but before the
+//!     `published = true` UPDATE causes a republish on recovery;
+//!     the consumer's `(reference_id, from_account)` UNIQUE
+//!     absorbs the duplicate.
+//!   * Lease hand-off — a publish failure clears `claimed_at` so
+//!     the durable PG row is picked up by the publish_outbox
+//!     backstop on its next iteration.
 
 use std::time::Duration;
 
@@ -45,26 +49,49 @@ const IDLE_TICK: Duration = Duration::from_millis(10);
 /// immediately.
 const ERROR_BACKOFF: Duration = Duration::from_millis(500);
 
-/// Spawns one intake worker per shard. Mirrors
-/// [`super::publish_outbox::spawn_publish_outbox`] in shape so
-/// shutdown wiring is uniform across the bootstrap.
+/// Maximum consecutive failures tolerated during recovery before
+/// giving up and letting the main loop take over. Bounds hot-loop
+/// risk on a poisoned entry without abandoning the whole tail of
+/// the inflight list on a single transient error (PG hiccup, Redis
+/// blip). The main loop only services `pending`, so abandoning
+/// inflight here means stranded entries until the next process
+/// restart.
+const MAX_DRAIN_CONSECUTIVE_FAILURES: usize = 5;
+
+/// How many publishes a batched `process_batch` runs in parallel.
+/// Matches the producer's `CHANNEL_POOL_SIZE` (2 conn × 8 ch = 16)
+/// so the batch's publishes saturate the channel pool without
+/// queueing on per-channel `publish_lock`.
+const PUBLISH_CONCURRENCY: usize = 16;
+
+/// Spawns `num_shards × concurrency` batched redis-intake workers.
+/// Each worker claims up to `batch_size` reservation keys per
+/// iteration and processes them via `process_batch` — amortizing
+/// fixed round-trip latency over the batch and parallelizing the
+/// publishes across the producer channel pool.
 pub fn spawn_redis_intake(
     shards: ShardRouter,
     cache: RedisCache,
     queue: QueueProducer,
     cancel: CancellationToken,
+    concurrency: usize,
+    batch_size: usize,
 ) -> Vec<JoinHandle<()>> {
-    (0..shards.num_shards())
-        .map(|shard_idx| {
+    let concurrency = concurrency.max(1);
+    let batch_size = batch_size.max(1);
+    let mut handles = Vec::with_capacity(shards.num_shards() * concurrency);
+    for shard_idx in 0..shards.num_shards() {
+        for _ in 0..concurrency {
             let shards = shards.clone();
             let cache = cache.clone();
             let queue = queue.clone();
             let cancel = cancel.clone();
-            tokio::spawn(async move {
-                run_shard_worker(shard_idx, shards, cache, queue, cancel).await;
-            })
-        })
-        .collect()
+            handles.push(tokio::spawn(async move {
+                run_shard_worker(shard_idx, shards, cache, queue, cancel, batch_size).await;
+            }));
+        }
+    }
+    handles
 }
 
 async fn run_shard_worker(
@@ -73,30 +100,39 @@ async fn run_shard_worker(
     cache: RedisCache,
     queue: QueueProducer,
     cancel: CancellationToken,
+    batch_size: usize,
 ) {
-    tracing::info!(shard = shard_idx, "redis-intake worker starting");
+    tracing::info!(
+        shard = shard_idx,
+        batch_size,
+        "redis-intake worker starting"
+    );
 
-    // Bind once — these strings live for the worker's lifetime.
     let pending = pending_key(shard_idx);
     let inflight = inflight_key(shard_idx);
 
-    // First pass: drain anything left in the in-flight list from a
-    // previous worker incarnation. RPOPLPUSH src=inflight,
-    // dst=inflight so the entry stays claimed if processing
-    // crashes again. The inflight list is usually small.
-    drain_inflight(shard_idx, &shards, &cache, &queue, &inflight, &cancel).await;
+    // Crash recovery: drain any inflight entries left from a previous
+    // process incarnation BEFORE accepting new claims, so a redelivery
+    // never overtakes an in-flight one.
+    drain_inflight_batched(
+        shard_idx, &shards, &cache, &queue, &inflight, batch_size, &cancel,
+    )
+    .await;
 
     while !cancel.is_cancelled() {
-        match cache.rpoplpush(&pending, &inflight).await {
-            Ok(Some(idempotency_key)) => {
-                if let Err(e) =
-                    process_one(shard_idx, &shards, &cache, &queue, &idempotency_key).await
-                {
+        match cache.rpoplpush_batch(&pending, &inflight, batch_size).await {
+            Ok(keys) if keys.is_empty() => {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(IDLE_TICK) => {}
+                }
+            }
+            Ok(keys) => {
+                if let Err(e) = process_batch(shard_idx, &shards, &cache, &queue, keys).await {
                     tracing::warn!(
                         shard = shard_idx,
-                        idempotency_key = %idempotency_key,
                         error = %e,
-                        "redis-intake processing failed; key stays in inflight, will retry"
+                        "redis-intake batch processing failed; keys stay in inflight"
                     );
                     metrics::counter!("idempotency_redis_intake_failures_total").increment(1);
                     tokio::select! {
@@ -104,22 +140,12 @@ async fn run_shard_worker(
                         _ = tokio::time::sleep(ERROR_BACKOFF) => {}
                     }
                 }
-                // Successful claim — loop immediately to drain
-                // any remaining backlog.
-            }
-            Ok(None) => {
-                // Pending list empty; sleep briefly before next
-                // poll. Cancellation-aware so shutdown is prompt.
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    _ = tokio::time::sleep(IDLE_TICK) => {}
-                }
             }
             Err(e) => {
                 tracing::warn!(
                     shard = shard_idx,
                     error = %e,
-                    "redis RPOPLPUSH error; backing off"
+                    "redis batch-claim error; backing off"
                 );
                 metrics::counter!("idempotency_redis_intake_errors_total").increment(1);
                 tokio::select! {
@@ -132,21 +158,13 @@ async fn run_shard_worker(
     tracing::info!(shard = shard_idx, "redis-intake worker exiting");
 }
 
-/// Maximum consecutive failures tolerated during recovery before
-/// giving up and letting the main loop take over. Bounds hot-loop
-/// risk on a poisoned entry without abandoning the whole tail of
-/// the inflight list on a single transient error (PG hiccup, Redis
-/// blip), which the previous `break`-on-first-error did. The main
-/// loop only services `pending`, so abandoning inflight here means
-/// stranded entries until the next process restart.
-const MAX_DRAIN_CONSECUTIVE_FAILURES: usize = 5;
-
-async fn drain_inflight(
+async fn drain_inflight_batched(
     shard_idx: usize,
     shards: &ShardRouter,
     cache: &RedisCache,
     queue: &QueueProducer,
     inflight: &str,
+    batch_size: usize,
     cancel: &CancellationToken,
 ) {
     let mut consecutive_failures: usize = 0;
@@ -154,50 +172,48 @@ async fn drain_inflight(
         if cancel.is_cancelled() {
             break;
         }
-        // RPOPLPUSH inflight → inflight cycles entries through
-        // the same list while we work. Non-blocking: returns None
-        // on empty so recovery terminates naturally.
-        let res = cache.rpoplpush(inflight, inflight).await;
-        match res {
-            Ok(Some(idempotency_key)) => {
-                match process_one(shard_idx, shards, cache, queue, &idempotency_key).await {
-                    Ok(()) => {
-                        consecutive_failures = 0;
-                    }
-                    Err(e) => {
-                        consecutive_failures += 1;
-                        tracing::warn!(
-                            shard = shard_idx,
-                            idempotency_key = %idempotency_key,
-                            error = %e,
-                            failures = consecutive_failures,
-                            "redis-intake recovery: process_one failed, entry stays in inflight"
-                        );
-                        metrics::counter!("idempotency_redis_intake_failures_total").increment(1);
-                        if consecutive_failures >= MAX_DRAIN_CONSECUTIVE_FAILURES {
-                            tracing::error!(
-                                shard = shard_idx,
-                                "redis-intake recovery: too many consecutive failures, \
-                                 exiting drain; remaining inflight entries will be picked \
-                                 up on next process restart"
-                            );
-                            break;
-                        }
-                        tokio::select! {
-                            _ = cancel.cancelled() => break,
-                            _ = tokio::time::sleep(ERROR_BACKOFF) => {}
-                        }
-                    }
-                }
-            }
-            Ok(None) => break,
+        // Cycle: RPOPLPUSH inflight -> inflight pulls a batch through
+        // the same list; process_batch's final LREM cleans up the
+        // ones it handled. Anything that errored stays in inflight
+        // for the next cycle.
+        let claimed = match cache.rpoplpush_batch(inflight, inflight, batch_size).await {
+            Ok(k) => k,
             Err(e) => {
                 tracing::warn!(
                     shard = shard_idx,
                     error = %e,
-                    "redis-intake recovery: RPOPLPUSH error"
+                    "drain_inflight RPOPLPUSH error"
                 );
                 break;
+            }
+        };
+        if claimed.is_empty() {
+            break;
+        }
+        match process_batch(shard_idx, shards, cache, queue, claimed).await {
+            Ok(()) => {
+                consecutive_failures = 0;
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                tracing::warn!(
+                    shard = shard_idx,
+                    error = %e,
+                    failures = consecutive_failures,
+                    "drain_inflight: process_batch failed"
+                );
+                metrics::counter!("idempotency_redis_intake_failures_total").increment(1);
+                if consecutive_failures >= MAX_DRAIN_CONSECUTIVE_FAILURES {
+                    tracing::error!(
+                        shard = shard_idx,
+                        "drain_inflight: too many consecutive failures, exiting"
+                    );
+                    break;
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(ERROR_BACKOFF) => {}
+                }
             }
         }
     }
@@ -210,139 +226,213 @@ struct StoredEntry {
     outbox_payload: serde_json::Value,
 }
 
-async fn process_one(
+/// Process one batch of already-claimed reservation keys.
+///
+/// Pipeline (5 round-trips + N parallel publishes per batch):
+///   1. MGET the N reservation entries from the master pool.
+///   2. Bulk INSERT into `idempotency_keys` with
+///      `ON CONFLICT DO NOTHING RETURNING idempotency_key` — the
+///      returned set is the freshly-claimed subset; the rest are
+///      pre-existing rows (crash recovery).
+///   3. For the conflict subset (usually empty), bulk SELECT the
+///      `published` flag; rows with `published=true` skip the
+///      publish step (a previous attempt already shipped them).
+///   4. Publish the remaining outbox payloads via
+///      `buffer_unordered(PUBLISH_CONCURRENCY)`.
+///   5. Bulk UPDATE: succeeded keys -> `published=true`,
+///      `claimed_at=NULL`; failed keys -> just `claimed_at=NULL`
+///      so `publish_outbox` retries from the durable PG row.
+///   6. Pipelined LREM all claimed keys from the inflight list.
+///
+/// Money-safety: every claimed key is either published exactly
+/// once (UNIQUE constraint downstream absorbs duplicate publishes
+/// from the at-least-once window) OR handed off to `publish_outbox`
+/// via the cleared lease. A crash anywhere leaves the keys in
+/// `inflight`; restart's batched `drain_inflight_batched`
+/// reprocesses them idempotently.
+async fn process_batch(
     shard_idx: usize,
     shards: &ShardRouter,
     cache: &RedisCache,
     queue: &QueueProducer,
-    idempotency_key: &str,
+    claimed_keys: Vec<String>,
 ) -> Result<(), String> {
-    // Fetch the full reservation from Redis master.
-    let raw = cache
-        .get_master_raw(&entry_key(idempotency_key))
-        .await
-        .map_err(|e| format!("redis GET: {}", e))?;
+    use futures::stream::{self, StreamExt};
+    use std::collections::HashSet;
 
-    let entry: StoredEntry = match raw {
-        Some(s) => {
-            serde_json::from_str(&s).map_err(|e| format!("deserialize reservation: {}", e))?
-        }
-        None => {
-            // Reservation TTL'd between SETNX and intake. Drop the
-            // pending-list entry; nothing to publish.
-            tracing::debug!(
-                shard = shard_idx,
-                idempotency_key = %idempotency_key,
-                "redis-intake: reservation key missing (TTL expired or deleted), discarding"
-            );
-            cache
-                .lrem(&inflight_key(shard_idx), 1, idempotency_key)
-                .await
-                .map_err(|e| format!("redis LREM: {}", e))?;
-            return Ok(());
-        }
-    };
-
-    // 1. Insert the PG row with `claimed_at = NOW()` so the
-    //    publish_outbox worker treats this row as leased and skips
-    //    it on its 10ms IDLE_TICK. Without the lease stamp, the
-    //    outbox worker would race us during the publish-await
-    //    window and republish every row at-least-twice. ON CONFLICT
-    //    DO NOTHING makes recovery retries idempotent: if the row
-    //    already exists (previous attempt crashed), the next step
-    //    consults its `published` flag instead of double-publishing.
-    let pool = shards.writer(shard_idx);
-    sqlx::query(
-        r#"
-        INSERT INTO idempotency_keys
-          (idempotency_key, request_hash, status,
-           response_payload, outbox_payload,
-           expires_at, published, claimed_at)
-        VALUES ($1, $2, 'processing', $3, $4,
-                NOW() + INTERVAL '24 hours', false, NOW())
-        ON CONFLICT (idempotency_key) DO NOTHING
-        "#,
-    )
-    .bind(idempotency_key)
-    .bind(&entry.request_hash)
-    .bind(&entry.accepted_payload)
-    .bind(&entry.outbox_payload)
-    .execute(pool)
-    .await
-    .map_err(|e| format!("PG INSERT: {}", e))?;
-
-    // 2. Read the row's current `published` flag. On crash recovery
-    //    a previous attempt may have already published and flipped
-    //    the flag before crashing pre-LREM; in that case we skip
-    //    publish entirely and just release the inflight slot.
-    //    The remaining duplicate-publish window — crash AFTER broker
-    //    confirm but BEFORE the UPDATE in step 4 — is absorbed by
-    //    the consumer's `(reference_id, from_account)` UNIQUE.
-    let already_published: bool = sqlx::query_scalar(
-        "SELECT published FROM idempotency_keys WHERE idempotency_key = $1",
-    )
-    .bind(idempotency_key)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| format!("PG SELECT published: {}", e))?
-    .unwrap_or(false);
-
-    if already_published {
-        cache
-            .lrem(&inflight_key(shard_idx), 1, idempotency_key)
-            .await
-            .map_err(|e| format!("redis LREM: {}", e))?;
+    if claimed_keys.is_empty() {
         return Ok(());
     }
 
-    // 3. Publish to broker. We hold the lease (`claimed_at = NOW()`),
-    //    so publish_outbox stays out of our way until the lease
-    //    expires. On failure, clear the lease so publish_outbox can
-    //    pick the row up on its next IDLE_TICK rather than waiting
-    //    `LEASE_SECS` for our stamp to age out — the PG row is
-    //    durable, only the broker round-trip is missing.
-    if let Err(e) = queue.publish(&entry.outbox_payload).await {
-        tracing::warn!(
-            shard = shard_idx,
-            idempotency_key = %idempotency_key,
-            error = %e,
-            "redis-intake: publish failed; clearing lease so publish_outbox retries"
-        );
-        metrics::counter!("idempotency_redis_intake_publish_failures_total").increment(1);
-        let _ = sqlx::query(
-            "UPDATE idempotency_keys
-               SET claimed_at = NULL,
-                   updated_at = NOW()
-             WHERE idempotency_key = $1
-               AND NOT published",
-        )
-        .bind(idempotency_key)
-        .execute(pool)
-        .await;
+    // ── 1. MGET the entries ──────────────────────────────────────
+    let entry_keys: Vec<String> = claimed_keys.iter().map(|k| entry_key(k)).collect();
+    let raws = cache
+        .mget_master_raw(&entry_keys)
+        .await
+        .map_err(|e| format!("redis MGET: {}", e))?;
+
+    // Partition: keys whose entry deserialised OK vs missing/garbled.
+    // Missing entries are TTL-expired or deleted reservations — they
+    // can never be published; we LREM them from inflight and drop.
+    let mut to_process: Vec<(String, StoredEntry)> = Vec::with_capacity(claimed_keys.len());
+    for (k, raw) in claimed_keys.iter().zip(raws.iter()) {
+        match raw {
+            Some(s) => match serde_json::from_str::<StoredEntry>(s) {
+                Ok(entry) => to_process.push((k.clone(), entry)),
+                Err(e) => {
+                    tracing::error!(
+                        shard = shard_idx,
+                        idempotency_key = %k,
+                        error = %e,
+                        "redis-intake: deserialise reservation, dropping from inflight"
+                    );
+                }
+            },
+            None => {
+                tracing::debug!(
+                    shard = shard_idx,
+                    idempotency_key = %k,
+                    "redis-intake: reservation TTL'd, dropping from inflight"
+                );
+            }
+        }
+    }
+
+    // ── 2. Bulk INSERT (with RETURNING) ──────────────────────────
+    let pool = shards.writer(shard_idx);
+    let freshly_inserted: Vec<String> = if to_process.is_empty() {
+        Vec::new()
     } else {
-        // 4. Mark published and clear the lease so publish_outbox
-        //    never re-claims this row.
+        let n = to_process.len();
+        let mut ids: Vec<String> = Vec::with_capacity(n);
+        let mut hashes: Vec<String> = Vec::with_capacity(n);
+        let mut accepts: Vec<serde_json::Value> = Vec::with_capacity(n);
+        let mut outboxes: Vec<serde_json::Value> = Vec::with_capacity(n);
+        for (k, e) in &to_process {
+            ids.push(k.clone());
+            hashes.push(e.request_hash.clone());
+            accepts.push(e.accepted_payload.clone());
+            outboxes.push(e.outbox_payload.clone());
+        }
+        sqlx::query_scalar::<_, String>(
+            r#"
+            INSERT INTO idempotency_keys
+              (idempotency_key, request_hash, status,
+               response_payload, outbox_payload,
+               expires_at, published, claimed_at)
+            SELECT k, h, 'processing', a, o,
+                   NOW() + INTERVAL '24 hours', false, NOW()
+            FROM unnest($1::text[], $2::text[], $3::jsonb[], $4::jsonb[])
+                 AS t(k, h, a, o)
+            ON CONFLICT (idempotency_key) DO NOTHING
+            RETURNING idempotency_key
+            "#,
+        )
+        .bind(&ids)
+        .bind(&hashes)
+        .bind(&accepts)
+        .bind(&outboxes)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("PG bulk INSERT: {}", e))?
+    };
+
+    // ── 3. Conflict subset: bulk SELECT published ────────────────
+    let freshly_set: HashSet<&String> = freshly_inserted.iter().collect();
+    let conflict_keys: Vec<String> = to_process
+        .iter()
+        .filter(|(k, _)| !freshly_set.contains(k))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut already_published: HashSet<String> = HashSet::new();
+    if !conflict_keys.is_empty() {
+        let rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT idempotency_key, published
+             FROM idempotency_keys
+             WHERE idempotency_key = ANY($1)",
+        )
+        .bind(&conflict_keys)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("PG bulk SELECT published: {}", e))?;
+        for (k, p) in rows {
+            if p {
+                already_published.insert(k);
+            }
+        }
+    }
+
+    // ── 4. Publish (parallel across channel pool) ────────────────
+    let to_publish: Vec<(String, serde_json::Value)> = to_process
+        .iter()
+        .filter(|(k, _)| !already_published.contains(k))
+        .map(|(k, e)| (k.clone(), e.outbox_payload.clone()))
+        .collect();
+
+    let publish_results: Vec<(String, bool)> = stream::iter(to_publish)
+        .map(|(k, payload)| {
+            let queue = queue.clone();
+            async move {
+                let tp = payload.get("traceparent").and_then(|v| v.as_str());
+                let ok = queue.publish_traced(&payload, tp).await.is_ok();
+                (k, ok)
+            }
+        })
+        .buffer_unordered(PUBLISH_CONCURRENCY)
+        .collect()
+        .await;
+
+    let succeeded: Vec<String> = publish_results
+        .iter()
+        .filter_map(|(k, ok)| if *ok { Some(k.clone()) } else { None })
+        .collect();
+    let failed: Vec<String> = publish_results
+        .iter()
+        .filter_map(|(k, ok)| if !*ok { Some(k.clone()) } else { None })
+        .collect();
+
+    // ── 5a. Mark succeeded: published=true, lease cleared ────────
+    if !succeeded.is_empty() {
         sqlx::query(
             "UPDATE idempotency_keys
                SET published = true,
                    published_at = NOW(),
                    claimed_at = NULL,
                    updated_at = NOW()
-             WHERE idempotency_key = $1",
+             WHERE idempotency_key = ANY($1)",
         )
-        .bind(idempotency_key)
+        .bind(&succeeded)
         .execute(pool)
         .await
-        .map_err(|e| format!("PG UPDATE published: {}", e))?;
-        metrics::counter!("idempotency_redis_intake_published_total").increment(1);
+        .map_err(|e| format!("PG bulk UPDATE succeeded: {}", e))?;
+        metrics::counter!("idempotency_redis_intake_published_total")
+            .increment(succeeded.len() as u64);
     }
 
-    // 5. Release the inflight slot. LREM count=1 removes the first
-    //    matching occurrence (we only ever push one per claim).
-    cache
-        .lrem(&inflight_key(shard_idx), 1, idempotency_key)
+    // ── 5b. Failed publishes: clear lease so publish_outbox retries ─
+    if !failed.is_empty() {
+        sqlx::query(
+            "UPDATE idempotency_keys
+               SET claimed_at = NULL,
+                   updated_at = NOW()
+             WHERE idempotency_key = ANY($1)
+               AND NOT published",
+        )
+        .bind(&failed)
+        .execute(pool)
         .await
-        .map_err(|e| format!("redis LREM: {}", e))?;
+        .map_err(|e| format!("PG bulk UPDATE failed: {}", e))?;
+        metrics::counter!("idempotency_redis_intake_publish_failures_total")
+            .increment(failed.len() as u64);
+    }
+
+    // ── 6. LREM every claimed key from inflight ──────────────────
+    // succeeded ∪ failed ∪ already_published ∪ dropped (missing/garbled)
+    // = claimed_keys (the original list).
+    let _ = cache
+        .lrem_batch(&inflight_key(shard_idx), &claimed_keys)
+        .await
+        .map_err(|e| format!("redis bulk LREM: {}", e))?;
 
     Ok(())
 }

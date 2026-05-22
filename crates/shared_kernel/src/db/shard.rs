@@ -5,8 +5,18 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AppError;
+use crate::resilience::DependencyBreaker;
 
 use super::pool::DatabasePool;
+
+/// R-7 DB-breaker tuning. Threshold = 10 transient failures (well
+/// past the small per-promotion blip the retry budget is sized to
+/// absorb in `.env DB_WRITE_RETRY_*`); recovery = 30 s (covers one
+/// full typical Patroni promotion window). Hardcoded for now —
+/// promoting to `ShardRouterConfig` is trivial when an operator
+/// actually wants to tune them.
+const DB_BREAKER_FAILURE_THRESHOLD: u32 = 10;
+const DB_BREAKER_RECOVERY_SECS: u64 = 30;
 
 /// Runtime shard count, set on `ShardRouter::new` from config.
 /// Default 2 mirrors the historical const so single-binary tests
@@ -41,6 +51,11 @@ pub struct ShardRouterConfig {
 #[derive(Debug, Clone)]
 pub struct ShardRouter {
     shards: Vec<DatabasePool>,
+    /// R-7 DB breaker. One per-dependency breaker covering every
+    /// shard — a single dependency (Postgres) conceptually, even
+    /// though it is sharded. Per-shard isolation would be a refinement;
+    /// the audit's R-7 prescription names it as one `DbBreaker`.
+    db_breaker: DependencyBreaker,
 }
 
 impl ShardRouter {
@@ -68,6 +83,7 @@ impl ShardRouter {
                 &shard_urls.read_urls,
                 config.write_pool_size,
                 config.read_pool_size,
+                i,
             )
             .await
             .map_err(|e| AppError::Internal(format!("Failed to connect to shard {}: {}", i, e)))?;
@@ -81,9 +97,25 @@ impl ShardRouter {
             shards.push(pool);
         }
 
-        tracing::info!(num_shards = shards.len(), "ShardRouter initialized");
+        let db_breaker =
+            DependencyBreaker::new("db", DB_BREAKER_FAILURE_THRESHOLD, DB_BREAKER_RECOVERY_SECS);
 
-        Ok(Self { shards })
+        tracing::info!(
+            num_shards = shards.len(),
+            db_breaker_threshold = DB_BREAKER_FAILURE_THRESHOLD,
+            db_breaker_recovery_secs = DB_BREAKER_RECOVERY_SECS,
+            "ShardRouter initialized (R-7 db breaker registered)"
+        );
+
+        Ok(Self { shards, db_breaker })
+    }
+
+    /// R-7: handle to the DB dependency breaker. Call sites that
+    /// already use `retry_transient` should migrate to
+    /// `retry_transient_with_breaker(&shards.db_breaker(), ...)` to
+    /// pick up fail-fast on a known-down DB.
+    pub fn db_breaker(&self) -> &DependencyBreaker {
+        &self.db_breaker
     }
 
     /// Get the shard index for a given account. FNV-1a → modulo

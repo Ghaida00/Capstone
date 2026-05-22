@@ -1,0 +1,5 @@
+# A-4: rustfmt configuration. Empty body keeps the project on
+# the stock rustfmt defaults (which the codebase already matches);
+# the file's job is to insulate against contributor-local
+# `~/.rustfmt.toml` overrides reformatting hunks unexpectedly.
+edition = "2021"

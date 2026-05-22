@@ -31,17 +31,21 @@ Single Rust binary, deployed as two replicas behind nginx.
 flowchart LR
     Client[API client / k6] -->|HTTPS| Nginx[nginx :8080]
     Nginx --> App[Rust app x 2]
-    App -->|writes| PG[(PostgreSQL — 3 shards, primary+replica each)]
+    App -->|writes| PG[(PostgreSQL — 2 active shards, primary+replica each<br/>shard router supports 3; shard 2 disabled in compose)]
     App -->|cache| Redis[(Redis — Sentinel HA)]
     App -->|publish/consume| MQ[(RabbitMQ)]
     App -->|metrics| Prom[Prometheus → Grafana]
 ```
 
 The client speaks HTTPS to nginx, which load-balances across two
-stateless Rust replicas. The replicas share three Postgres shards
-(each a primary + replica pair under Patroni — see
-[ADR-0005](adr/0005-patroni-over-pg-auto-failover.md)), a Redis
-HA pair fronted by Sentinel, and a RabbitMQ broker.
+stateless Rust replicas. The replicas share **two active Postgres
+shards** (each a primary + replica pair under Patroni — see
+[ADR-0005](adr/0005-patroni-over-pg-auto-failover.md)); the shard
+router code supports three but the third shard is commented out
+in compose for capstone-host capacity (see
+[docker-compose.yml](../docker-compose.yml) lines 7 + 54). The
+replicas also share a Redis HA pair fronted by Sentinel and a
+RabbitMQ broker.
 
 ---
 
@@ -59,38 +63,42 @@ flowchart TB
     end
 
     subgraph Data_Plane
-        PgBouncer[pgBouncer x3<br/>one per shard]
-        HAProxy[pg-haproxy<br/>:5000-5002]
+        PgBouncer[pgBouncer x2<br/>one per active shard]
+        HAProxy[pg-haproxy<br/>:5000-5001]
         Shard0[(pg-shard0<br/>node-a + node-b)]
         Shard1[(pg-shard1<br/>node-a + node-b)]
-        Shard2[(pg-shard2<br/>node-a + node-b)]
+        Shard2[(pg-shard2<br/>node-a + node-b<br/>disabled in compose)]:::disabled
         Etcd[(etcd cluster<br/>3 nodes)]
         Redis[(Redis master + replica<br/>+ Sentinel x3)]
         Mq[(RabbitMQ)]
     end
 
+    classDef disabled stroke-dasharray:5 5,opacity:0.4
+
     Nginx --> AppA
     Nginx --> AppB
     AppA -->|reads| Shard0
     AppA -->|reads| Shard1
-    AppA -->|reads| Shard2
     AppA -->|writes| PgBouncer
     AppB -->|reads| Shard0
     AppB -->|reads| Shard1
-    AppB -->|reads| Shard2
     AppB -->|writes| PgBouncer
     PgBouncer --> HAProxy
     HAProxy -->|"GET /primary 200"| Shard0
     HAProxy -->|"GET /primary 200"| Shard1
-    HAProxy -->|"GET /primary 200"| Shard2
     Shard0 <-->|leader election| Etcd
     Shard1 <-->|leader election| Etcd
-    Shard2 <-->|leader election| Etcd
     AppA --> Redis
     AppB --> Redis
     AppA --> Mq
     AppB --> Mq
 ```
+
+> The shard-router code (`ShardRouterConfig::shards`) supports an
+> arbitrary number of shards. Shard 2 is declared in the topology but
+> its compose stanza is commented out for capstone-host capacity (see
+> [docker-compose.yml](../docker-compose.yml) lines 7 + 54). Re-enabling
+> is a single uncomment + `docker compose up -d` step.
 
 - **Writes** go through pgBouncer → HAProxy → whichever node serves
   `GET /primary 200` (see [ADR-0006](adr/0006-haproxy-primary-routing.md)).
@@ -187,12 +195,30 @@ sequenceDiagram
 
 ## 6. Cross-cutting concerns
 
-**Middleware stack** (applied uniformly to every `/api/v2/*` sub-router
-via `apply_protection_stack` in [`crates/app/src/bootstrap.rs`](../crates/app/src/bootstrap.rs)):
+**Middleware stack — request-inbound order** (this is the order a
+request hits each layer on its way to the handler; the
+[`apply_protection_stack`](../crates/app/src/bootstrap.rs) Tower
+`.layer()` calls appear in the *reverse* of this list, because each
+`.layer()` wraps the previous):
 
 ```
-auth → rate-limit → circuit-breaker → backpressure → request-id → metrics
+client request
+  ↓ TraceLayer                   (span creation, outermost)
+  ↓ TimeoutLayer + HandleError   (api_timeout_secs)
+  ↓ request_id                   (inject / echo X-Request-Id)
+  ↓ backpressure                 (concurrent-request semaphore)
+  ↓ circuit_breaker              (per-route trip on 5xx)
+  ↓ rate_limit                   (per-IP token bucket via Redis)
+  ↓ auth                         (JWT pin'd HS256, optional via ENABLE_AUTH)
+  ↓ degradation                  (R-9 write-method 503 in read_only mode)
+  ↓ metrics                      (innermost — counter + histogram)
+  ↓ handler
 ```
+
+This is the single canonical statement of middleware order in this
+repo. Per-crate READMEs link here rather than re-listing it to avoid
+the drift this doc previously carried (DOC-9 in
+[the docs audit](audit/2026-05-16-phase2-documentation.md#doc-9--middleware-order-documented-two-different-ways)).
 
 | Concern             | Where                                                               |
 |---------------------|---------------------------------------------------------------------|

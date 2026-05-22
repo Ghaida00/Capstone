@@ -26,12 +26,11 @@ struct CounterEntry {
 /// load. Power of two so the modulo compiles to an `&`.
 const SHARDS: usize = 64;
 
-/// Sharded local-counter map. The previous implementation used a single
-/// `tokio::sync::RwLock<HashMap>` taken in WRITE mode for every request
-/// — every VU serialised through one async lock, blowing latency past
-/// 1 s under 500–1000 concurrent VUs. With 64 shards of `std::sync::Mutex`
-/// the critical section (hash + insert + cmp + increment) stays inside
-/// the synchronous fast path and almost never contends.
+/// Sharded local-counter map. Each request hashes its IP to one
+/// of 64 `std::sync::Mutex<HashMap>` shards; the critical section
+/// (hash + insert + cmp + increment) runs synchronously and never
+/// holds the lock across `.await`. Contention is `1/SHARDS` of a
+/// single global lock under uniform load.
 type Shard = Mutex<HashMap<IpAddr, CounterEntry>>;
 
 /// Redis-based rate limiter with local in-memory cache.
@@ -167,17 +166,53 @@ impl RateLimiter {
             return;
         }
 
-        if let Ok(mut conn) = self.pool.get().await {
-            let mut pipe = redis::pipe();
-            for (ip, count) in &snapshot {
-                let key = format!("rl:global:{}", ip);
-                pipe.cmd("INCRBY").arg(&key).arg(*count as i64).ignore();
-                pipe.cmd("EXPIRE")
-                    .arg(&key)
-                    .arg(self.window_secs as i64)
-                    .ignore();
+        // R-6: both failure paths below were silently swallowed.
+        // When the Redis round-trip fails, every replica keeps
+        // enforcing only its LOCAL counter, so the effective
+        // global ceiling silently becomes `N × per_replica_limit`
+        // — the limiter claims to enforce a number it no longer
+        // enforces. An attacker who can keep Redis just stressed
+        // enough to fail the sync (or who waits for a Sentinel
+        // flip) gets multiplicative burst tolerance. Emit a
+        // counter + WARN on each path so the degradation is a
+        // page-able signal, not an invisible posture change.
+        let mut conn = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                metrics::counter!(
+                    "rate_limiter_redis_sync_failures_total",
+                    "kind" => "pool_get"
+                )
+                .increment(1);
+                tracing::warn!(
+                    error = %e,
+                    "rate-limit Redis sync skipped: pool acquire failed — \
+                     global ceiling degraded to per-replica until Redis recovers"
+                );
+                return;
             }
-            let _: Result<(), _> = pipe.query_async(&mut *conn).await;
+        };
+
+        let mut pipe = redis::pipe();
+        for (ip, count) in &snapshot {
+            let key = format!("rl:global:{}", ip);
+            pipe.cmd("INCRBY").arg(&key).arg(*count as i64).ignore();
+            pipe.cmd("EXPIRE")
+                .arg(&key)
+                .arg(self.window_secs as i64)
+                .ignore();
+        }
+        if let Err(e) = pipe.query_async::<()>(&mut *conn).await {
+            metrics::counter!(
+                "rate_limiter_redis_sync_failures_total",
+                "kind" => "pipeline"
+            )
+            .increment(1);
+            tracing::warn!(
+                error = %e,
+                "rate-limit Redis sync failed: pipeline query errored — \
+                 global ceiling degraded to per-replica until Redis recovers"
+            );
         }
     }
 }
@@ -209,5 +244,77 @@ pub async fn rate_limit_middleware(
             })),
         )
             .into_response()
+    }
+}
+
+// ─── Integration tests for rate_limit_middleware (T-4) ───────
+//
+// The decision logic (`RateLimiter::check`) is in-memory; only
+// the background sync task touches Redis. Tests construct a real
+// `MasterPoolHandle` from a `deadpool` pool against an
+// unreachable port (deadpool builds lazily, so the pool exists
+// but every connection attempt fails). Background sync still
+// runs but its failures are recorded on the silent-degradation
+// counter (R-6) and do not affect the on-request `check` path.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{middleware::from_fn_with_state, routing::get, Router};
+    use axum_test::TestServer;
+    use deadpool_redis::Config as RedisConfig;
+    use shared_kernel::cache::redis::MasterPoolHandle;
+
+    fn limiter_with_burst(burst: u32) -> RateLimiter {
+        // Pool builds lazily against an unreachable port; the
+        // rate-limit decision never calls .get() so this is fine.
+        let pool = RedisConfig::from_url("redis://127.0.0.1:1/")
+            .create_pool(None)
+            .expect("deadpool builds pool lazily");
+        let handle = MasterPoolHandle::from_pool(pool);
+        RateLimiter::new(handle, 1000, burst, CancellationToken::new())
+    }
+
+    fn router_under_limit(limiter: RateLimiter) -> Router {
+        Router::new()
+            .route("/x", get(|| async { "ok" }))
+            .layer(from_fn_with_state(limiter, rate_limit_middleware))
+    }
+
+    #[tokio::test]
+    async fn under_burst_allows_requests() {
+        let limiter = limiter_with_burst(5);
+        let server = TestServer::new(router_under_limit(limiter));
+        for i in 0..5 {
+            let res = server.get("/x").add_header("x-real-ip", "1.2.3.4").await;
+            assert_eq!(
+                res.status_code(),
+                StatusCode::OK,
+                "request {i} under burst should be admitted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn over_burst_returns_429_with_retry_after() {
+        let limiter = limiter_with_burst(2);
+        let server = TestServer::new(router_under_limit(limiter));
+
+        // Exhaust the burst.
+        for _ in 0..2 {
+            let res = server.get("/x").add_header("x-real-ip", "9.9.9.9").await;
+            assert_eq!(res.status_code(), StatusCode::OK);
+        }
+        // Next request from the same IP is shed with 429 + the
+        // documented `retry-after` header and the documented body.
+        let res = server.get("/x").add_header("x-real-ip", "9.9.9.9").await;
+        assert_eq!(res.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(res.header("retry-after"), "1");
+        let body: serde_json::Value = res.json();
+        assert_eq!(body["error"], "rate_limited");
+
+        // A *different* IP is on its own counter and still admitted
+        // — the per-IP isolation contract.
+        let res = server.get("/x").add_header("x-real-ip", "1.1.1.1").await;
+        assert_eq!(res.status_code(), StatusCode::OK);
     }
 }

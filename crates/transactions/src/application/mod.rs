@@ -178,6 +178,58 @@ fn validate_description(s: &str) -> Result<(), TransactionError> {
     Ok(())
 }
 
+// ─── Idempotency-key and request-hash construction ──────────
+//
+// Extracted as named helpers so the wire-shape is testable in
+// isolation (T-3 unit tests, T-2 proptest invariants). The
+// consumer agrees with the producer on these strings by reading
+// them off the outbox row; any change here must be paired with
+// a migration of pre-existing `idempotency_keys.request_hash`.
+
+/// Format of the per-(shard, reference_id) idempotency key the
+/// producer reserves and the consumer reads. The shard is part
+/// of the key so the same `reference_id` written into different
+/// shards (a legal collision under the routing function) stays
+/// distinct.
+fn idempotency_key(shard: usize, reference_id: &str) -> String {
+    format!("txn:{}:{}", shard, reference_id)
+}
+
+/// SHA-256 over the canonical field bytes with a `0xff` separator
+/// between every field. The separator forecloses adjacency-class
+/// collisions — without it, `("ab", "c")` and `("a", "bc")` would
+/// hash to the same digest. The 64-bit FNV-1a previously used
+/// here had ~2^32 keys-per-namespace birthday bound; SHA-256
+/// raises that to a level the rest of the system can rely on.
+///
+/// `amount_str` is the wire-form decimal (`Decimal::to_string`),
+/// chosen at the call site to share one canonical encoding with
+/// the queue payload — passing in the raw `Decimal` here would
+/// either double-encode or risk drift if the call site formats
+/// differently from this helper.
+fn hash_request(
+    from_account: &str,
+    to_account: &str,
+    amount_str: &str,
+    currency: &str,
+    reference_id: &str,
+    description: Option<&str>,
+) -> String {
+    let mut h = Sha256::new();
+    for part in [
+        from_account.as_bytes(),
+        to_account.as_bytes(),
+        amount_str.as_bytes(),
+        currency.as_bytes(),
+        reference_id.as_bytes(),
+        description.unwrap_or("").as_bytes(),
+    ] {
+        h.update(part);
+        h.update([0xff]);
+    }
+    format!("{:x}", h.finalize())
+}
+
 // ─── Entity → port DTO conversion ───────────────────────────
 
 fn tx_to_view(t: Transaction) -> TransactionView {
@@ -305,7 +357,7 @@ impl TransactionService for TransactionsService {
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let shard = self.shards.shard_for_account(&input.from_account);
-        let idempotency_key = format!("txn:{}:{}", shard, reference_id);
+        let idemp_key = idempotency_key(shard, &reference_id);
 
         // Canonical wire-form of the amount, computed once. Used
         // for both the request_hash bytes and the queue payload
@@ -313,33 +365,14 @@ impl TransactionService for TransactionsService {
         // string, so this is the single conversion point.
         let amount_str = input.amount.to_string();
 
-        // SHA-256 over the canonical field bytes with a 0xff
-        // separator so adjacent fields cannot be confused. The
-        // 64-bit fnv-1a previously here was vulnerable to
-        // birthday-class collisions (~2^32 keys per namespace) —
-        // a hash collision here lets a different request replay
-        // the original "accepted" response, masking a payload-
-        // tamper attack. SHA-256 closes that bypass.
-        //
-        // Hash format change is incompatible with rows produced
-        // by the old code path; the load-test fixture wipes the
-        // table between runs, but a real cutover would need a
-        // migration of existing `idempotency_keys.request_hash`.
-        let request_hash = {
-            let mut h = Sha256::new();
-            for part in [
-                input.from_account.as_bytes(),
-                input.to_account.as_bytes(),
-                amount_str.as_bytes(),
-                input.currency.as_bytes(),
-                reference_id.as_bytes(),
-                input.description.as_deref().unwrap_or("").as_bytes(),
-            ] {
-                h.update(part);
-                h.update([0xff]);
-            }
-            format!("{:x}", h.finalize())
-        };
+        let request_hash = hash_request(
+            &input.from_account,
+            &input.to_account,
+            &amount_str,
+            &input.currency,
+            &reference_id,
+            input.description.as_deref(),
+        );
 
         let accepted = TransactionAccepted {
             reference_id: reference_id.clone(),
@@ -353,7 +386,7 @@ impl TransactionService for TransactionsService {
         // consumer expects; the publish-outbox worker forwards
         // this JSONB column to the broker as-is.
         let request_id = input.request_id.clone().unwrap_or_default();
-        let outbox_payload = serde_json::json!({
+        let mut outbox_payload = serde_json::json!({
             "from_account":    input.from_account,
             "to_account":      input.to_account,
             "amount":          amount_str,
@@ -362,9 +395,15 @@ impl TransactionService for TransactionsService {
             "description":     input.description,
             "request_id":      request_id,
             "shard":           shard,
-            "idempotency_key": idempotency_key,
+            "idempotency_key": idemp_key,
             "request_hash":    request_hash,
         });
+        // `traceparent` travels with `request_id` so the consumer can
+        // parent its span under the originating HTTP request. Present
+        // only when the HTTP span had an OTel context.
+        if let Some(tp) = &input.traceparent {
+            outbox_payload["traceparent"] = serde_json::Value::String(tp.clone());
+        }
 
         // Reserve commits the response and the outbox payload in a
         // single Postgres transaction. After this returns
@@ -374,13 +413,13 @@ impl TransactionService for TransactionsService {
             .idempotency
             .reserve(
                 shard,
-                &idempotency_key,
+                &idemp_key,
                 &request_hash,
                 &response_payload,
                 &outbox_payload,
             )
             .await
-            .map_err(TransactionError::Infra)?
+            .map_err(|e| TransactionError::Infra(e.to_string()))?
         {
             ReserveOutcome::Replay(stored) => {
                 let replayed: TransactionAccepted =
@@ -398,7 +437,10 @@ impl TransactionService for TransactionsService {
         match self.repo.find_by_id(id).await {
             Ok(Some(tx)) => Ok(tx_to_view(tx)),
             Ok(None) => Err(TransactionError::NotFound(id.as_uuid().to_string())),
-            Err(msg) => Err(TransactionError::Infra(msg)),
+            // A-1: RepoError flows out via Display; pattern-matching
+            // by variant (Sqlx, Join, Serialize, Other) is now
+            // possible here when a retry/escalate policy needs it.
+            Err(e) => Err(TransactionError::Infra(e.to_string())),
         }
     }
 
@@ -407,7 +449,7 @@ impl TransactionService for TransactionsService {
             .repo
             .list(&filter)
             .await
-            .map_err(TransactionError::Infra)?;
+            .map_err(|e| TransactionError::Infra(e.to_string()))?;
         Ok(rows.into_iter().map(tx_to_view).collect())
     }
 
@@ -429,7 +471,380 @@ impl TransactionService for TransactionsService {
                 processed_at: s.processed_at,
             }),
             Ok(None) => Err(TransactionError::NotFound(reference_id.to_owned())),
-            Err(msg) => Err(TransactionError::Infra(msg)),
+            Err(e) => Err(TransactionError::Infra(e.to_string())),
+        }
+    }
+}
+
+// ─── Unit tests for pure domain helpers (T-3) ───────────────
+//
+// Each test is one assertion over a pure function. The
+// validators and the two hash/key helpers cover the DB-constraint
+// invariants (DECIMAL(18,2), VARCHAR(3), VARCHAR(100)) and the
+// wire-shape invariants the consumer reads off the outbox. A
+// regression here surfaces in <1ms instead of "k6 is flakier
+// this week" (the audit's T-3 framing).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::Decimal;
+
+    // ── validate_account ──────────────────────────────────
+
+    #[test]
+    fn validate_account_rejects_empty() {
+        assert!(validate_account("", "from_account").is_err());
+    }
+
+    #[test]
+    fn validate_account_rejects_oversize() {
+        let s = "a".repeat(MAX_ACCOUNT_LEN + 1);
+        assert!(validate_account(&s, "from_account").is_err());
+    }
+
+    #[test]
+    fn validate_account_accepts_canonical() {
+        assert!(validate_account("ACC_0000001", "from_account").is_ok());
+    }
+
+    #[test]
+    fn validate_account_rejects_leading_punctuation() {
+        for bad in ["-ACC_001", "_ACC_001", ".ACC_001"] {
+            assert!(
+                validate_account(bad, "from_account").is_err(),
+                "expected reject: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_account_rejects_trailing_punctuation() {
+        for bad in ["ACC_001-", "ACC_001_", "ACC_001."] {
+            assert!(
+                validate_account(bad, "from_account").is_err(),
+                "expected reject: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_account_rejects_non_ascii() {
+        assert!(validate_account("ACCçUNT_1", "from_account").is_err());
+    }
+
+    #[test]
+    fn validate_account_rejects_disallowed_punctuation() {
+        for bad in ["ACC@001", "ACC/001", "ACC 001", "ACC+001"] {
+            assert!(
+                validate_account(bad, "from_account").is_err(),
+                "expected reject: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_account_accepts_dotted_account_number() {
+        assert!(validate_account("4.0.0", "from_account").is_ok());
+    }
+
+    // ── validate_reference_id ─────────────────────────────
+
+    #[test]
+    fn validate_reference_id_rejects_empty() {
+        assert!(validate_reference_id("").is_err());
+    }
+
+    #[test]
+    fn validate_reference_id_rejects_oversize() {
+        let s = "a".repeat(MAX_REFERENCE_ID_LEN + 1);
+        assert!(validate_reference_id(&s).is_err());
+    }
+
+    #[test]
+    fn validate_reference_id_accepts_uuid_shape() {
+        assert!(validate_reference_id("0c8a9c4f-1ad2-4b41-9bef-1e96eb6f2d0f").is_ok());
+    }
+
+    #[test]
+    fn validate_reference_id_rejects_unicode() {
+        // NFC vs NFD ambiguity is precisely why ASCII-only is the
+        // rule; the validator is the gate.
+        assert!(validate_reference_id("ref-é").is_err());
+    }
+
+    // ── validate_amount ───────────────────────────────────
+
+    #[test]
+    fn validate_amount_rejects_zero() {
+        assert!(validate_amount(Decimal::ZERO).is_err());
+    }
+
+    #[test]
+    fn validate_amount_rejects_negative() {
+        assert!(validate_amount(Decimal::new(-100, 2)).is_err());
+    }
+
+    #[test]
+    fn validate_amount_rejects_scale_over_two() {
+        // 12.3456 has scale 4 — DB column would silently round
+        // it. Reject at the validator.
+        assert!(validate_amount(Decimal::new(123456, 4)).is_err());
+    }
+
+    #[test]
+    fn validate_amount_accepts_canonical_two_decimal() {
+        assert!(validate_amount(Decimal::new(12345, 2)).is_ok());
+    }
+
+    #[test]
+    fn validate_amount_accepts_integer_no_fraction() {
+        assert!(validate_amount(Decimal::new(100, 0)).is_ok());
+    }
+
+    #[test]
+    fn validate_amount_rejects_overflow_above_decimal_18_2() {
+        // 9_999_999_999_999_999.99 is the DB ceiling; +0.01
+        // overflows and would trip a CHECK in the consumer
+        // batch. The audit-prescribed test.
+        let max = Decimal::new(999_999_999_999_999_999_i64, 2);
+        let over = max + Decimal::new(1, 2);
+        assert!(validate_amount(over).is_err());
+    }
+
+    // ── validate_currency ─────────────────────────────────
+
+    #[test]
+    fn validate_currency_rejects_too_short() {
+        assert!(validate_currency("ID").is_err());
+    }
+
+    #[test]
+    fn validate_currency_rejects_too_long() {
+        assert!(validate_currency("IDRX").is_err());
+    }
+
+    #[test]
+    fn validate_currency_rejects_lowercase() {
+        assert!(validate_currency("idr").is_err());
+    }
+
+    #[test]
+    fn validate_currency_accepts_idr_and_usd() {
+        assert!(validate_currency("IDR").is_ok());
+        assert!(validate_currency("USD").is_ok());
+    }
+
+    // ── validate_description ──────────────────────────────
+
+    #[test]
+    fn validate_description_accepts_empty() {
+        // Empty description is legal at the column level (it is
+        // `TEXT`, nullable via the `Option<String>` in the input).
+        assert!(validate_description("").is_ok());
+    }
+
+    #[test]
+    fn validate_description_accepts_tab() {
+        // The validator carves tab out as the one allowed
+        // control char so CSV-aligned descriptions still pass.
+        assert!(validate_description("col1\tcol2").is_ok());
+    }
+
+    #[test]
+    fn validate_description_rejects_newline() {
+        assert!(validate_description("line1\nline2").is_err());
+        assert!(validate_description("line1\rline2").is_err());
+    }
+
+    #[test]
+    fn validate_description_rejects_null_byte() {
+        assert!(validate_description("hello\0world").is_err());
+    }
+
+    #[test]
+    fn validate_description_rejects_oversize() {
+        let s = "a".repeat(MAX_DESCRIPTION_LEN + 1);
+        assert!(validate_description(&s).is_err());
+    }
+
+    // ── idempotency_key + hash_request ────────────────────
+
+    #[test]
+    fn idempotency_key_is_shard_prefixed() {
+        assert_eq!(idempotency_key(0, "abc"), "txn:0:abc");
+        assert_eq!(idempotency_key(1, "abc"), "txn:1:abc");
+    }
+
+    #[test]
+    fn idempotency_key_distinguishes_shards_for_same_ref() {
+        // Same reference_id routed to different shards yields
+        // distinct keys — the design intent of putting `shard`
+        // in the key in the first place.
+        assert_ne!(idempotency_key(0, "ref"), idempotency_key(1, "ref"));
+    }
+
+    #[test]
+    fn hash_request_is_deterministic() {
+        let a = hash_request("from", "to", "10.00", "IDR", "ref", Some("d"));
+        let b = hash_request("from", "to", "10.00", "IDR", "ref", Some("d"));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hash_request_changes_with_any_field() {
+        let base = hash_request("from", "to", "10.00", "IDR", "ref", Some("d"));
+        let cases = [
+            hash_request("FROM", "to", "10.00", "IDR", "ref", Some("d")),
+            hash_request("from", "TO", "10.00", "IDR", "ref", Some("d")),
+            hash_request("from", "to", "10.01", "IDR", "ref", Some("d")),
+            hash_request("from", "to", "10.00", "USD", "ref", Some("d")),
+            hash_request("from", "to", "10.00", "IDR", "ref2", Some("d")),
+            hash_request("from", "to", "10.00", "IDR", "ref", Some("e")),
+            hash_request("from", "to", "10.00", "IDR", "ref", None),
+        ];
+        for h in cases {
+            assert_ne!(h, base, "field-mutation should change hash: got {h}");
+        }
+    }
+
+    #[test]
+    fn hash_request_disambiguates_adjacent_field_concatenation() {
+        // The 0xff separator's whole purpose: ("ab", "c") and
+        // ("a", "bc") must hash distinctly. Without the
+        // separator they collide. This is the one test that
+        // proves the separator is doing its job.
+        let a = hash_request("ab", "c", "1.00", "IDR", "ref", Some(""));
+        let b = hash_request("a", "bc", "1.00", "IDR", "ref", Some(""));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hash_request_returns_64_hex_chars() {
+        // SHA-256 hex digest is always 64 chars; if this ever
+        // changes the consumer's `request_hash` column width is
+        // wrong.
+        let h = hash_request("a", "b", "1.00", "IDR", "ref", None);
+        assert_eq!(h.len(), 64);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+}
+
+// ─── Property-based tests for financial-correctness invariants (T-2) ─
+//
+// The three audit-prescribed properties for the
+// transactions::application surface. Property tests pay off where
+// invariants are easy to state but hard to enumerate by example:
+//
+//   * `hash_request` is a collision-resistant deterministic function
+//     over the canonical input tuple. A payload-tamper attack
+//     succeeds iff this property fails.
+//   * `validate_amount` accepts iff DECIMAL(18,2) accepts. A
+//     mismatch silently rounds money on the consumer INSERT.
+//   * `idempotency_key` is injective over (shard, reference_id).
+//     A collision means two logically-distinct requests share a
+//     reservation slot and the second one replays the first one's
+//     response.
+//
+// Each property runs proptest's default of 256 cases. `_test` suffix
+// avoids macro-expansion shadow collisions with the regression
+// tests above.
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use rust_decimal::Decimal;
+
+    proptest! {
+        /// `hash_request` is injective over distinct input tuples
+        /// (collision resistance of SHA-256 + the `0xff` field
+        /// separator together). Tests the contract the audit names
+        /// as the highest-stakes financial-correctness invariant:
+        /// if two distinct payloads hash equal, the second one
+        /// replays the first one's accepted response, which is a
+        /// payload-tamper bypass.
+        ///
+        /// Strategy: two independently-drawn tuples drawn from a
+        /// space that comfortably exceeds SHA-256's birthday bound
+        /// at 256 trial pairs; collision probability is ~2^-256
+        /// per pair, so the property is empirically equivalent to
+        /// "always distinct" — a failure would mean the separator
+        /// or the field-order shifted in a way the constructor
+        /// drifted from.
+        #[test]
+        fn hash_request_distinct_inputs_distinct_outputs(
+            from1 in "[A-Z]{3}_[0-9]{4}",
+            to1   in "[A-Z]{3}_[0-9]{4}",
+            amt1  in 1_i64..1_000_000_000_i64,
+            ref1  in "[a-zA-Z0-9._-]{1,40}",
+            desc1 in "[ -~]{0,100}",
+            from2 in "[A-Z]{3}_[0-9]{4}",
+            to2   in "[A-Z]{3}_[0-9]{4}",
+            amt2  in 1_i64..1_000_000_000_i64,
+            ref2  in "[a-zA-Z0-9._-]{1,40}",
+            desc2 in "[ -~]{0,100}",
+        ) {
+            let amt1_str = Decimal::new(amt1, 2).to_string();
+            let amt2_str = Decimal::new(amt2, 2).to_string();
+            let h1 = hash_request(&from1, &to1, &amt1_str, "IDR", &ref1, Some(&desc1));
+            let h2 = hash_request(&from2, &to2, &amt2_str, "IDR", &ref2, Some(&desc2));
+            let inputs_equal =
+                from1 == from2 && to1 == to2 && amt1 == amt2 && ref1 == ref2 && desc1 == desc2;
+            if inputs_equal {
+                prop_assert_eq!(h1, h2);
+            } else {
+                prop_assert_ne!(h1, h2);
+            }
+        }
+
+        /// `validate_amount`'s decision matches the DB invariant
+        /// it gates: accept iff `amount > 0 AND scale ≤ 2 AND
+        /// amount ≤ DECIMAL(18,2) max`. A mismatch on the scale
+        /// edge silently rounds money on the consumer's
+        /// DECIMAL(18,2) INSERT; a mismatch on the overflow edge
+        /// trips a runtime CHECK and aborts the whole batch.
+        ///
+        /// Strategy: mantissa bounded so the only way to overflow
+        /// the DB max is via the scale itself, keeping the rule
+        /// crisp on every drawn input.
+        #[test]
+        fn validate_amount_matches_db_constraint(
+            mantissa in 1_i64..=1_000_000_000_000_000_000_i64,
+            scale in 0_u32..=4_u32,
+        ) {
+            let amt = Decimal::new(mantissa, scale);
+            let max = Decimal::new(999_999_999_999_999_999_i64, 2);
+            let should_reject = scale > 2 || amt > max;
+            let res = validate_amount(amt);
+            if should_reject {
+                prop_assert!(res.is_err(), "expected Err for {amt} (scale={scale})");
+            } else {
+                prop_assert!(res.is_ok(), "expected Ok for {amt} (scale={scale})");
+            }
+        }
+
+        /// `idempotency_key(shard, ref)` is injective. The format
+        /// `txn:{shard}:{ref}` is injective regardless of what's
+        /// in `ref` because `shard` is rendered as an integer
+        /// (cannot contain `:` or be empty), so the two `:` in
+        /// the format mark unambiguous field boundaries — every
+        /// distinct `(shard, ref)` pair therefore produces a
+        /// distinct key. Property pins that for any later
+        /// refactor (e.g. dropping the prefix, swapping the
+        /// separator) that would silently break it.
+        #[test]
+        fn idempotency_key_injective(
+            shard1 in 0_usize..1024,
+            shard2 in 0_usize..1024,
+            ref1   in "[ -~]{1,80}",
+            ref2   in "[ -~]{1,80}",
+        ) {
+            let k1 = idempotency_key(shard1, &ref1);
+            let k2 = idempotency_key(shard2, &ref2);
+            if shard1 == shard2 && ref1 == ref2 {
+                prop_assert_eq!(k1, k2);
+            } else {
+                prop_assert_ne!(k1, k2);
+            }
         }
     }
 }

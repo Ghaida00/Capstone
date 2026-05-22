@@ -1,0 +1,26 @@
+# S-7 — cargo-audit configuration read by both `cargo audit` (run
+# locally + from `make check` / `cargo audit`) and the
+# `rustsec/audit-check@v2` GitHub Action in `.github/workflows/ci.yml`.
+#
+# This file mirrors the `[advisories]` block in `deny.toml`. They
+# are kept in sync deliberately: cargo-audit and cargo-deny consume
+# different config files but the policy must match, otherwise a
+# new advisory would pass one gate and fail the other.
+
+[advisories]
+# RUSTSEC-2023-0071 — `rsa` "Marvin Attack" timing sidechannel.
+# No upstream fix available. Pulled transitively by `sqlx-postgres`
+# for Postgres password authentication. Our Postgres traffic flows
+# over the Docker bridge / pgBouncer (no public-internet exposure
+# for the auth path), and our TLS stack is rustls-only (the `rsa`
+# crate is not on the TLS hot path). The same disposition is used
+# by sqlx itself and the wider Rust ecosystem.
+#
+# Re-evaluate when:
+#   * the `rsa` crate publishes a fix (track RUSTSEC-2023-0071), OR
+#   * sqlx-postgres swaps in a constant-time alternative, OR
+#   * the deployment moves Postgres connections off a trusted
+#     network (e.g. talking to a managed Postgres over the
+#     internet), in which case the risk profile changes and this
+#     ignore should be removed.
+ignore = ["RUSTSEC-2023-0071"]

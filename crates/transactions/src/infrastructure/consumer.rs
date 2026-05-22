@@ -1,27 +1,33 @@
 //! RabbitMQ batch consumer for the `transactions` write path.
 //!
-//! Phase-2 follow-up (Step A in `docs/architecture/cutover-readiness.md`):
-//! the consumer was moved out of `crates/app/src/queue/consumer.rs` so the
-//! `transactions` crate now owns its full write path
-//! (HTTP handler → service → producer → consumer → DB write).
+//! Owns the consumer side of `HTTP handler → service → producer
+//! → consumer → DB write`. The consumer pulls messages from
+//! `transactions.process`, buffers them up to `BATCH_SIZE`, and
+//! flushes either when the buffer fills or when `BATCH_FLUSH_MS`
+//! elapses — whichever comes first.
 //!
-//! Idempotency-key shape (`txn:{shard}:{reference_id}`) and the
-//! `transactions.committed` event contract are preserved from the
-//! pre-move implementation — v1-published in-flight messages still
-//! match v2-reserved keys.
+//! Idempotency key shape: `txn:{shard}:{reference_id}`. The
+//! `transactions.committed` event contract is the same shape the
+//! notifications module consumes via the shared-kernel event bus.
 //!
-//! Bleed-stop bundle (this rewrite): restored in-tx idempotency
-//! check, re-derives the destination shard from `from_account`
-//! (drops trust in the wire-supplied `shard` field), bulk INSERTs
-//! moved INTO the same tx as debit/credit (atomic), `processed_at`
-//! set on failed rows, same-shard credit failures roll back via
-//! atomic refund within the tx, ACKs are per-tag (`multiple=false`)
-//! to prevent cumulative-tag races between concurrent flushes,
-//! empty-batch ACK guarded against `delivery_tag=0`, cross-shard
-//! credits run in parallel post-commit.
+//! Money-safety invariants:
 //!
-//! Cross-shard credit failure remains best-effort + metric; the
-//! outbox-table fix lives in a follow-up bundle.
+//!   * The shard for a message is derived from `from_account`
+//!     locally; the wire-supplied `shard` field (if any) is
+//!     ignored — preventing a buggy or malicious producer from
+//!     routing a debit to the wrong shard.
+//!   * Idempotency check, debit, credit, and audit-row insert
+//!     all run inside ONE per-shard transaction. A same-shard
+//!     credit failure rolls back the debit atomically.
+//!   * Failed rows carry `processed_at` so dashboards can
+//!     measure end-to-end-to-terminal latency.
+//!   * ACKs are per-tag (`multiple=false`) — cumulative-tag
+//!     races between concurrent flushes can't lose a tag.
+//!   * Empty-batch ACK is guarded against `delivery_tag=0`
+//!     (an AMQP protocol error).
+//!   * Cross-shard credits run in parallel post-commit and use
+//!     the durable-outbox pattern (`cross_shard_outbox` table)
+//!     for retries; see `cross_shard_processor.rs`.
 
 use amqprs::{
     callbacks::DefaultConnectionCallback,
@@ -30,14 +36,17 @@ use amqprs::{
     consumer::AsyncConsumer,
     BasicProperties, Deliver,
 };
-use shared_kernel::queue::callback::ConsumerChannelCallback;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use shared_kernel::queue::callback::ConsumerChannelCallback;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use shared_kernel::db::shard::ShardRouter;
@@ -46,13 +55,34 @@ use shared_kernel::events::{Event, EventPublisher, EVENT_TRANSACTIONS_COMMITTED}
 
 const QUEUE_NAME: &str = "transactions.process";
 const CONSUMER_TAG: &str = "peakload-consumer";
-const BATCH_SIZE: usize = 100;
-/// Maximum time a partial batch waits in the buffer before being
-/// flushed to PG. Caps the average status-reflection latency at
-/// `BATCH_FLUSH_MS / 2` for any single message that doesn't fill
-/// a full batch on its own. The value is the dominant tunable for
-/// the 202-to-`completed` window.
-const BATCH_FLUSH_MS: u64 = 50;
+/// Maximum messages buffered before a size-flush triggers. Raised
+/// from 100 to 200 in Phase 2: per-batch overhead collapsed to a
+/// single `apply_transactions_batch` function call, so larger
+/// batches amortise fixed cost over more messages without a
+/// proportional rise in per-batch wall time. The AMQP prefetch
+/// derives from this value (`basic_qos(0, BATCH_SIZE as u16, …)`),
+/// so the broker delivers up to 200 unacked messages per consumer
+/// — within pgbouncer's `MAX_DB_CONNECTIONS = 200`.
+const BATCH_SIZE: usize = 200;
+/// Maximum time a partial batch waits in the buffer with no new
+/// arrival before the timer flushes it. Under sustained load the
+/// idle window never opens (messages arrive every few ms), so the
+/// size-flush at `BATCH_SIZE` dominates — bigger batches, higher
+/// throughput. When inflow pauses, the last partial batch flushes
+/// after this window, bounding straggler status-reflection latency
+/// at roughly `IDLE_FLUSH_MS` for the slowest message.
+///
+/// Why this is larger than the previous fixed `BATCH_FLUSH_MS = 50`:
+/// at 50ms the timer fired before the buffer could accumulate (~7
+/// messages per consumer × 50ms), so per-shard batches averaged 2.1
+/// instead of the configured cap of 100, and per-tx overhead was
+/// amortised over almost nothing. See the 2026-05-21 throughput
+/// design doc.
+const IDLE_FLUSH_MS: u64 = 250;
+/// How often the timer wakes up to evaluate `should_idle_flush`.
+/// Decoupled from `IDLE_FLUSH_MS` so cancellation still drains
+/// promptly (the `select!` polls cancellation on the same cadence).
+const CHECK_INTERVAL_MS: u64 = 50;
 
 /// Wire-shape DTO for the queue message. Owned by the consumer
 /// because it represents the format the producer writes — the
@@ -108,6 +138,13 @@ struct QueuePayload {
     description: Option<String>,
     #[serde(default)]
     request_id: String,
+    /// W3C `traceparent` also rides the JSON payload (it crosses the
+    /// storage hop there). The active parent context is reconstructed
+    /// from the AMQP headers in `consume`, so this field is accepted
+    /// for wire-shape completeness but not read directly.
+    #[serde(default)]
+    #[allow(dead_code)]
+    traceparent: Option<String>,
 }
 
 /// Per-batch ACK/NACK ledger returned by `flush_batch_to_shards`.
@@ -238,11 +275,14 @@ pub async fn start_consumer(
 
     let shared_channel = Arc::new(channel);
 
+    let last_arrival_ms = Arc::new(AtomicU64::new(0));
     let consumer = BatchTransactionConsumer {
         shard_router: shard_router.clone(),
         buffer: Arc::new(Mutex::new(Vec::with_capacity(BATCH_SIZE))),
         channel: shared_channel.clone(),
         events: events.clone(),
+        spawned: Arc::new(Mutex::new(JoinSet::new())),
+        last_arrival_ms: last_arrival_ms.clone(),
     };
 
     // Spawn flush timer — respects the cancellation token, drains
@@ -252,16 +292,31 @@ pub async fn start_consumer(
     let timer_channel = shared_channel.clone();
     let timer_events = events.clone();
     let flush_cancel = cancel.clone();
+    let timer_last_arrival = last_arrival_ms.clone();
     let timer_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(tokio::time::Duration::from_millis(BATCH_FLUSH_MS)) => {
-                    let batch = drain_buffer(&buffer_ref).await;
-                    if !batch.is_empty() {
-                        let report = flush_batch_to_shards(&batch, &router_ref).await;
-                        apply_acks(&timer_channel, &report, "timer-flush").await;
-                        record_batch_metrics(&report);
-                        publish_committed_events(&report.successful, &timer_events);
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(CHECK_INTERVAL_MS)) => {
+                    // Debounce: only flush when the buffer has been
+                    // idle for IDLE_FLUSH_MS. Under sustained load
+                    // arrivals keep landing inside the window and the
+                    // size-flush in `consume()` wins; we never enter
+                    // this branch's drain. During quiet periods the
+                    // last partial batch ships after the idle window.
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let buf_len = buffer_ref.lock().await.len();
+                    let last = timer_last_arrival.load(Ordering::Relaxed);
+                    if should_idle_flush(buf_len, last, now_ms, IDLE_FLUSH_MS) {
+                        let batch = drain_buffer(&buffer_ref).await;
+                        if !batch.is_empty() {
+                            let report = flush_batch_to_shards(&batch, &router_ref).await;
+                            apply_acks(&timer_channel, &report, "idle-flush").await;
+                            record_batch_metrics(&report);
+                            publish_committed_events(&report.successful, &timer_events);
+                        }
                     }
                 }
                 _ = flush_cancel.cancelled() => {
@@ -319,6 +374,28 @@ pub async fn start_consumer(
     });
 
     Ok(handle)
+}
+
+/// Decide whether the timer should flush a partial batch.
+///
+/// Returns true when the buffer has at least one message AND no new
+/// arrival has landed for `idle_threshold_ms`. Under sustained load
+/// the idle window never opens (messages arrive every few ms), so
+/// the size-flush at `BATCH_SIZE` dominates and batches reach their
+/// configured cap. When inflow stops or pauses, the last partial
+/// batch flushes after a bounded idle window — bounding straggler
+/// latency without capping throughput.
+///
+/// `saturating_sub` defends against `last_arrival_ms > now_ms`
+/// (initial zero state, NTP step, clock skew) — that case is
+/// treated as "just arrived", not "very old".
+fn should_idle_flush(
+    buf_len: usize,
+    last_arrival_ms: u64,
+    now_ms: u64,
+    idle_threshold_ms: u64,
+) -> bool {
+    buf_len > 0 && now_ms.saturating_sub(last_arrival_ms) >= idle_threshold_ms
 }
 
 async fn drain_buffer(buffer: &Arc<Mutex<Vec<PendingMessage>>>) -> Vec<PendingMessage> {
@@ -389,7 +466,11 @@ fn record_batch_metrics(report: &FlushReport) {
     let acked = report.ack_count();
     if acked > 0 {
         metrics::counter!("transactions_processed_total").increment(acked as u64);
-        metrics::histogram!("transactions_batch_size").record(acked as f64);
+        // transactions_batch_size moved to flush_batch_to_shards
+        // (O-10): it now carries a `shard` label and is recorded
+        // per shard, so a summed/aggregate distribution is still
+        // recoverable in PromQL (`histogram_quantile` without the
+        // shard label) while a per-shard P95 also becomes plottable.
     }
     if !report.failed_tags.is_empty() {
         metrics::counter!("transactions_failed_total").increment(report.failed_tags.len() as u64);
@@ -416,6 +497,22 @@ struct BatchTransactionConsumer {
     /// row so subscribers (`notifications`, future `analytics`) can
     /// react without coupling to this module.
     events: Arc<dyn EventPublisher>,
+    /// A-3: holds the JoinHandles of size-flush tasks the consumer
+    /// fires off. `consume()` cannot await flush directly (amqprs
+    /// serialises the per-consumer call, so awaiting would wedge
+    /// the AMQP read loop) — but dropping the JoinHandle silently
+    /// loses panic observability and gives the orchestrator no
+    /// way to know about leaked work. The JoinSet keeps panics
+    /// visible (`background_task_panics_total`) and lets shutdown
+    /// drain by `join_all`-ing.
+    spawned: Arc<Mutex<JoinSet<()>>>,
+    /// Wall-clock millis of the most recent buffer push. Read by
+    /// the flush-timer to decide whether the buffer has been idle
+    /// long enough to flush a partial batch (`should_idle_flush`).
+    /// Updated in `consume()` after each push. Relaxed ordering is
+    /// fine: the timer's idle-check tolerates a slightly stale read
+    /// (it will just re-check on the next tick).
+    last_arrival_ms: Arc<AtomicU64>,
 }
 
 #[async_trait]
@@ -424,10 +521,28 @@ impl AsyncConsumer for BatchTransactionConsumer {
         &mut self,
         _channel: &amqprs::channel::Channel,
         deliver: Deliver,
-        _basic_properties: BasicProperties,
+        basic_properties: BasicProperties,
         content: Vec<u8>,
     ) {
         let delivery_tag = deliver.delivery_tag();
+
+        // Reconstruct the originating HTTP request's trace context
+        // from the AMQP headers (set by `publish_traced`) so this
+        // span is parented under it — one trace spans HTTP -> storage
+        // -> worker -> AMQP -> consumer. Absent header => a fresh
+        // (root) context, preserving prior behaviour.
+        let parent_cx = basic_properties
+            .headers()
+            .map(shared_kernel::queue::trace_propagation::extract_parent_context)
+            .unwrap_or_default();
+        let span = tracing::info_span!(
+            "amqp.consume",
+            messaging.system = "rabbitmq",
+            messaging.destination = %deliver.routing_key(),
+            request_id = tracing::field::Empty,
+        );
+        let _ = span.set_parent(parent_cx);
+        let _span_guard = span.enter();
 
         let payload: QueuePayload = match serde_json::from_slice(&content) {
             Ok(p) => p,
@@ -441,6 +556,8 @@ impl AsyncConsumer for BatchTransactionConsumer {
                 return;
             }
         };
+
+        tracing::Span::current().record("request_id", payload.request_id.as_str());
 
         // Defense-in-depth: the producer always supplies a
         // reference_id (UUID fallback). A NULL on the wire would
@@ -482,6 +599,16 @@ impl AsyncConsumer for BatchTransactionConsumer {
             });
             should_flush = buf.len() >= BATCH_SIZE;
         }
+        // Stamp arrival time AFTER the buffer push so the timer's
+        // idle-check (which also drains under the buffer mutex) sees
+        // a consistent "buffer has content AND was recently touched"
+        // window. Relaxed is sufficient — the timer tolerates stale
+        // reads, it will retry on the next tick.
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_arrival_ms.store(now_ms, Ordering::Relaxed);
 
         if should_flush {
             let batch = drain_buffer(&self.buffer).await;
@@ -502,12 +629,33 @@ impl AsyncConsumer for BatchTransactionConsumer {
             let router = self.shard_router.clone();
             let channel = self.channel.clone();
             let events = self.events.clone();
-            tokio::spawn(async move {
+            // A-3: track every size-flush spawn in the JoinSet so a
+            // panic is observable (counter + log) rather than
+            // silently dropped by the default panic hook. Drain
+            // completed tasks each call so the JoinSet does not
+            // grow unbounded.
+            let mut spawned = self.spawned.lock().await;
+            spawned.spawn(async move {
                 let report = flush_batch_to_shards(&batch, &router).await;
                 apply_acks(&channel, &report, "size-flush").await;
                 record_batch_metrics(&report);
                 publish_committed_events(&report.successful, &events);
             });
+            while let Some(res) = spawned.try_join_next() {
+                if let Err(e) = res {
+                    if e.is_panic() {
+                        metrics::counter!(
+                            "background_task_panics_total",
+                            "task" => "consumer_size_flush"
+                        )
+                        .increment(1);
+                        tracing::error!(
+                            error = ?e,
+                            "consumer size-flush task panicked (A-3 made this observable)"
+                        );
+                    }
+                }
+            }
         }
         // No individual ACK here — messages stay unacknowledged
         // until the batch is flushed (either by size threshold above
@@ -561,6 +709,21 @@ async fn flush_batch_to_shards(batch: &[PendingMessage], router: &ShardRouter) -
                     failed_tags,
                     skipped_tags,
                 } = outcome;
+                // O-10: per-shard batch-size distribution. Recorded
+                // here (not in record_batch_metrics) because the
+                // aggregated FlushReport has already merged every
+                // shard's outcome — the `shard` label can only be
+                // attached while the per-shard ShardOutcome is still
+                // in hand. Ack count mirrors FlushReport::ack_count
+                // (completed + failed + skipped are all ACKed).
+                let shard_acked = completed.len() + failed_tags.len() + skipped_tags.len();
+                if shard_acked > 0 {
+                    metrics::histogram!(
+                        "transactions_batch_size",
+                        "shard" => sender_shard.to_string()
+                    )
+                    .record(shard_acked as f64);
+                }
                 report
                     .successful_tags
                     .extend(completed.iter().map(|m| m.delivery_tag));
@@ -579,6 +742,19 @@ async fn flush_batch_to_shards(batch: &[PendingMessage], router: &ShardRouter) -
                 let pool = router.writer(sender_shard).clone();
                 let split =
                     process_messages_individually(&pool, sender_shard, &messages, router).await;
+                // O-10: poison-fallback path still ACKs the
+                // completed/failed/skipped split — record its
+                // per-shard size too so the histogram is not
+                // silently missing the fallback batches.
+                let split_acked =
+                    split.completed.len() + split.failed_tags.len() + split.skipped_tags.len();
+                if split_acked > 0 {
+                    metrics::histogram!(
+                        "transactions_batch_size",
+                        "shard" => sender_shard.to_string()
+                    )
+                    .record(split_acked as f64);
+                }
                 report
                     .successful_tags
                     .extend(split.completed.iter().map(|m| m.delivery_tag));
@@ -627,39 +803,26 @@ struct ShardOutcome {
     skipped_tags: Vec<u64>,
 }
 
-/// Tx structure (atomic on `pool`):
+/// Apply one shard's batch via the `apply_transactions_batch`
+/// PL/pgSQL function — a single round-trip that runs the per-row
+/// claim / debit / credit / refund / outbox sequence server-side.
 ///
-/// 1. **Claim slots** — bulk INSERT a placeholder row (status='pending',
-///    processed_at=NOW()) for every message, `ON CONFLICT (reference_id,
-///    from_account) DO NOTHING RETURNING id, reference_id, from_account`.
-///    Messages whose key was already inserted by a prior batch (or a
-///    concurrent batch racing this one) lose the claim and are reported
-///    as `skipped` — they ARE NOT debited again.
-/// 2. For each message that won the claim:
-///    a. UPDATE balance debit (atomic check-and-decrement).
-///    b. If debit matched zero rows: mark message 'failed', continue.
-///    c. If receiver lives on this shard: UPDATE balance credit. If
-///    credit matched zero rows (recipient missing): refund the
-///    sender atomically within this tx, mark message 'failed'.
-///    d. Else: queue an outbox row for the cross-shard processor.
-/// 3. Bulk INSERT outbox rows (in tx).
-/// 4. Bulk UPDATE the placeholder transactions rows to terminal
-///    ('completed' or 'failed') status.
-/// 5. tx.commit().
+/// The function returns one `(idx, outcome, assigned_id)` row per
+/// input message; this fn marshals the batch into the function's
+/// array arguments and maps the outcomes onto `ShardOutcome`.
+/// `idx` is 1-based (PL/pgSQL `FOR i IN 1..n`).
 ///
-/// Why insert-first rather than the previous SELECT-then-UPDATE:
-/// the dedupe SELECT runs at READ COMMITTED snapshot time, so two
-/// concurrent batches racing on the same `(reference_id, from_account)`
-/// could both see "no row exists", both proceed to debit, and only
-/// one INSERT survive `ON CONFLICT DO NOTHING`. The losing batch's
-/// debit became silent money loss. INSERT-first turns the
-/// `(reference_id, from_account)` UNIQUE constraint into the
-/// serialisation point: only the writer that successfully inserts
-/// the placeholder owns the slot for the rest of the tx.
+/// Outcome semantics, preserved from the previous per-statement
+/// Rust loop: a debit checks the running balance (two debits from
+/// one `from_account` in a batch see each other's effects); a
+/// same-shard credit miss refunds the sender atomically; a
+/// cross-shard row queues a `cross_shard_outbox` row in the same
+/// transaction and leaves the sender row 'processing'.
 ///
-/// On any DB error before commit the whole batch returns Err. The
-/// caller decides per-error class whether to requeue or fall back
-/// to a per-message retry that isolates the bad row.
+/// On any DB error — including a poison row that aborts the
+/// function and rolls back the tx — the whole batch returns Err;
+/// the caller (`flush_batch_to_shards`) falls back to a per-message
+/// retry that isolates the bad row.
 async fn process_shard_batch(
     pool: &sqlx::PgPool,
     sender_shard: usize,
@@ -678,175 +841,116 @@ async fn process_shard_batch(
         });
     }
 
-    let mut tx = pool.begin().await?;
-
-    // Claim the (reference_id, from_account) slot up front. The
-    // returned map covers ONLY the messages whose row was actually
-    // inserted; everything else lost the claim race and is an
-    // idempotent skip.
-    let claimed: std::collections::HashMap<(String, String), Uuid> =
-        bulk_claim_slots(&mut tx, messages).await?;
-
-    let mut completed_msgs: Vec<PendingMessage> = Vec::with_capacity(messages.len());
-    let mut failed_msgs: Vec<PendingMessage> = Vec::new();
-    // Cross-shard rows: sender-side audit row stays at 'processing'
-    // until `cross_shard_processor` confirms the credit landed on
-    // the receiver. Marking these 'completed' at sender commit time
-    // would surface a "completed" status to clients during the
-    // 250 ms+ window before the cross-shard apply runs, even though
-    // the recipient has not been credited yet.
-    let mut processing_msgs: Vec<PendingMessage> = Vec::new();
-    // (msg, receiver_shard) — outbox rows queued for cross-shard credit.
-    let mut cross_shard_outbox: Vec<(PendingMessage, usize)> = Vec::new();
-    // Intra-batch dedupe: ON CONFLICT DO NOTHING returns one
-    // placeholder per key, so without this two messages sharing
-    // (ref_id, from) would both look up the same id and double-debit.
-    let mut consumed: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::new();
+    // Marshal the batch into the function's array arguments. UUIDs
+    // for transactions.id and cross_shard_outbox.id are generated
+    // here so the function needs no pgcrypto / gen_random_uuid.
+    // Messages with a NULL reference_id are rejected to DLQ by the
+    // consume() callback before reaching this loop; defense-in-depth
+    // skips any that slip through, and the kept subset stays
+    // index-aligned with `owned` below.
+    let n = messages.len();
+    let mut ids: Vec<Uuid> = Vec::with_capacity(n);
+    let mut outbox_ids: Vec<Uuid> = Vec::with_capacity(n);
+    let mut from_accounts: Vec<String> = Vec::with_capacity(n);
+    let mut to_accounts: Vec<String> = Vec::with_capacity(n);
+    let mut amounts: Vec<Decimal> = Vec::with_capacity(n);
+    let mut currencies: Vec<String> = Vec::with_capacity(n);
+    let mut reference_ids: Vec<String> = Vec::with_capacity(n);
+    let mut descriptions: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut receiver_shards: Vec<i32> = Vec::with_capacity(n);
+    let mut owned: Vec<&PendingMessage> = Vec::with_capacity(n);
 
     for msg in messages {
         let ref_id = match msg.request.reference_id.as_deref() {
             Some(r) => r.to_string(),
-            // The `consume` callback rejects messages with a NULL
-            // reference_id to DLQ before they ever land in the
-            // buffer; defense-in-depth — skip this row.
             None => {
                 skipped_tags.push(msg.delivery_tag);
                 continue;
             }
         };
-        let key = (ref_id, msg.request.from_account.clone());
-        let assigned_id = match claimed.get(&key) {
-            Some(id) => *id,
-            None => {
-                tracing::debug!(
-                    reference_id = %key.0,
-                    from_account = %key.1,
-                    "Skipping already-claimed message (idempotent redelivery)"
+        ids.push(Uuid::new_v4());
+        outbox_ids.push(Uuid::new_v4());
+        from_accounts.push(msg.request.from_account.clone());
+        to_accounts.push(msg.request.to_account.clone());
+        amounts.push(msg.request.amount);
+        currencies.push(msg.request.currency.clone());
+        reference_ids.push(ref_id);
+        descriptions.push(msg.request.description.clone());
+        receiver_shards.push(router.shard_for_account(&msg.request.to_account) as i32);
+        owned.push(msg);
+    }
+
+    if owned.is_empty() {
+        return Ok(ShardOutcome {
+            completed,
+            failed_tags,
+            skipped_tags,
+        });
+    }
+
+    // Single round-trip: the function loops server-side and returns
+    // one row per input. It runs in the connection's implicit
+    // transaction; a poison row aborts it, sqlx surfaces the error,
+    // and `flush_batch_to_shards` routes the whole batch into the
+    // per-message poison-fallback (`process_messages_individually`).
+    let outcomes: Vec<(i32, String, Option<Uuid>)> = sqlx::query_as(
+        r#"SELECT idx, outcome, assigned_id
+           FROM apply_transactions_batch(
+               $1::uuid[], $2::uuid[], $3::text[], $4::text[],
+               $5::numeric[], $6::text[], $7::text[], $8::text[],
+               $9::int[], $10::int
+           )"#,
+    )
+    .bind(&ids)
+    .bind(&outbox_ids)
+    .bind(&from_accounts)
+    .bind(&to_accounts)
+    .bind(&amounts)
+    .bind(&currencies)
+    .bind(&reference_ids)
+    .bind(&descriptions)
+    .bind(&receiver_shards)
+    .bind(sender_shard as i32)
+    .fetch_all(pool)
+    .await?;
+
+    for (idx_one_based, outcome, assigned_id) in outcomes {
+        // PL/pgSQL `FOR i IN 1..n` yields idx starting at 1.
+        let i = match (idx_one_based as usize).checked_sub(1) {
+            Some(i) if i < owned.len() => i,
+            _ => {
+                tracing::error!(
+                    idx = idx_one_based,
+                    "apply_transactions_batch returned out-of-range idx"
                 );
-                skipped_tags.push(msg.delivery_tag);
                 continue;
             }
         };
-        if !consumed.insert(key.clone()) {
-            tracing::debug!(
-                reference_id = %key.0,
-                from_account = %key.1,
-                "Skipping intra-batch duplicate"
-            );
-            metrics::counter!("transactions_intra_batch_dupes_total").increment(1);
-            skipped_tags.push(msg.delivery_tag);
-            continue;
-        }
-
-        let mut owned = msg.clone();
-        owned.id = Some(assigned_id);
-
-        // Debit sender: atomic check-and-decrement against an
-        // active row. The `status = 'active'` predicate is what
-        // closes the bug where the API layer's `verify_from_account`
-        // is OFF and an inactive/blocked sender's tx would otherwise
-        // be silently debited.
-        let updated = sqlx::query(
-            "UPDATE users SET balance = balance - $1 \
-             WHERE account_number = $2 AND balance >= $1 AND status = 'active'",
-        )
-        .bind(owned.request.amount)
-        .bind(&owned.request.from_account)
-        .execute(&mut *tx)
-        .await?;
-
-        if updated.rows_affected() == 0 {
-            // Insufficient balance OR sender missing — both surface
-            // here as a no-op debit. Persist as 'failed'.
-            failed_msgs.push(owned);
-            continue;
-        }
-
-        // Credit recipient. Filter on `status = 'active'` so a
-        // blocked/inactive recipient is treated the same as a
-        // missing one — refund the sender and mark failed rather
-        // than crediting funds to an account that can't transact.
-        let receiver_shard = router.shard_for_account(&owned.request.to_account);
-        if receiver_shard == sender_shard {
-            let credited = sqlx::query(
-                "UPDATE users SET balance = balance + $1 \
-                 WHERE account_number = $2 AND status = 'active'",
-            )
-            .bind(owned.request.amount)
-            .bind(&owned.request.to_account)
-            .execute(&mut *tx)
-            .await?;
-
-            if credited.rows_affected() == 0 {
-                // Recipient missing or not active on this shard.
-                // Compensate the sender's debit atomically within
-                // the same tx so money is never lost. Mark
-                // message 'failed'.
-                tracing::warn!(
-                    from = %owned.request.from_account,
-                    to = %owned.request.to_account,
-                    "same-shard credit hit no row, refunding sender"
-                );
-                metrics::counter!("same_shard_credit_missing_total").increment(1);
-                sqlx::query("UPDATE users SET balance = balance + $1 WHERE account_number = $2")
-                    .bind(owned.request.amount)
-                    .bind(&owned.request.from_account)
-                    .execute(&mut *tx)
-                    .await?;
-                failed_msgs.push(owned);
-                continue;
+        let src = owned[i];
+        match outcome.as_str() {
+            // Same-shard 'completed' and cross-shard 'processing'
+            // are both durably committed and both ACK at the
+            // consumer. publish_committed_events emits one
+            // transactions.committed per row so the cache
+            // invalidator DELs stale keys; the cross-shard
+            // processor emits a second one when it flips
+            // 'processing' -> 'completed'.
+            "completed" | "processing" => {
+                let mut m = src.clone();
+                m.id = assigned_id;
+                completed.push(m);
             }
-            completed_msgs.push(owned);
-        } else {
-            // Cross-shard credit deferred to outbox row written
-            // INSIDE this tx — atomic with the debit. The sender
-            // audit row commits as 'processing' and is flipped to
-            // 'completed' by `cross_shard_processor` only after the
-            // receiver shard's credit lands.
-            cross_shard_outbox.push((owned.clone(), receiver_shard));
-            processing_msgs.push(owned);
+            "failed" => failed_tags.push(src.delivery_tag),
+            "skipped" => skipped_tags.push(src.delivery_tag),
+            other => {
+                tracing::error!(
+                    outcome = other,
+                    "apply_transactions_batch returned unknown outcome — treating as skipped"
+                );
+                skipped_tags.push(src.delivery_tag);
+            }
         }
     }
-
-    // Insert outbox rows in same tx as debit.
-    if !cross_shard_outbox.is_empty() {
-        let outbox_refs: Vec<(&PendingMessage, usize)> =
-            cross_shard_outbox.iter().map(|(m, s)| (m, *s)).collect();
-        bulk_insert_outbox(&mut tx, &outbox_refs).await?;
-    }
-
-    // ─── Promote placeholder rows from 'pending' ────────────
-    // Same-shard outcomes are terminal here ('completed' /
-    // 'failed'). Cross-shard rows go to the non-terminal
-    // 'processing' state — `cross_shard_processor` flips them to
-    // 'completed' once the receiver-shard credit lands, or to
-    // 'reversed' on the recipient-missing refund path.
-    if !failed_msgs.is_empty() {
-        bulk_update_status(&mut tx, &failed_msgs, "failed").await?;
-        for msg in &failed_msgs {
-            failed_tags.push(msg.delivery_tag);
-        }
-    }
-
-    if !completed_msgs.is_empty() {
-        bulk_update_status(&mut tx, &completed_msgs, "completed").await?;
-        completed.extend(completed_msgs);
-    }
-
-    if !processing_msgs.is_empty() {
-        bulk_update_status(&mut tx, &processing_msgs, "processing").await?;
-        // Both same-shard 'completed' and cross-shard 'processing'
-        // rows are durably committed at this point. Publish the
-        // `transactions.committed` event for both so the cache
-        // invalidator DELs the per-id / per-status keys; clients
-        // who poll status during the cross-shard window then read
-        // the truthful 'processing' state from the DB instead of a
-        // stale cached value.
-        completed.extend(processing_msgs);
-    }
-
-    tx.commit().await?;
 
     Ok(ShardOutcome {
         completed,
@@ -906,156 +1010,6 @@ struct ShardSplit {
     requeue_tags: Vec<u64>,
 }
 
-async fn bulk_insert_outbox(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    rows: &[(&PendingMessage, usize)],
-) -> Result<(), AppError> {
-    let n = rows.len();
-    let mut ids: Vec<Uuid> = Vec::with_capacity(n);
-    let mut from_accounts: Vec<String> = Vec::with_capacity(n);
-    let mut to_accounts: Vec<String> = Vec::with_capacity(n);
-    let mut to_shards: Vec<i32> = Vec::with_capacity(n);
-    let mut amounts: Vec<Decimal> = Vec::with_capacity(n);
-    let mut currencies: Vec<String> = Vec::with_capacity(n);
-    let mut reference_ids: Vec<String> = Vec::with_capacity(n);
-    let mut descriptions: Vec<Option<String>> = Vec::with_capacity(n);
-    for (msg, to_shard) in rows {
-        ids.push(Uuid::new_v4());
-        from_accounts.push(msg.request.from_account.clone());
-        to_accounts.push(msg.request.to_account.clone());
-        to_shards.push(*to_shard as i32);
-        amounts.push(msg.request.amount);
-        currencies.push(msg.request.currency.clone());
-        // Producer guarantees Some(ref) — null-rejected at the
-        // wire level. unwrap_or for defense.
-        reference_ids.push(msg.request.reference_id.clone().unwrap_or_default());
-        descriptions.push(msg.request.description.clone());
-    }
-    sqlx::query(
-        r#"INSERT INTO cross_shard_outbox
-           (id, from_account, to_account, to_shard, amount, currency,
-            reference_id, description, status)
-           SELECT * FROM UNNEST(
-               $1::uuid[], $2::text[], $3::text[], $4::int[],
-               $5::numeric[], $6::text[], $7::text[], $8::text[],
-               ARRAY_FILL('pending'::text, ARRAY[$9::int])
-           )"#,
-    )
-    .bind(&ids)
-    .bind(&from_accounts)
-    .bind(&to_accounts)
-    .bind(&to_shards)
-    .bind(&amounts)
-    .bind(&currencies)
-    .bind(&reference_ids)
-    .bind(&descriptions)
-    .bind(n as i32)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-/// Bulk INSERT placeholder rows for the batch and return the set
-/// of `(reference_id, from_account) → id` whose row this batch
-/// actually claimed. Conflicts are silent — the conflicting key
-/// belongs to a prior batch's commit and is the caller's signal
-/// to treat the message as an idempotent skip.
-///
-/// The placeholder is inserted with `status = 'pending'` and
-/// `processed_at = NOW()`. The schema CHECK allows 'pending', and
-/// the row is promoted to a terminal status by `bulk_update_status`
-/// before tx commit, so external readers (READ COMMITTED snapshot)
-/// only ever observe the terminal state.
-async fn bulk_claim_slots(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    msgs: &[PendingMessage],
-) -> Result<std::collections::HashMap<(String, String), Uuid>, AppError> {
-    let n = msgs.len();
-    let mut ids: Vec<Uuid> = Vec::with_capacity(n);
-    let mut from_accounts: Vec<String> = Vec::with_capacity(n);
-    let mut to_accounts: Vec<String> = Vec::with_capacity(n);
-    let mut amounts: Vec<Decimal> = Vec::with_capacity(n);
-    let mut currencies: Vec<String> = Vec::with_capacity(n);
-    let mut reference_ids: Vec<String> = Vec::with_capacity(n);
-    let mut descriptions: Vec<Option<String>> = Vec::with_capacity(n);
-
-    for msg in msgs {
-        // Producer always supplies a reference_id (UUID fallback);
-        // the consume callback rejects NULLs to DLQ before they
-        // reach the buffer. Fall back to empty string here only
-        // for the type-system — the conflict on (NULL, from) would
-        // never match the message's logical key anyway.
-        let ref_id = msg.request.reference_id.clone().unwrap_or_default();
-        ids.push(Uuid::new_v4());
-        from_accounts.push(msg.request.from_account.clone());
-        to_accounts.push(msg.request.to_account.clone());
-        amounts.push(msg.request.amount);
-        currencies.push(msg.request.currency.clone());
-        reference_ids.push(ref_id);
-        descriptions.push(msg.request.description.clone());
-    }
-
-    let returned: Vec<(Uuid, Option<String>, String)> = sqlx::query_as(
-        r#"INSERT INTO transactions
-           (id, from_account, to_account, amount, currency, status, reference_id, description, processed_at)
-           SELECT * FROM UNNEST(
-               $1::uuid[], $2::text[], $3::text[], $4::numeric[], $5::text[],
-               ARRAY_FILL('pending'::text, ARRAY[$8::int]),
-               $6::text[], $7::text[],
-               ARRAY_FILL(NOW()::timestamptz, ARRAY[$8::int])
-           )
-           ON CONFLICT (reference_id, from_account) DO NOTHING
-           RETURNING id, reference_id, from_account"#,
-    )
-    .bind(&ids)
-    .bind(&from_accounts)
-    .bind(&to_accounts)
-    .bind(&amounts)
-    .bind(&currencies)
-    .bind(&reference_ids)
-    .bind(&descriptions)
-    .bind(n as i32)
-    .fetch_all(&mut **tx)
-    .await?;
-
-    Ok(returned
-        .into_iter()
-        .filter_map(|(id, ref_id, from_acc)| ref_id.map(|r| ((r, from_acc), id)))
-        .collect())
-}
-
-/// Promote the placeholder rows claimed by `bulk_claim_slots` to
-/// the given terminal status. Both `processed_at` and `updated_at`
-/// are refreshed to `NOW()` so the timestamp on the terminal row
-/// reflects when the status was finalised, not when the placeholder
-/// was first inserted.
-async fn bulk_update_status(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    msgs: &[PendingMessage],
-    status: &'static str,
-) -> Result<(), AppError> {
-    let n = msgs.len();
-    let mut reference_ids: Vec<String> = Vec::with_capacity(n);
-    let mut from_accounts: Vec<String> = Vec::with_capacity(n);
-    for msg in msgs {
-        reference_ids.push(msg.request.reference_id.clone().unwrap_or_default());
-        from_accounts.push(msg.request.from_account.clone());
-    }
-    sqlx::query(
-        r#"UPDATE transactions
-           SET status = $3, processed_at = NOW(), updated_at = NOW()
-           WHERE (reference_id, from_account) IN (
-               SELECT * FROM UNNEST($1::text[], $2::text[])
-           )"#,
-    )
-    .bind(&reference_ids)
-    .bind(&from_accounts)
-    .bind(status)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
 // ─── Cross-module event publication ─────────────────────────
 
 /// Wire-level payload for the `transactions.committed` event.
@@ -1071,14 +1025,42 @@ async fn bulk_update_status(
 /// Older subscribers without the field continue to work — they
 /// just ignore the new key.
 #[derive(serde::Serialize)]
-struct TransactionCommittedPayload<'a> {
-    id: Option<Uuid>,
-    from_account: &'a str,
-    to_account: &'a str,
-    amount: String,
-    currency: &'a str,
-    reference_id: Option<&'a str>,
-    shard: usize,
+pub(super) struct TransactionCommittedPayload<'a> {
+    pub id: Option<Uuid>,
+    pub from_account: &'a str,
+    pub to_account: &'a str,
+    pub amount: String,
+    pub currency: &'a str,
+    pub reference_id: Option<&'a str>,
+    pub shard: usize,
+}
+
+/// Build + publish one `transactions.committed` event. Shared by
+/// the consumer's batch flush and the cross-shard processor's
+/// sender-row completion. Best-effort: failures are logged +
+/// counted, never propagated — the row is already durably
+/// committed and queue ACK / outbox progress must not depend on a
+/// notification channel being healthy.
+pub(super) fn publish_one_committed_event(
+    events: &Arc<dyn EventPublisher>,
+    payload: TransactionCommittedPayload<'_>,
+    request_id: &str,
+) {
+    let event = match Event::new(EVENT_TRANSACTIONS_COMMITTED, &payload) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(error = %e, request_id, "Failed to build TransactionCommitted event");
+            metrics::counter!("events_build_errors_total").increment(1);
+            return;
+        }
+    };
+    if let Err(e) = events.publish(event) {
+        tracing::warn!(error = %e, request_id, "EventBus publish failed");
+        metrics::counter!("events_publish_errors_total").increment(1);
+    } else {
+        metrics::counter!("events_published_total", "name" => EVENT_TRANSACTIONS_COMMITTED)
+            .increment(1);
+    }
 }
 
 /// Publish one `transactions.committed` event per row in
@@ -1097,28 +1079,42 @@ fn publish_committed_events(successful: &[PendingMessage], events: &Arc<dyn Even
             reference_id: msg.request.reference_id.as_deref(),
             shard: msg.shard,
         };
-        let event = match Event::new(EVENT_TRANSACTIONS_COMMITTED, &payload) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    request_id = %msg.request_id,
-                    "Failed to build TransactionCommitted event"
-                );
-                metrics::counter!("events_build_errors_total").increment(1);
-                continue;
-            }
-        };
-        if let Err(e) = events.publish(event) {
-            tracing::warn!(
-                error = %e,
-                request_id = %msg.request_id,
-                "EventBus publish failed"
-            );
-            metrics::counter!("events_publish_errors_total").increment(1);
-        } else {
-            metrics::counter!("events_published_total", "name" => EVENT_TRANSACTIONS_COMMITTED)
-                .increment(1);
-        }
+        publish_one_committed_event(events, payload, &msg.request_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_idle_flush;
+
+    #[test]
+    fn idle_flush_yes_when_buffer_nonempty_and_idle_threshold_exceeded() {
+        // last arrival at t=0, now at t=300, threshold 250 → idle
+        assert!(should_idle_flush(3, 0, 300, 250));
+    }
+
+    #[test]
+    fn idle_flush_no_when_buffer_empty() {
+        // Nothing to flush even if idle for a long time.
+        assert!(!should_idle_flush(0, 0, 1000, 250));
+    }
+
+    #[test]
+    fn idle_flush_no_when_arrival_is_recent() {
+        // 100ms since last arrival, threshold 250ms → keep accumulating.
+        assert!(!should_idle_flush(5, 200, 300, 250));
+    }
+
+    #[test]
+    fn idle_flush_yes_at_exactly_the_threshold() {
+        // Boundary: now - last == threshold → flush (>=, not >).
+        assert!(should_idle_flush(1, 0, 250, 250));
+    }
+
+    #[test]
+    fn idle_flush_handles_clock_running_backwards() {
+        // last_arrival_ms > now_ms (clock skew, NTP step, or initial state).
+        // saturating_sub returns 0 → not idle → keep accumulating.
+        assert!(!should_idle_flush(5, 1000, 500, 250));
     }
 }

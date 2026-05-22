@@ -22,11 +22,13 @@ For why the workspace has a dedicated composition-root crate see
 ## Middleware stack
 
 Applied uniformly to every `/api/v2/*` sub-router via
-`apply_protection_stack` in [`bootstrap.rs`](./src/bootstrap.rs):
+`apply_protection_stack` in [`bootstrap.rs`](./src/bootstrap.rs).
 
-```
-request → backpressure → circuit_breaker → rate_limit → auth → handler
-```
+The full canonical middleware-order list (TraceLayer → … → handler,
+including the outer-router layers and the R-9 degradation gate) lives
+in [`docs/architecture.md` §6 — Cross-cutting concerns](../../docs/architecture.md#6-cross-cutting-concerns).
+That section is the single source of truth so this README does not
+drift away from it again (DOC-9 in the WP13 reconciliation).
 
 | File                                                              | Concern                                                |
 |-------------------------------------------------------------------|--------------------------------------------------------|
@@ -94,6 +96,10 @@ never publishes any of its own.
   to exit promptly when it fires. If you add a new background task,
   thread the token through `init_infrastructure` rather than spawning
   with `tokio::spawn` directly.
-- **Tracing exporter is `stdout` by default.** To send traces to a
-  collector, swap `opentelemetry_stdout` for `opentelemetry-otlp` in
-  [`bootstrap.rs::init_tracing`](./src/bootstrap.rs).
+- **Tracing.** Structured JSON logs go to stdout via `tracing-subscriber`
+  (one event per line; `RUST_LOG_PRETTY=1` or `cargo run` falls back to
+  compact text). Spans are exported via OTLP/gRPC to the `otel-collector`
+  sidecar when `OTEL_EXPORTER_OTLP_ENDPOINT` is set — the compose stack
+  sets it to `http://otel-collector:4317`, so spans are visible in
+  `docker logs peakload-otel-collector`. Unset the env to disable the
+  OTel pipeline without code changes.

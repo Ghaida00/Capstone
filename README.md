@@ -4,7 +4,7 @@ Repository ini berisi arsitektur dan implementasi prototype sistem manajemen beb
 🛡️ Key Features:
 - **High Performance**: Backend menggunakan Rust (Axum & Tokio) untuk efisiensi memori dan latensi rendah.
 - **Horizontal Scalability**: Load balancing menggunakan Nginx ke 2 replicas application server.
-- **Database Sharding**: PostgreSQL dengan konfigurasi **3 Shards**, masing-masing menggunakan pola **1 Primary & 1 Replica** untuk skalabilitas data (Total 6 DB instances).
+- **Database Sharding**: PostgreSQL dengan konfigurasi **2 active Shards** (shard 2 dideklarasikan di kode router namun container-nya di-disable di [docker-compose.yml](docker-compose.yml) untuk kapasitas capstone; lihat baris 7 dan 54), masing-masing menggunakan pola **1 Primary & 1 Replica** untuk skalabilitas data (Total 4 DB instances di compose). Sharding logic mendukung 3 shards penuh; re-enable shard 2 cukup dengan uncomment block-nya di compose.
 - **Resilience**: Proteksi berlapis dengan Rate Limiting, Circuit Breaker, Retries, dan mekanisme Backpressure.
 - **Data Integrity**: Menjamin konsistensi data dengan Idempotency Key dan pemrosesan asinkron via RabbitMQ.
 - **Full Observability**: Monitoring real-time menggunakan Prometheus, Grafana, dan cAdvisor (Metrics, Logs, Tracing).
@@ -35,10 +35,20 @@ cd Capstone
 ```
 
 ### 3️⃣ Setup Environment Variables
-Salin file konfigurasi _.env.example_ menjadi _.env_ untuk digunakan oleh container dan aplikasi backend.
-```bash
-cp .env.example .env
-```
+Salin file konfigurasi _.env.example_ menjadi _.env_ untuk digunakan oleh container dan aplikasi backend. Gunakan perintah sesuai sistem operasi Anda:
+
+- **macOS / Linux / WSL / Git Bash:**
+  ```bash
+  cp .env.example .env
+  ```
+- **Windows (PowerShell):**
+  ```powershell
+  Copy-Item .env.example .env
+  ```
+- **Windows (cmd):**
+  ```cmd
+  copy .env.example .env
+  ```
 
 ### 4️⃣ Menjalankan Sistem Secara Full Stack
 Silakan jalankan perintah Docker Compose di bawah ini untuk memulai seluruh infrastruktur (Backend 2 Replicas, PostgreSQL Sharding, Redis HA Sentinel, RabbitMQ, serta Monitoring tools):
@@ -69,13 +79,6 @@ Untuk kepentingan pengembangan (_development_) serta pengujian aplikasi (_tests_
   ```bash
   k6 run k6/load-test-1m.js
   ```
-
-### 📚 Documentation
-
-- [docs/architecture.md](docs/architecture.md) — single-page system overview (start here)
-- [docs/adr/](docs/adr/) — architecture decision records (the *why*)
-- [docs/apiContract.yaml](docs/apiContract.yaml) — OpenAPI 2.0 contract
-- Per-crate `README.md` under [crates/](crates/) — what each module owns
 
 ### 🛑 Menghentikan Layanan
 Ketika Anda sudah selesai, matikan environment infrastrukturnya dengan perintah:

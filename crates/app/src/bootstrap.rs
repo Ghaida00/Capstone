@@ -14,6 +14,12 @@ use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::Resource;
+
 use crate::config::Config;
 use crate::middleware::backpressure::BackpressureController;
 use crate::middleware::circuit_breaker::CircuitBreaker;
@@ -28,26 +34,70 @@ use shared_kernel::queue::producer::QueueProducer;
 
 /// Initialise the global `tracing` subscriber.
 ///
-/// Default: EnvFilter (RUST_LOG, default `warn`) + compact line format
-/// to stdout. The previous build wired an OpenTelemetry `SimpleExporter`
-/// which calls `write!(stdout)` synchronously on every span exit — under
-/// 500–1000 VU load that pegged the hot path with blocking I/O. JSON
-/// fmt also serialises every event; compact is ~3× cheaper.
+/// Default level is `info`; `RUST_LOG` overrides it (e.g. `RUST_LOG=debug`).
+/// Default output is JSON on stdout — one event per line, structured fields
+/// preserved.
+/// Plain compact format is used when `RUST_LOG_PRETTY` is set or the binary
+/// is built with `debug_assertions` (i.e. `cargo run` / `cargo test`).
 ///
-/// To re-enable structured / OTel output, set `LOG_FORMAT=json` or
-/// `OTEL_ENABLED=1` (OTel uses the batch exporter, not simple).
+/// When `OTEL_EXPORTER_OTLP_ENDPOINT` is set and non-blank, an OTLP/gRPC
+/// batch span exporter is layered onto the subscriber and registered as
+/// the global tracer provider. `OTEL_SERVICE_NAME` (default
+/// `peakload-capstone`) is attached as the `service.name` resource
+/// attribute. With the endpoint unset or blank (the latter is what
+/// Compose passes for a cleared variable), no OTLP pipeline runs and
+/// the subscriber behaves as above.
+///
+/// Filter composition: a single `EnvFilter` from `RUST_LOG` (default
+/// `info`) is applied as a Layer on the Registry. Both the OTel and fmt
+/// layers see only events that pass that filter — h2/hyper/sqlx DEBUG
+/// noise is dropped at the registry, never reaching the OTel hot path.
+/// The OTel layer is NOT wrapped in `Filtered<_,_>` (per-layer
+/// `.with_filter()`), because that wrapper hides the OTel layer's
+/// `WithContext` from `subscriber.downcast_ref::<WithContext>()`,
+/// breaking `tracing_opentelemetry::OpenTelemetrySpanExt::context()`
+/// at the publish boundary (traceparent injection silently writes
+/// nothing). This is the canonical `tracing-opentelemetry` pattern.
+/// Resolve the OTLP exporter endpoint from its raw env value. Tracing
+/// exports only when the endpoint is present and non-blank; both an
+/// unset variable and an empty/whitespace one (what Compose passes for
+/// a cleared variable) yield `None`, leaving the OTLP pipeline off.
+fn resolve_otlp_endpoint(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 pub fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let log_directives = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+    let pretty = std::env::var("RUST_LOG_PRETTY").is_ok() || cfg!(debug_assertions);
 
-    let json = std::env::var("LOG_FORMAT").ok().as_deref() == Some("json");
-    let registry = tracing_subscriber::registry().with(filter);
+    let global_filter =
+        EnvFilter::try_new(&log_directives).unwrap_or_else(|_| EnvFilter::new("info"));
 
-    if json {
-        registry
-            .with(tracing_subscriber::fmt::layer().json())
-            .init();
-    } else {
-        registry
+    let otel_layer =
+        resolve_otlp_endpoint(std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()).map(|endpoint| {
+            let exporter = SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint)
+                .build()
+                .expect("OTLP SpanExporter build");
+            let service_name = std::env::var("OTEL_SERVICE_NAME")
+                .unwrap_or_else(|_| "peakload-capstone".to_string());
+            let resource = Resource::builder()
+                .with_attribute(KeyValue::new("service.name", service_name))
+                .build();
+            let provider = SdkTracerProvider::builder()
+                .with_batch_exporter(exporter)
+                .with_resource(resource)
+                .build();
+            let tracer = provider.tracer("peakload-capstone");
+            opentelemetry::global::set_tracer_provider(provider);
+            tracing_opentelemetry::layer().with_tracer(tracer)
+        });
+
+    if pretty {
+        tracing_subscriber::registry()
+            .with(global_filter)
+            .with(otel_layer)
             .with(
                 tracing_subscriber::fmt::layer()
                     .compact()
@@ -55,6 +105,12 @@ pub fn init_tracing() {
                     .with_thread_ids(false)
                     .with_thread_names(false),
             )
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(global_filter)
+            .with(otel_layer)
+            .with(tracing_subscriber::fmt::layer().json())
             .init();
     }
 }
@@ -64,7 +120,22 @@ pub fn init_tracing() {
 /// Install the Prometheus recorder and pre-register every metric so
 /// they appear in `/metrics` from the very first scrape.
 pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
+    // O-4: render http_request_duration_seconds as a real histogram with
+    // SLO-straddling buckets (the exporter defaults histograms to summary;
+    // `histogram_quantile()` is impossible without buckets). Boundaries
+    // straddle the stated 500 ms P95 SLO and the observed sub-10 ms baseline.
+    // Scope is intentionally `Matcher::Full` (exact name): other
+    // histograms (e.g. `transactions_batch_size`) remain summaries —
+    // broadening to `Matcher::Prefix`/`Suffix` would change their
+    // exposition shape silently.
     let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full("http_request_duration_seconds".to_string()),
+            &[
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ],
+        )
+        .expect("set_buckets_for_metric")
         .install_recorder()
         .expect("Failed to install Prometheus recorder");
 
@@ -76,16 +147,63 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
     metrics::describe_counter!("cache_hits_total", "Cache hits");
     metrics::describe_counter!("cache_misses_total", "Cache misses");
     metrics::describe_counter!("rate_limited_total", "Rate limited requests");
+    metrics::describe_counter!(
+        "rate_limiter_redis_sync_failures_total",
+        "Rate-limiter Redis sync failures (label `kind`: `pool_get` = could not acquire a Redis connection; `pipeline` = the INCRBY/EXPIRE pipeline errored). Each failure means the global ceiling silently degraded to per-replica enforcement (effective limit = N × per_replica) until Redis recovers — page on sustained non-zero rate (R-6)."
+    );
     metrics::describe_counter!("backpressure_shed_total", "Backpressure shed requests");
     metrics::describe_gauge!("backpressure_in_flight", "In-flight requests");
     metrics::describe_gauge!("circuit_breaker_state", "Circuit breaker state");
+    metrics::describe_gauge!(
+        "degradation_mode",
+        "R-9 operator-controlled degradation posture: 0 normal, 1 read_only (writes 503'd, reads served), 2 essential_only. Monotonic in severity — alert on > 0."
+    );
+    metrics::describe_gauge!(
+        "dependency_breaker_state",
+        "R-7 per-dependency circuit-breaker state (label `dep`: db|redis|rabbitmq): 0 closed, 1 open (failing fast), 2 half-open (probing recovery). Distinct from the coarse circuit_breaker_state HTTP-edge breaker."
+    );
+    metrics::describe_counter!(
+        "dependency_breaker_trips_total",
+        "R-7 per-dependency breaker open transitions (label `dep`). Each increment = that upstream's error class crossed the failure threshold (or a half-open probe failed) and calls now fail fast with 503 + Retry-After until the recovery timeout."
+    );
+    metrics::describe_counter!(
+        "background_task_panics_total",
+        "A-3 background-task panic count (label `task`: which background spawn class panicked). Increments under panic=unwind when a JoinSet-tracked task panics — previously such panics were observed only by the default panic hook (silent). Alert on any non-zero rate."
+    );
+    metrics::describe_counter!(
+        "idempotency_cache_set_attempts_total",
+        "A-3 idempotency cache-set attempts (one per replay-write attempt; failures are tolerated by design — the next replay re-populates from the DB)."
+    );
     metrics::describe_counter!("idempotency_hits_total", "Idempotency hits");
     metrics::describe_counter!("rabbitmq_reconnections_total", "RabbitMQ reconnections");
-    metrics::describe_histogram!("transactions_batch_size", "Batch sizes");
+    metrics::describe_histogram!(
+        "transactions_batch_size",
+        "Per-shard consumer batch sizes (label `shard`: sender-shard index). ACK count per shard per flush (completed + failed + skipped). Aggregate distribution = histogram_quantile without the shard label; per-shard fault-domain view = by (shard) (O-10)."
+    );
     metrics::describe_counter!("dlq_messages_total", "Dead letter queue messages");
+    metrics::describe_counter!(
+        "transactions_list_tail_skew_dropped_total",
+        "Rows dropped from a transactions-list page because at least one shard's coverage did not reach them (D-3 safe-cursor truncation)"
+    );
+    metrics::describe_counter!(
+        "transactions_find_by_id_shard_timeout_total",
+        "Per-shard find_by_id fan-out timeouts (label `shard`: index of the slow shard) — a slow shard turned into a per-shard error rather than pinning the API wall-clock (D-4)"
+    );
+    metrics::describe_counter!(
+        "db_read_fallback_to_primary_total",
+        "Per-shard read-pool fallback to primary because every replica was marked unhealthy (label `shard`: index of the affected shard). Rate signal for the silent-degradation case (D-5); alert on sustained non-zero rate to catch replica outages before they amplify load on the primary."
+    );
     metrics::describe_counter!(
         "cross_shard_step_failures_total",
         "Cross-shard outbox step failures (label `step`: `credit` or `refund`) — credit failures stranded a sender debit; refund failures left a sender un-compensated"
+    );
+    metrics::describe_counter!(
+        "cross_shard_outbox_terminal_failures_total",
+        "Cross-shard outbox terminal failures after MAX_ATTEMPTS retries (label `step`: `credit` only — refund path never terminal-fails by design). Each increment means a sender's audit row was transitioned 'processing' → 'failed' with `failure_reason` populated; the funds have been debited and the recipient credit never landed. Page on any non-zero rate (R-2). Reconciliation procedure: docs/runbooks/cross-shard-outbox-reconciliation.md."
+    );
+    metrics::describe_counter!(
+        "cross_shard_refund_stuck_total",
+        "Refund-path retry attempts while past MAX_ATTEMPTS (label-less). Sender is debited; the compensating refund has failed at least 10 times and the row is in a 5min defer-lease loop. Reads as 'retry attempts per stuck row × time' — not a count of distinct stuck rows. Ticket on sustained non-zero rate for 30+ min (R-2)."
     );
 
     // Failover metrics
@@ -205,10 +323,7 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
         "amqp_publish_failed_total",
         "Outbox publish failed terminally (label `kind`: nack_or_returned, etc.)"
     );
-    metrics::describe_counter!(
-        "amqp_publish_nack_total",
-        "Broker NACKed a publish confirm"
-    );
+    metrics::describe_counter!("amqp_publish_nack_total", "Broker NACKed a publish confirm");
     metrics::describe_counter!(
         "amqp_publish_return_total",
         "Broker returned a mandatory publish as unrouteable"
@@ -338,18 +453,41 @@ pub fn build_router(
     // otherwise the middleware is still attached but in pass-through mode
     // so we have a single code path and tests never need to special-case.
     if config.enable_auth {
-        if let Some(secret) = config.auth_secret.as_deref() {
-            crate::middleware::auth::init_auth(secret);
-            tracing::info!("JWT auth middleware enabled");
-        } else {
-            tracing::error!("ENABLE_AUTH=true but AUTH_SECRET is missing — all requests will 500");
-        }
+        // S-1 / S-2: validate() already guarantees secret +
+        // expected_issuer + expected_audience are set when
+        // ENABLE_AUTH=true, so these unwraps are unreachable
+        // defence-in-depth.
+        let secret = config.auth_secret.as_deref().unwrap_or("");
+        let issuer = config.auth_expected_issuer.as_deref().unwrap_or("");
+        let audience = config.auth_expected_audience.as_deref().unwrap_or("");
+        crate::middleware::auth::init_auth(&crate::middleware::auth::AuthConfig {
+            secret,
+            expected_issuer: issuer,
+            expected_audience: audience,
+            leeway_secs: config.auth_leeway_secs,
+        });
+        tracing::info!(
+            expected_issuer = issuer,
+            expected_audience = audience,
+            leeway_secs = config.auth_leeway_secs,
+            "JWT auth middleware enabled (HS256-pinned; iss/aud/exp/sub required) [S-1/S-2]"
+        );
     } else {
         tracing::info!("JWT auth middleware disabled (ENABLE_AUTH=false)");
     }
     let auth_state = crate::middleware::auth::AuthState {
         enabled: config.enable_auth,
     };
+    // Separate clone for the admin sub-router (R-2). Kept distinct
+    // here so a future change to the v2 protection-stack auth
+    // policy does not silently relax the admin gate.
+    let auth_state_admin = auth_state.clone();
+
+    // R-9: the degradation flag is shared by the write-path
+    // middleware (every v2 sub-router) and the admin flip
+    // endpoints (via AppState). Clone the handle out before the
+    // sub-routers consume `state`.
+    let degradation = state.degradation.clone();
 
     // Fix #10: Build CORS layer from configuration
     let cors = build_cors_layer(config);
@@ -369,6 +507,7 @@ pub fn build_router(
         rate_limiter.clone(),
         circuit_breaker.clone(),
         backpressure.clone(),
+        degradation.clone(),
     );
 
     // Phase 2: transactions module wired with the cross-module
@@ -388,6 +527,7 @@ pub fn build_router(
         rate_limiter.clone(),
         circuit_breaker.clone(),
         backpressure.clone(),
+        degradation.clone(),
     );
 
     // ─── Phase 3 modular-monolith: mount `/api/v2/notifications/*` ───
@@ -409,6 +549,7 @@ pub fn build_router(
         rate_limiter,
         circuit_breaker,
         backpressure,
+        degradation,
     );
 
     // `nest_service` (rather than `nest`) because each module
@@ -418,7 +559,22 @@ pub fn build_router(
     // `nest_service` method accepts any `Service`, bridging the
     // mismatch without forcing module deps to implement
     // `FromRef<AppState>`.
+    // R-2: admin sub-router for operator queries on cross-shard
+    // outbox state and audit-row 'processing' rows. Uses
+    // `require_admin_middleware` (refuses outright when
+    // `ENABLE_AUTH=false`, requires JWT `role="admin"` when on)
+    // instead of the v2 protection stack — the operator surface
+    // does not need rate-limit / circuit-breaker / backpressure
+    // gating (low traffic, already authorised, no customer-impacting
+    // throughput concern). Carries `AppState` directly so the
+    // handlers can reach `state.shard_router`.
+    let admin_router = crate::admin::router().layer(axum_middleware::from_fn_with_state(
+        auth_state_admin,
+        crate::middleware::auth::require_admin_middleware,
+    ));
+
     Router::new()
+        .nest("/api/v2/admin", admin_router)
         .nest_service("/api/v2/accounts", accounts_router)
         .nest_service("/api/v2/transactions", transactions_router)
         .nest_service("/api/v2/notifications", notifications_router)
@@ -427,9 +583,6 @@ pub fn build_router(
         .with_state(state)
         .layer(axum_middleware::from_fn(
             crate::middleware::request_id::request_id_middleware,
-        ))
-        .layer(axum_middleware::from_fn(
-            crate::middleware::metrics::metrics_middleware,
         ))
         .layer(
             ServiceBuilder::new()
@@ -450,17 +603,38 @@ pub fn build_router(
                     config.api_timeout_secs,
                 ))),
         )
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|req: &axum::http::Request<_>| {
+                    tracing::info_span!(
+                        "http.request",
+                        http.request.method = %req.method(),
+                        url.path = %req.uri().path(),
+                        request_id = tracing::field::Empty,
+                        http.response.status_code = tracing::field::Empty,
+                    )
+                })
+                .on_response(
+                    |res: &axum::http::Response<_>,
+                     _latency: std::time::Duration,
+                     span: &tracing::Span| {
+                        span.record("http.response.status_code", res.status().as_u16());
+                    },
+                ),
+        )
         .layer(cors)
 }
 
 /// Apply the standard request-protection stack to a router.
 ///
 /// Order matters: `.layer` wraps outside-in, so the call sequence below
-/// produces this request flow at runtime:
+/// produces this request flow at runtime. The metrics layer is placed
+/// outermost so it observes the FINAL response status — including
+/// 429/503 short-circuits emitted by rate-limit / circuit-breaker /
+/// backpressure inside the protection stack.
 ///
 /// ```text
-///   request → backpressure → circuit_breaker → rate_limit → auth → handler
+///   request → metrics → backpressure → circuit_breaker → rate_limit → auth → handler
 /// ```
 ///
 /// Applied to every `/api/v2/{accounts,transactions,notifications}/*`
@@ -476,11 +650,23 @@ fn apply_protection_stack<S>(
     rate_limiter: RateLimiter,
     circuit_breaker: CircuitBreaker,
     backpressure: BackpressureController,
+    degradation: crate::degradation::DegradationFlag,
 ) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     router
+        .layer(axum_middleware::from_fn(
+            crate::middleware::metrics::metrics_middleware,
+        ))
+        // R-9: write-path degradation gate. Placed just inside the
+        // metrics layer so a degraded-mode 503 is still RED-counted,
+        // but outside auth/rate-limit/breaker so a read-only window
+        // sheds writes before they consume any of those budgets.
+        .layer(axum_middleware::from_fn_with_state(
+            degradation,
+            crate::degradation::degradation_middleware,
+        ))
         .layer(axum_middleware::from_fn_with_state(
             auth_state,
             crate::middleware::auth::auth_middleware,
@@ -527,5 +713,41 @@ fn build_cors_layer(config: &Config) -> CorsLayer {
             .allow_origin(origins)
             .allow_methods(Any)
             .allow_headers(Any)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_otlp_endpoint_returns_none_for_unset() {
+        assert_eq!(resolve_otlp_endpoint(None), None);
+    }
+
+    #[test]
+    fn resolve_otlp_endpoint_returns_none_for_empty_string() {
+        assert_eq!(resolve_otlp_endpoint(Some(String::new())), None);
+    }
+
+    #[test]
+    fn resolve_otlp_endpoint_returns_none_for_whitespace_only() {
+        assert_eq!(resolve_otlp_endpoint(Some("   ".to_string())), None);
+    }
+
+    #[test]
+    fn resolve_otlp_endpoint_returns_some_for_real_endpoint() {
+        assert_eq!(
+            resolve_otlp_endpoint(Some("http://otel-collector:4317".to_string())),
+            Some("http://otel-collector:4317".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_otlp_endpoint_trims_padded_input() {
+        assert_eq!(
+            resolve_otlp_endpoint(Some("  http://x:4317  ".to_string())),
+            Some("http://x:4317".to_string())
+        );
     }
 }

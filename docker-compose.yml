@@ -22,12 +22,21 @@ name: peakload
 #  redis-replica                    1.0      384 M
 #  redis-sentinel-1/2/3 (× 3)       0.3      96 M       (0.1 × 3, 32 M × 3)
 #  rabbitmq                         1.0      512 M
+#  ───────────────────────────────  ───────  ────────
+#  CORE TOTAL                       13.10    4768 M (~4.66 GB)
+#
+#  Observability (profile-gated — set COMPOSE_PROFILES in .env):
 #  prometheus                       0.5      256 M
 #  grafana                          0.5      256 M
 #  cadvisor                         0.2      128 M
+#  otel-collector                   0.3      256 M
+#  jaeger                           0.3      512 M
 #  ───────────────────────────────  ───────  ────────
-#  TOTAL steady-state               14.30    5408 M (~5.28 GB)
-#  TOTAL termasuk bootstrap         14.40    5472 M (~5.34 GB)
+#  OBSERVABILITY TOTAL              1.8      1408 M (~1.37 GB)
+#
+#  FULL  (observability ON)         14.90    6176 M (~6.03 GB)
+#  LEAN  (observability OFF)        13.10    4768 M (~4.66 GB)
+#  TOTAL termasuk bootstrap (FULL)  15.00    6240 M (~6.09 GB)
 #
 # Catatan:
 # * Ini limit, bukan request — pemakaian aktual idle jauh
@@ -37,6 +46,11 @@ name: peakload
 #   8-core host). Kalau host < 8 GB RAM atau < 6 cores,
 #   turunkan PG node ke 0.5 CPU / 256 M lewat anchor
 #   `x-pg-node-deploy` di bawah.
+# * Observability (prometheus/grafana/cadvisor/otel-collector/
+#   jaeger) di-gate lewat Compose profiles. Set COMPOSE_PROFILES
+#   di .env: `observability` untuk FULL, kosongkan untuk LEAN
+#   (k6 perf runs). Granular: `tracing`, `metrics`, atau
+#   nama service spesifik (`jaeger,prometheus`).
 # ============================================================
 
 # ============================================================
@@ -98,6 +112,13 @@ x-pg-node-env: &pg-node-env
   POSTGRES_SUPERUSER_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD in .env}
   REPL_PASSWORD: ${REPL_PASSWORD:?set REPL_PASSWORD in .env}
   ETCD_HOSTS: "etcd-1:2379,etcd-2:2379,etcd-3:2379"
+  # Durability posture — rendered into each node's local PG
+  # parameters by patroni-entrypoint.sh. Defaults here mirror
+  # the entrypoint's so a missing .env entry stays safe. See
+  # the "Postgres durability posture" block in .env.
+  PG_SYNCHRONOUS_COMMIT: ${PG_SYNCHRONOUS_COMMIT:-remote_write}
+  PG_COMMIT_DELAY: ${PG_COMMIT_DELAY:-0}
+  PG_COMMIT_SIBLINGS: ${PG_COMMIT_SIBLINGS:-5}
 
 # Per-node resource envelope. 1.5 CPU / 512 MB gives the
 # primary headroom for both request-driven INSERT/UPDATE
@@ -276,7 +297,22 @@ services:
     ports:
       - "8080:80"
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # OPS-2 / S-5: rendered by the official image's envsubst step
+      # (20-envsubst-on-templates.sh) at container start.
+      - ./nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+    environment:
+      # Edge rate-limit knobs. Default = production-safe ceiling.
+      # Benchmarks restore bench throughput by exporting the high
+      # values before `docker compose up` (e.g. in .env or shell):
+      #   NGINX_PER_IP_RATE=50000 NGINX_GLOBAL_RATE=100000 \
+      #   NGINX_PER_IP_BURST=10000 NGINX_GLOBAL_BURST=50000
+      NGINX_PER_IP_RATE: "${NGINX_PER_IP_RATE:-2000}"
+      NGINX_GLOBAL_RATE: "${NGINX_GLOBAL_RATE:-50000}"
+      NGINX_PER_IP_BURST: "${NGINX_PER_IP_BURST:-2000}"
+      NGINX_GLOBAL_BURST: "${NGINX_GLOBAL_BURST:-10000}"
+      # Render the full main config (not a conf.d snippet) to
+      # /etc/nginx/nginx.conf.
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
     depends_on:
       app:
         condition: service_healthy
@@ -330,6 +366,20 @@ services:
       # here only for experimentation.
       DB_WRITE_RETRY_MAX_ATTEMPTS: "6"
       DB_WRITE_RETRY_BACKOFF_MS: "200"
+      # ── S-1 / S-2: JWT validator config ──────────────────
+      # Required when ENABLE_AUTH=true (validate() fails closed
+      # at boot if missing); ignored when auth is off.
+      AUTH_EXPECTED_ISSUER: "${AUTH_EXPECTED_ISSUER:-}"
+      AUTH_EXPECTED_AUDIENCE: "${AUTH_EXPECTED_AUDIENCE:-}"
+      AUTH_LEEWAY_SECS: "${AUTH_LEEWAY_SECS:-30}"
+      # ── R-9: degradation posture seed ────────────────────
+      # Safe default = normal. Flip a maintenance window by
+      # exporting DEGRADATION_MODE=read_only before `up`, or
+      # (preferred, no restart) PUT /api/v2/admin/degradation.
+      DEGRADATION_MODE: "${DEGRADATION_MODE:-normal}"
+      # ── OpenTelemetry ────────────────────────────────────
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-}"
+      OTEL_SERVICE_NAME: "peakload-capstone"
     expose:
       - "3000"
     depends_on:
@@ -342,12 +392,17 @@ services:
       #   condition: service_healthy
       db-bootstrap-schema:
         condition: service_completed_successfully
+      db-migrator:
+        condition: service_completed_successfully
       redis-master:
         condition: service_healthy
       redis-sentinel-1:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      otel-collector:
+        condition: service_started
+        required: false
     healthcheck:
       test: [ "CMD", "/app/peakload-capstone", "--health-check" ]
       interval: 10s
@@ -439,7 +494,14 @@ services:
       PATRONI_NAME:     shard0-a
       PATRONI_HOSTNAME: pg-shard0-node-a
     volumes:
-      - pg_shard0_node_a_data:/var/lib/postgresql/data
+      # Mount at the parent path (postgres image declares
+      # `VOLUME /var/lib/postgresql`). Mounting only PGDATA
+      # would leave the parent uncovered and Docker would
+      # spawn a fresh anonymous volume for it on every
+      # container recreate. PGDATA stays at the `data/`
+      # subdirectory inside this named volume (see patroni-
+      # entrypoint.sh which chowns both).
+      - pg_shard0_node_a_data:/var/lib/postgresql
     depends_on:
       etcd-1:
         condition: service_healthy
@@ -458,7 +520,8 @@ services:
       PATRONI_NAME:     shard0-b
       PATRONI_HOSTNAME: pg-shard0-node-b
     volumes:
-      - pg_shard0_node_b_data:/var/lib/postgresql/data
+      # Mounted at parent path — see pg-shard0-node-a for rationale.
+      - pg_shard0_node_b_data:/var/lib/postgresql
     depends_on:
       etcd-1:
         condition: service_healthy
@@ -499,7 +562,8 @@ services:
       PATRONI_NAME:     shard1-a
       PATRONI_HOSTNAME: pg-shard1-node-a
     volumes:
-      - pg_shard1_node_a_data:/var/lib/postgresql/data
+      # Mounted at parent path — see pg-shard0-node-a for rationale.
+      - pg_shard1_node_a_data:/var/lib/postgresql
     depends_on:
       etcd-1:
         condition: service_healthy
@@ -518,7 +582,8 @@ services:
       PATRONI_NAME:     shard1-b
       PATRONI_HOSTNAME: pg-shard1-node-b
     volumes:
-      - pg_shard1_node_b_data:/var/lib/postgresql/data
+      # Mounted at parent path — see pg-shard0-node-a for rationale.
+      - pg_shard1_node_b_data:/var/lib/postgresql
     depends_on:
       etcd-1:
         condition: service_healthy
@@ -568,7 +633,8 @@ services:
   #     PATRONI_NAME:     shard2-a
   #     PATRONI_HOSTNAME: pg-shard2-node-a
   #   volumes:
-  #     - pg_shard2_node_a_data:/var/lib/postgresql/data
+  #     # Mounted at parent path — see pg-shard0-node-a for rationale.
+  #     - pg_shard2_node_a_data:/var/lib/postgresql
   #   depends_on:
   #     etcd-1:
   #       condition: service_healthy
@@ -587,7 +653,8 @@ services:
   #     PATRONI_NAME:     shard2-b
   #     PATRONI_HOSTNAME: pg-shard2-node-b
   #   volumes:
-  #     - pg_shard2_node_b_data:/var/lib/postgresql/data
+  #     # Mounted at parent path — see pg-shard0-node-a for rationale.
+  #     - pg_shard2_node_b_data:/var/lib/postgresql
   #   depends_on:
   #     etcd-1:
   #       condition: service_healthy
@@ -620,9 +687,9 @@ services:
   # answers HTTP 200 on GET /primary. See haproxy/README.md
   # for the detailed protocol.
   #
-  # Port 7000 stats dashboard is bound to 127.0.0.1 so it is
-  # visible from the host for debugging but never from the
-  # public internet.
+  # The stats dashboard (container port 7000) is published to
+  # 127.0.0.1 only — reachable from the host for debugging but
+  # never from the public internet. See the ports: block below.
   # ============================================================
   pg-haproxy:
     image: haproxy:3.3-alpine
@@ -630,7 +697,13 @@ services:
     volumes:
       - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
-      - "127.0.0.1:7000:7000"
+      # Host port left unspecified: Docker binds a free ephemeral port
+      # on 127.0.0.1 at `up` time. A fixed host port is unsafe on
+      # Windows — WinNAT reserves arbitrary blocks from the TCP dynamic
+      # range, and binding inside a reserved block fails with WSAEACCES.
+      # Letting the OS choose avoids every reservation. Discover the
+      # assigned URL with:  docker compose port pg-haproxy 7000
+      - "127.0.0.1::7000"
     expose:
       - "5000"
       - "5001"
@@ -693,6 +766,14 @@ services:
     image: postgres:18.3-alpine3.23
     container_name: peakload-db-bootstrap-schema
     entrypoint: [ "/bin/sh", "/opt/bootstrap-schema.sh" ]
+    # The postgres image declares `VOLUME /var/lib/postgresql`,
+    # which otherwise spawns a fresh anonymous volume on every
+    # container recreate. This container only runs psql against
+    # remote pg-haproxy and never touches its own /var/lib/postgresql,
+    # so an 8 MB tmpfs there is sufficient to satisfy the VOLUME
+    # declaration without leaving disk residue.
+    tmpfs:
+      - /var/lib/postgresql:size=8m
     environment:
       POSTGRES_USER:     ${POSTGRES_USER:?set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
@@ -700,6 +781,10 @@ services:
       PG_HAPROXY_HOST:   pg-haproxy
       # Shard 2 disabled — was "5000 5001 5002".
       PG_HAPROXY_PORTS:  "5000 5001"
+      # D-1/R-3: server-side statement/lock/idle-in-tx timeouts (milliseconds), applied per shard primary as ALTER DATABASE defaults by bootstrap-schema.sh.
+      DB_STATEMENT_TIMEOUT_MS:   "2000"
+      DB_LOCK_TIMEOUT_MS:        "500"
+      DB_IDLE_IN_TX_TIMEOUT_MS:  "5000"
     volumes:
       - ./db/bootstrap/bootstrap-schema.sh:/opt/bootstrap-schema.sh:ro
       - ./db/init.sql:/sql/init.sql:ro
@@ -715,6 +800,53 @@ services:
         limits:
           memory: 64M
           cpus: "0.1"
+
+  # ============================================================
+  # DB migrator — one-shot sqlx::migrate! runner (D-7)
+  # ============================================================
+  # Runs the existing app image with `--migrate`, which connects
+  # directly to each shard primary via HAProxy (NOT pgBouncer —
+  # pgBouncer's transaction-pool mode rejects the startup options
+  # the connection-level lock_timeout/statement_timeout overrides
+  # would need; and the bypass also avoids racing the two app
+  # instances over the ACCESS EXCLUSIVE lock). Migrations are
+  # idempotent (`IF NOT EXISTS` everywhere); re-runs are no-ops
+  # recorded in `_sqlx_migrations`.
+  #
+  # Gated on `db-bootstrap-schema` (the baseline init.sql must
+  # exist first) and on `pg-haproxy: service_healthy` so the
+  # primary route is up. The app's `depends_on` waits on this
+  # service `service_completed_successfully` so the app cannot
+  # boot against an un-migrated schema.
+  # ============================================================
+  db-migrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: peakload-app
+    container_name: peakload-db-migrator
+    command: ["/app/peakload-capstone", "--migrate"]
+    environment:
+      # Direct-to-primary URLs via HAProxy ports (5000=shard0, 5001=shard1).
+      # Uses the superuser so DDL (ALTER TABLE, CREATE INDEX) is permitted.
+      MIGRATE_SHARD_URLS: "postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@pg-haproxy:5000/${POSTGRES_DB:?},postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@pg-haproxy:5001/${POSTGRES_DB:?}"
+      # The migrator only needs sqlx + dotenv; suppress noisy app-startup
+      # env to keep the log output focused on migration progress.
+      RUST_LOG: "info,sqlx::query=warn"
+    depends_on:
+      pg-haproxy:
+        condition: service_healthy
+      db-bootstrap-schema:
+        condition: service_completed_successfully
+    restart: "no"
+    logging: *default-logging
+    networks:
+      - peakload-network
+    deploy:
+      resources:
+        limits:
+          memory: 96M
+          cpus: "0.2"
 
   # ============================================================
   # Redis HA — Master + Replica + Sentinel
@@ -838,8 +970,10 @@ services:
   prometheus:
     image: prom/prometheus:v3.10.0-distroless
     container_name: peakload-prometheus
+    profiles: ["observability", "metrics", "prometheus"]
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
       - prometheus_data:/prometheus
     ports:
       - "9090:9090"
@@ -858,11 +992,79 @@ services:
           cpus: "0.5"
 
   # ============================================================
+  # OpenTelemetry Collector — receives OTLP traces from app
+  # ============================================================
+  # Receives OTLP/gRPC on 4317 and fans traces out to two exporters:
+  # `debug` (span-count heartbeat in `docker logs
+  # peakload-otel-collector`) and `otlp` (forwards to the `jaeger`
+  # service for the searchable trace UI). See otel/collector.yaml.
+  # No healthcheck (image is upstream-distroless: no shell). App
+  # depends on `service_started`, mirroring the prometheus pattern.
+  # ============================================================
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.117.0
+    container_name: peakload-otel-collector
+    profiles: ["observability", "tracing", "otel-collector"]
+    volumes:
+      - ./otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    expose:
+      - "4317"
+    # Start after Jaeger so the `otlp` exporter's first spans have a
+    # back-end to land in (the exporter retries regardless, but this
+    # keeps the cold-start window clean).
+    depends_on:
+      jaeger:
+        condition: service_started
+        required: false
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - peakload-network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.3"
+
+  # ============================================================
+  # Jaeger — trace UI + storage back-end for the collector
+  # ============================================================
+  # All-in-one Jaeger: receives OTLP/gRPC on 4317 from the
+  # otel-collector's `otlp` exporter, stores spans in memory
+  # (MEMORY_MAX_TRACES bounds RAM under load-test span volume), and
+  # serves the search/trace UI on :16686 → host :16686. In-memory
+  # storage is intentional — traces here are a live debugging
+  # surface, not a retained record; a restart clears them.
+  # ============================================================
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: peakload-jaeger
+    profiles: ["observability", "tracing", "jaeger"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      MEMORY_MAX_TRACES: "50000"
+    ports:
+      - "16686:16686"
+    expose:
+      - "4317"
+    restart: unless-stopped
+    logging: *default-logging
+    networks:
+      - peakload-network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.3"
+
+  # ============================================================
   # Grafana — Metrics Visualization
   # ============================================================
   grafana:
     image: grafana/grafana:12.3
     container_name: peakload-grafana
+    profiles: ["observability", "metrics", "grafana"]
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:?set GRAFANA_USER in .env}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in .env}
@@ -881,6 +1083,7 @@ services:
     depends_on:
       prometheus:
         condition: service_started
+        required: false
     restart: unless-stopped
     logging: *default-logging
     networks:
@@ -897,6 +1100,7 @@ services:
   cadvisor:
     image: ghcr.io/google/cadvisor:0.56.2
     container_name: peakload-cadvisor
+    profiles: ["observability", "metrics", "cadvisor"]
     ports:
       - "8081:8080"
     volumes:
@@ -918,27 +1122,6 @@ services:
         limits:
           memory: 128M
           cpus: "0.2"
-
-  # ============================================================
-  # jaeger — Distributed Tracing
-  # ============================================================
-  jaeger:
-      image: jaegertracing/all-in-one:latest
-      container_name: peakload-jaeger
-      environment:
-        - COLLECTOR_OTLP_ENABLED=true
-      ports:
-        - "16686:16686"
-        - "4317:4317"
-        - "4318:4318"
-      restart: unless-stopped
-      networks:
-        - peakload-network
-      deploy:
-        resources:
-          limits:
-            memory: 256M
-            cpus: "0.5"
 
 # ============================================================
 # Volumes
@@ -966,4 +1149,3 @@ volumes:
 networks:
   peakload-network:
     driver: bridge
-

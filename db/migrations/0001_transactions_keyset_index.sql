@@ -15,19 +15,21 @@
 -- the planner from picking a bitmap-heap-scan path on small
 -- `LIMIT` reads.
 --
--- All operations run `CONCURRENTLY` so live writers are not
--- blocked on `AccessExclusiveLock`. `IF NOT EXISTS` /
--- `IF EXISTS` make the script idempotent — re-running on a
--- migrated cluster is a no-op.
---
--- Apply against each shard primary via the pg-haproxy frontend
--- ports (e.g. 5000 for shard 0, 5001 for shard 1). Fresh
--- clusters reach the same end state from `db/init.sql`; this
--- file is for clusters whose bootstrap canary already exists.
+-- `IF NOT EXISTS` / `IF EXISTS` make the script idempotent — on
+-- a cluster where `init.sql` already provisioned the index the
+-- statements are no-ops and the `_sqlx_migrations` row is the
+-- only side effect. `CONCURRENTLY` is intentionally NOT used:
+-- the migrator runs inside the default `sqlx::migrate!`
+-- transaction wrap, and `CONCURRENTLY` is incompatible with
+-- transaction blocks. The brief `AccessExclusiveLock` is
+-- acceptable here because the operation is idempotent — on a
+-- migrated cluster it returns immediately. For genuinely
+-- online schema changes against a live table, run the change
+-- via a separate `psql` script (see runbook).
 -- ============================================================
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_transactions_created_id
+CREATE INDEX IF NOT EXISTS idx_transactions_created_id
     ON transactions (created_at DESC, id DESC);
 
-DROP INDEX CONCURRENTLY IF EXISTS idx_transactions_created_at;
-DROP INDEX CONCURRENTLY IF EXISTS idx_transactions_created_at_brin;
+DROP INDEX IF EXISTS idx_transactions_created_at;
+DROP INDEX IF EXISTS idx_transactions_created_at_brin;
