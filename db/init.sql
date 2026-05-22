@@ -254,10 +254,10 @@ $$ LANGUAGE plpgsql;
 
 
 -- ============================================================
--- Seed Data: 1,000,000 Test Accounts
+-- Seed Data: 100,000 Test Accounts
 -- ============================================================
 -- Auto-seeded so no one needs to run extra scripts.
--- Account format: ACC_0000001 through ACC_1000000
+-- Account format: ACC_0000001 through ACC_0100000
 -- All accounts start with a large balance and 'active' status.
 --
 -- Uses batch inserts (50k per batch) for fast bulk loading.
@@ -267,7 +267,7 @@ $$ LANGUAGE plpgsql;
 DO $$
 DECLARE
     batch_size  INT := 50000;
-    total       INT := 1000000;
+    total       INT := 100000;
     batch_start INT := 1;
     existing    INT;
 BEGIN
