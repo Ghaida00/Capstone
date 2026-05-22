@@ -428,6 +428,66 @@ impl RedisCache {
         Ok(removed)
     }
 
+    /// Pipelined batched `RPOPLPUSH src dst` — N invocations in one
+    /// network round-trip. Each `RPOPLPUSH` is individually atomic
+    /// and inflight-safe; the pipeline only removes per-call network
+    /// cost. Returns the items actually claimed (fewer than `n` when
+    /// `src` runs out).
+    pub async fn rpoplpush_batch(
+        &self,
+        src: &str,
+        dst: &str,
+        n: usize,
+    ) -> Result<Vec<String>, AppError> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.write_conn().await?;
+        let mut pipe = ::redis::pipe();
+        for _ in 0..n {
+            pipe.cmd("RPOPLPUSH").arg(src).arg(dst);
+        }
+        let results: Vec<Option<String>> =
+            self.map_redis(pipe.query_async(&mut *conn).await)?;
+        Ok(results.into_iter().flatten().collect())
+    }
+
+    /// `MGET` against the master pool (no replication lag). Values
+    /// align with input; `None` for missing keys.
+    pub async fn mget_master_raw(
+        &self,
+        keys: &[String],
+    ) -> Result<Vec<Option<String>>, AppError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.write_conn().await?;
+        let values: Vec<Option<String>> = self.map_redis(
+            ::redis::cmd("MGET").arg(keys).query_async(&mut *conn).await,
+        )?;
+        Ok(values)
+    }
+
+    /// Pipelined batched `LREM list 1 key` — one round-trip for N
+    /// keys. Returns total items removed (sum across the N LREMs).
+    pub async fn lrem_batch(
+        &self,
+        list: &str,
+        keys: &[String],
+    ) -> Result<i64, AppError> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.write_conn().await?;
+        let mut pipe = ::redis::pipe();
+        for k in keys {
+            pipe.cmd("LREM").arg(list).arg(1).arg(k);
+        }
+        let removed: Vec<i64> =
+            self.map_redis(pipe.query_async(&mut *conn).await)?;
+        Ok(removed.iter().sum())
+    }
+
     /// Raw GET against the MASTER pool (no replication lag),
     /// returning the JSON string. Used by writers that read what
     /// they just wrote — replay detection on the idempotency
