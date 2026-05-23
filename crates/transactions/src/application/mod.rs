@@ -472,17 +472,39 @@ impl TransactionService for TransactionsService {
             .await
             .map_err(|e| TransactionError::Infra(e.to_string()))?;
 
-        // Hot path: `transactions` already has the row, skip the
-        // idempotency check. Cold path: `transactions` missed,
-        // ask `idempotency_keys` to disambiguate "still in
-        // flight" from "never accepted".
+        // Hot path: `transactions` already has the row, skip both
+        // idempotency checks. Cold path: `transactions` missed, ask
+        // both idempotency stores in turn.
+        //
+        // The PG check covers the "consumer hasn't materialised the
+        // transactions row yet but the idempotency row is already
+        // in PG" gap (the case the spec's original fix was written
+        // for — applies fully under IDEMPOTENCY_BACKEND=pg).
+        //
+        // The Redis check covers the further gap introduced by the
+        // Hybrid / Redis backends: the reservation lives in Redis
+        // from POST until the `redis_intake` worker flushes it to
+        // PG. During that window the PG check misses but the
+        // reservation is genuinely in flight; pre-this-fix, every
+        // poll-immediately-after-POST returned a spurious 404
+        // (empirically 20/20 first-polls). PG-only backend impls
+        // return false from this method so the cost is zero there.
         let idem_exists = if tx_status.is_some() {
             false
         } else {
-            self.repo
+            let in_pg = self
+                .repo
                 .idempotency_exists_for_reference(reference_id)
                 .await
-                .map_err(|e| TransactionError::Infra(e.to_string()))?
+                .map_err(|e| TransactionError::Infra(e.to_string()))?;
+            if in_pg {
+                true
+            } else {
+                self.idempotency
+                    .reservation_exists_for_reference(reference_id, self.shards.num_shards())
+                    .await
+                    .map_err(|e| TransactionError::Infra(e.to_string()))?
+            }
         };
 
         resolve_status_view(tx_status, idem_exists, reference_id)

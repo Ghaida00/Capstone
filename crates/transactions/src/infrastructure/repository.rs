@@ -648,4 +648,16 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
         metrics::counter!("idempotency_hits_total").increment(1);
         Ok(ReserveOutcome::Replay(payload))
     }
+
+    async fn reservation_exists_for_reference(
+        &self,
+        _reference_id: &str,
+        _num_shards: usize,
+    ) -> Result<bool, RepoError> {
+        // Pure-PG backend never writes to the Redis idempotency
+        // namespace. The PG-side check in
+        // `TransactionRepository::idempotency_exists_for_reference`
+        // is already authoritative for this backend.
+        Ok(false)
+    }
 }
