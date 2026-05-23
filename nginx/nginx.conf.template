@@ -44,6 +44,15 @@ http {
     keepalive_requests 10000;
     types_hash_max_size 2048;
 
+    # MIME types: needed by the /dashboard/ location which serves
+    # static files directly. The proxied API locations don't rely on
+    # this (the upstream Rust app sets Content-Type itself), which is
+    # why the include was never required before adding the dashboard.
+    # Without it, nginx defaults every static file to text/plain and
+    # browsers reject CSS/JS under strict MIME checking + nosniff.
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
     # ─── Buffers ─────────────────────────────────────────
     client_body_buffer_size 16k;
     client_max_body_size 8m;
@@ -181,27 +190,12 @@ http {
             proxy_next_upstream_timeout 5s;
         }
 
-        # Dashboard: static demo UI served from /var/www/dashboard/
-        # (mounted in docker-compose). The global CSP `default-src 'none'`
-        # is overridden ONLY for this prefix — every API route keeps the
-        # locked-down default. 'unsafe-eval' is required because
-        # Babel-standalone transpiles JSX at runtime; would be pre-compiled
-        # away in any prod variant. Cleanly detachable — drop this block
-        # and the docker-compose volume to remove the feature.
-        location /dashboard/ {
-            alias /var/www/dashboard/;
-            index index.html;
-            try_files $uri $uri/ /dashboard/index.html;
-
-            add_header Content-Security-Policy
-                "default-src 'self'; script-src 'self' 'unsafe-eval'; "
-                "style-src 'self' 'unsafe-inline'; font-src 'self'; "
-                "img-src 'self' data:; connect-src 'self'" always;
-            add_header X-Content-Type-Options "nosniff" always;
-            add_header X-Frame-Options "DENY" always;
-
-            expires 5m;
-        }
+        # Optional per-feature location blocks live in
+        # /etc/nginx/server.d/. The base image ships no such directory;
+        # the dashboard mounts one via docker-compose.dashboard.yml.
+        # Empty dir = no-op, so the base bring-up needs no edits to
+        # enable / disable feature locations.
+        include /etc/nginx/server.d/*.conf;
 
         location / {
             return 404 '{"error":"not_found","message":"Route not found"}';
