@@ -234,30 +234,36 @@ function App() {
     if (sending) return;
     setSending(true);
     const refId = PL.genRefId('manual');
-    const t0 = Date.now();
+    // tStart is the wall-clock origin for *both* timers: request → pending
+    // (accept time) AND request → done (full end-to-end). The previous
+    // version measured the post-202 poll duration as "completed in X ms",
+    // which hid the accept latency from the displayed end-to-end number.
+    const tStart = Date.now();
     try {
       const res = await PL.sendTxn(deps, {
         from_account: from, to_account: to, amount: amt,
         currency: 'IDR', reference_id: refId, description: 'dashboard manual',
       });
-      const acceptMs = Date.now() - t0;
+      const tPendingAt = Date.now();
+      const acceptMs = tPendingAt - tStart;
       addLog({
-        tag: 'ok',
-        msg: <>POST /transactions <span className="accent">{res.data.status === 'pending' ? '202' : '200'}</span> {acceptMs}ms · ref=<span className="mono">{refId}</span></>,
+        tag: 'info',
+        msg: <>POST /transactions → <span className="accent">pending</span> in <span className="num">{acceptMs}ms</span> · ref=<span className="mono">{refId}</span></>,
       });
-      const tPoll0 = Date.now();
       try {
         const final = await PL.pollStatus(deps, refId, {
           intervalMs: STATUS_POLL_INTERVAL_MS, timeoutMs: STATUS_POLL_TIMEOUT_MS,
         });
-        const totalMs = Date.now() - tPoll0;
+        const tDoneAt = Date.now();
+        const e2eMs = tDoneAt - tStart;          // request → done (the honest end-to-end)
+        const asyncMs = tDoneAt - tPendingAt;    // pending → done (queue + batch + DB)
         addLog({
           tag: final.status === 'completed' ? 'ok' : 'warn',
-          msg: <>ref=<span className="mono">{refId}</span> → <span className="accent">{final.status}</span> in <span className="num">{totalMs}ms</span></>,
+          msg: <>ref=<span className="mono">{refId}</span> → <span className="accent">{final.status}</span> · end-to-end <span className="num">{e2eMs}ms</span> (accept {acceptMs}ms + async {asyncMs}ms)</>,
         });
-        toast(`Transaction ${final.status}`, { detail: `ref=${refId.slice(0,12)}… · ${totalMs}ms` });
+        toast(`${final.status} in ${e2eMs}ms`, { detail: `accept ${acceptMs}ms · async ${asyncMs}ms` });
       } catch (timeout) {
-        addLog({ tag: 'warn', msg: <>ref=<span className="mono">{refId}</span> status-poll timeout</> });
+        addLog({ tag: 'warn', msg: <>ref=<span className="mono">{refId}</span> status-poll timeout (accept was {acceptMs}ms)</> });
       }
     } catch (e) {
       addLog({ tag: 'warn', msg: <>POST /transactions failed: {String(e.message)}</> });
@@ -270,25 +276,73 @@ function App() {
   const onBurst = useCallback(async ({ n }) => {
     if (bursting || !n) return;
     setBursting(true);
+    // refTimes records the wall-clock moment each POST was actually
+    // issued (worker pool != linear). Pairing with the completion
+    // timestamp from pollStatus gives a true per-request end-to-end
+    // number — the previous "total 805ms" only measured accept-only,
+    // matching what k6 reports and hiding the queue + batch + DB
+    // latency every burst transaction also pays.
+    const refs = [];
+    const refTimes = new Map();
     try {
       const out = await PL.runBurst({
         n,
         concurrency: BURST_CONCURRENCY,
-        fetcher: (payload) => PL.sendTxn(deps, payload),
-        payloadGen: (i) => ({
-          from_account: 'ACC_0000001',
-          to_account: 'ACC_0000042',
-          amount: '1.00',
-          currency: 'IDR',
-          reference_id: PL.genRefId(`burst-${i}`),
-          description: 'dashboard burst',
-        }),
+        fetcher: (payload) => {
+          refTimes.set(payload.reference_id, Date.now());
+          return PL.sendTxn(deps, payload);
+        },
+        payloadGen: (i) => {
+          const refId = PL.genRefId(`burst-${i}`);
+          refs.push(refId);
+          return {
+            from_account: 'ACC_0000001',
+            to_account: 'ACC_0000042',
+            amount: '1.00',
+            currency: 'IDR',
+            reference_id: refId,
+            description: 'dashboard burst',
+          };
+        },
       });
+
+      // Phase 1: accept-only summary (mirrors what k6 / http_req_duration
+      // measure — fast, comparable across tools).
       addLog({
         tag: out.failed === 0 ? 'ok' : 'warn',
-        msg: <>BURST × {out.ok + out.failed} · {out.failed === 0 ? <span className="accent">100% ok</span> : <span className="accent">{out.ok} ok / {out.failed} failed</span>} · max <span className="num">{out.maxLatencyMs}ms</span> · total <span className="num">{out.totalMs}ms</span></>,
+        msg: <>BURST × {out.ok + out.failed} · {out.failed === 0 ? <span className="accent">100% accepted</span> : <span className="accent">{out.ok} accepted / {out.failed} failed</span>} in <span className="num">{out.totalMs}ms</span> (max single accept <span className="num">{out.maxLatencyMs}ms</span>) · polling end-to-end…</>,
       });
-      toast(`Burst ${out.ok}/${out.ok + out.failed} ok`, { detail: `max ${out.maxLatencyMs}ms` });
+
+      // Phase 2: end-to-end per ref. Promise.all is fine here — each
+      // pollStatus is GET-only and we already capped the burst at 100,
+      // so the inflight read load is bounded. Total wall-clock ~= the
+      // slowest end-to-end (the worker pool naturally batches polls).
+      if (out.ok > 0 && refs.length > 0) {
+        const polled = await Promise.all(refs.map(async (ref) => {
+          const postedAt = refTimes.get(ref);
+          if (postedAt == null) return null;
+          try {
+            const final = await PL.pollStatus(deps, ref, {
+              intervalMs: STATUS_POLL_INTERVAL_MS,
+              timeoutMs: STATUS_POLL_TIMEOUT_MS,
+            });
+            return { ref, status: final.status, e2eMs: Date.now() - postedAt };
+          } catch (_) {
+            return { ref, status: 'timeout', e2eMs: null };
+          }
+        }));
+        const completed = polled.filter(p => p && p.status === 'completed');
+        const stuck = polled.filter(p => p && p.status !== 'completed');
+        const e2es = completed.map(p => p.e2eMs);
+        const maxE2E = e2es.length ? Math.max(...e2es) : 0;
+        const minE2E = e2es.length ? Math.min(...e2es) : 0;
+        const avgE2E = e2es.length ? Math.round(e2es.reduce((s, v) => s + v, 0) / e2es.length) : 0;
+        addLog({
+          tag: stuck.length === 0 ? 'ok' : 'warn',
+          msg: <>BURST × {out.ok} end-to-end: <span className="accent">{completed.length} completed</span>{stuck.length > 0 && <>, {stuck.length} stuck</>} · range <span className="num">{minE2E}–{maxE2E}ms</span> · avg <span className="num">{avgE2E}ms</span></>,
+        });
+        toast(`Burst e2e: max ${maxE2E}ms`, { detail: `${completed.length}/${out.ok} completed · avg ${avgE2E}ms` });
+      }
     } catch (e) {
       addLog({ tag: 'warn', msg: <>Burst failed: {String(e.message)}</> });
     } finally {
