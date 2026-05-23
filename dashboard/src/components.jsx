@@ -159,9 +159,17 @@ function ActionsPanel({ onSend, onBurst, onBalance, onListRecent, sending, burst
   const [burstN, setBurstN] = useState("20");
   const [balAcc, setBalAcc] = useState("ACC_0000001");
 
+  // B4 fix: wrap each section in a <form> so Enter submits the
+  // primary action. Button defaults to type="submit" inside a form;
+  // secondary buttons declare type="button" so they don't accidentally
+  // submit.
+  const submitSend = (e) => { e.preventDefault(); if (!sending) onSend({ from, to, amt }); };
+  const submitBurst = (e) => { e.preventDefault(); if (!bursting) onBurst({ n: parseInt(burstN, 10) || 0 }); };
+  const submitBalance = (e) => { e.preventDefault(); onBalance({ acc: balAcc }); };
+
   return (
     <div className="actions">
-      <div className="actions-section">
+      <form className="actions-section" onSubmit={submitSend}>
         <div className="actions-section-title">Send transaction</div>
         <div className="field-row">
           <div className="field">
@@ -177,37 +185,40 @@ function ActionsPanel({ onSend, onBurst, onBalance, onListRecent, sending, burst
           <span className="field-label">amount</span>
           <input className="input" value={amt} onChange={e => setAmt(e.target.value)} />
         </div>
-        <button className="btn btn-mint" onClick={() => onSend({ from, to, amt })} disabled={sending}>
+        <button type="submit" className="btn btn-mint" disabled={sending}>
           <Icon name="send" size={13}/> {sending ? "Sending…" : "Send transaction"}
         </button>
-      </div>
+      </form>
 
-      <div className="actions-section">
+      <form className="actions-section" onSubmit={submitBurst}>
         <div className="actions-section-title">Burst</div>
         <div className="field">
-          <span className="field-label">count (max 100)</span>
-          <input className="input" value={burstN} onChange={e => setBurstN(e.target.value)} />
+          <span className="field-label">count (1–100)</span>
+          {/* B5 fix: numeric input with hard min/max so the browser
+              enforces the same range runBurst's HARD_CAP enforces. */}
+          <input className="input" type="number" min="1" max="100" step="1"
+                 value={burstN} onChange={e => setBurstN(e.target.value)} />
         </div>
-        <button className="btn btn-amber" onClick={() => onBurst({ n: parseInt(burstN, 10) || 0 })} disabled={bursting}>
+        <button type="submit" className="btn btn-amber" disabled={bursting}>
           <Icon name="flame" size={13}/> {bursting ? "Bursting…" : `Fire burst (×${burstN || 0})`}
         </button>
-      </div>
+      </form>
 
-      <div className="actions-section">
+      <form className="actions-section" onSubmit={submitBalance}>
         <div className="actions-section-title">Read</div>
         <div className="field">
           <span className="field-label">account</span>
           <input className="input" value={balAcc} onChange={e => setBalAcc(e.target.value)} />
         </div>
         <div className="btn-row">
-          <button className="btn btn-ghost" onClick={() => onBalance({ acc: balAcc })}>
+          <button type="submit" className="btn btn-ghost">
             <Icon name="search" size={13}/> Balance
           </button>
-          <button className="btn btn-ghost" onClick={() => onListRecent()}>
+          <button type="button" className="btn btn-ghost" onClick={() => onListRecent()}>
             <Icon name="list" size={13}/> List recent
           </button>
         </div>
-      </div>
+      </form>
     </div>
   );
 }

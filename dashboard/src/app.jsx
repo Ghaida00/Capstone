@@ -1,5 +1,14 @@
 /* Peakload dashboard — App: state, polling loops, action handlers.
-   Reads kernels from window.PL and components from window globals. */
+   Reads kernels from window.PL and components from window globals.
+
+   Whole file wrapped in an IIFE because Babel-standalone injects each
+   transpiled text/babel script as an inline <script> in the document.
+   Top-level `const` in classic scripts shares a lexical environment
+   across scripts, so a second `const { useState, ... } = React;` here
+   would collide with the same destructure at the top of components.jsx
+   ("Identifier 'useState' has already been declared"). */
+
+(function () {
 
 const { useState, useEffect, useRef, useCallback } = React;
 const PL = window.PL;
@@ -53,10 +62,11 @@ function buildLatencyBuckets(metrics) {
 }
 
 // Map /health JSON → 6 + N rows (one per service + one per replica).
+// B2 fix: when health is null (fetch failed), the caller is expected
+// to keep the previously rendered rows and just flag the cluster as
+// degraded in the header — see the health-poll catch branch. This
+// function only handles the happy path now.
 function healthToRows(health) {
-  if (!health) {
-    return [{ id: 'app', name: 'app', meta: 'unreachable', glyph: 'A', status: 'err' }];
-  }
   const s = health.services || {};
   const rows = [
     { id: 'app',    name: 'app',      meta: 'axum · :3000', glyph: 'A',  status: health.status === 'healthy' ? 'ok' : 'warn' },
@@ -107,17 +117,16 @@ function App() {
   const prevHealthRef = useRef(null);
 
   const addLog = useCallback((entry) => {
-    setLogEntries(prev => {
-      const next = [{
-        id: Math.random().toString(36).slice(2),
-        t: fmtTime(),
-        fresh: true,
-        ...entry,
-      }, ...prev].slice(0, LOG_MAX);
-      return next;
-    });
+    // B1 fix: stamp a unique id per entry and clear `fresh` only for
+    // that id later. Previous version cleared every entry's fresh flag
+    // on every timer fire, so a burst of logs killed each other's
+    // highlight animations.
+    const id = Math.random().toString(36).slice(2);
+    setLogEntries(prev => [{
+      id, t: fmtTime(), fresh: true, ...entry,
+    }, ...prev].slice(0, LOG_MAX));
     setTimeout(() => {
-      setLogEntries(prev => prev.map(e => ({ ...e, fresh: false })));
+      setLogEntries(prev => prev.map(e => e.id === id ? { ...e, fresh: false } : e));
     }, 400);
   }, []);
 
@@ -207,8 +216,19 @@ function App() {
         }
         prevHealthRef.current = h.status;
       } catch (e) {
-        setComponents(healthToRows(null));
+        // B2 + B3 fix: don't erase the component rows on a transient
+        // /health blip — just flip the header pill. Audience sees
+        // "cluster degraded" without the card disappearing. Also log
+        // the transition the FIRST time we go degraded, so the
+        // activity stream has a paper trail before the eventual
+        // "health transition: healthy" log on recovery.
+        if (cancelled) return;
         setHealthStatus('degraded');
+        const prev = prevHealthRef.current;
+        if (prev && prev !== 'degraded') {
+          addLog({ tag: 'warn', msg: <>/health unreachable — cluster marked <span className="accent">degraded</span></> });
+        }
+        prevHealthRef.current = 'degraded';
       }
     }
 
@@ -442,3 +462,5 @@ root.render(
     <App/>
   </ToastProvider>
 );
+
+})();
