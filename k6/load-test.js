@@ -7,7 +7,7 @@ const transactionCreated = new Counter("transactions_created");
 const transactionRead = new Counter("transactions_read");
 const errorRate = new Rate("error_rate");
 const transactionLatency = new Trend("transaction_latency", true);
-const idempotencyReplayHits = new Counter("idempotency_replay_attempts");
+const idempotencyReplayAttempts = new Counter("idempotency_replay_attempts");
 
 // ─── Configuration ─────────────────────────────────────────
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";

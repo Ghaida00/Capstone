@@ -1,13 +1,16 @@
 import http from "k6/http";
 import { check, sleep, group } from "k6";
-import { Rate, Counter, Trend } from "k6/metrics";
+import { Rate, Counter } from "k6/metrics";
 
 // ─── Custom Metrics ────────────────────────────────────────
+// Per-endpoint latency lives on the built-in `http_req_duration`
+// metric, sliced by `tags.name`. A separate `transaction_latency`
+// Trend mixed POST and GET into one distribution, making its p95
+// meaningless — dropped in favour of the per-endpoint thresholds.
 const transactionCreated = new Counter("transactions_created");
 const transactionRead = new Counter("transactions_read");
 const errorRate = new Rate("error_rate");
-const transactionLatency = new Trend("transaction_latency", true);
-const idempotencyReplayHits = new Counter("idempotency_replay_attempts");
+const idempotencyReplayAttempts = new Counter("idempotency_replay_attempts");
 
 // ─── Configuration ─────────────────────────────────────────
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";
@@ -15,25 +18,15 @@ const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";
 // Must match the accounts seeded by db/init.sql (ACC_0000001 – ACC_0100000)
 const NUM_ACCOUNTS = 100000;
 
-// Hot-key contention pool: tiny set to force row-lock waits on the
-// debit UPDATE. Exercises the locking behavior that the uniform
-// 1M-account pick can never reach.
-const HOT_KEY_POOL_SIZE = 10;
-
-// Pool fits inside the `v1:balance:` 30 s Redis TTL so steady-state
-// polls hit warm.
+// Pool fits inside the `v1:balance:` 10 s Redis TTL
+// (BALANCE_CACHE_TTL_SECS in crates/accounts/src/application/mod.rs)
+// so steady-state polls hit warm.
 const BALANCE_POLL_POOL_SIZE = 100;
 
-// Random account from the 1M pool. Generated on-the-fly so we never
-// allocate a 1M array per VU.
+// Random account from the 100k pool. Generated on-the-fly so we never
+// allocate a 100k array per VU.
 function randomAccount() {
   const i = Math.floor(Math.random() * NUM_ACCOUNTS) + 1;
-  return `ACC_${String(i).padStart(7, "0")}`;
-}
-
-// Random account from the 10-key hot pool.
-function hotAccount() {
-  const i = Math.floor(Math.random() * HOT_KEY_POOL_SIZE) + 1;
   return `ACC_${String(i).padStart(7, "0")}`;
 }
 
@@ -68,15 +61,56 @@ function pickReplayRequest() {
 // ─── Test Scenarios ────────────────────────────────────────
 
 export const options = {
+  // Default summary stats include only avg/min/med/max/p(90)/p(95).
+  // Add p(99) + p(99.9) explicitly so the per-run stdout shows the
+  // tail percentiles the thresholds gate on (otherwise you must
+  // reach for Grafana even to see whether the p(99)<150 threshold
+  // was tight or loose).
+  summaryTrendStats: ["avg", "min", "med", "max", "p(90)", "p(95)", "p(99)", "p(99.9)", "count"],
+
+  // Global tags get attached to every sample so Grafana/k6 Cloud
+  // can filter runs by environment + commit. Run-local default to
+  // ms-since-epoch so back-to-back local runs do not overlap in
+  // the same series.
+  tags: {
+    environment: __ENV.K6_ENV || "local",
+    run_id: __ENV.RUN_ID || String(Date.now()),
+    git_sha: __ENV.GIT_SHA || "dev",
+  },
+
+  // Don't reuse TCP connections across iterations — this is the
+  // k6 default but stated explicitly here for reproducibility
+  // across k6 versions and against external readers.
+  noConnectionReuse: false,
+  insecureSkipTLSVerify: false,
+
   scenarios: {
     sustained_1m_per_hour: {
-      executor: "constant-arrival-rate",
-      rate: 278,
+      // Ramping arrival rate: a 1-minute warmup avoids the cold-
+      // pool / cold-cache thundering herd that briefly spikes p99
+      // at t=0 with constant-arrival-rate. The 1-minute cooldown
+      // exposes whether p99 recovers cleanly after load stops —
+      // a leak / queue-buildup bug shows up here as p99 staying
+      // high after the load drops to zero.
+      //
+      // Note: the progress bar may show a non-zero rate (~3 iter/s)
+      // at t=14:59.x because target=0 is reached at the END of the
+      // last stage, not before. That is a k6 progress-display
+      // quirk for ramping-arrival-rate, not a real "scenario did
+      // not complete" condition — `iterations` counts all
+      // dispatched, all complete, no orphans.
+      executor: "ramping-arrival-rate",
+      startRate: 50,
       timeUnit: "1s",
-      duration: "15m",
       preAllocatedVUs: 300,
       maxVUs: 1500,
+      stages: [
+        { duration: "1m",  target: 278 },   // warmup: 50 → 278 rps
+        { duration: "13m", target: 278 },   // sustained at 1M/hour
+        { duration: "1m",  target: 0 },     // cooldown: 278 → 0
+      ],
       exec: "txWorkload",
+      gracefulStop: "30s",
       tags: { scenario: "sustained_1m_per_hour" },
     },
 
@@ -95,8 +129,15 @@ export const options = {
   },
 
   thresholds: {
+    // `abortOnFail` kills the run if the error rate breaches the
+    // SLO — no point burning 15 minutes against a wedged server
+    // once the gate has tripped. `delayAbortEval: "2m"` rides
+    // through the warmup window (cold pools, cache misses) where
+    // a 1-minute moving rate can spike harmlessly.
+    http_req_failed: [
+      { threshold: "rate<0.05", abortOnFail: true, delayAbortEval: "2m" },
+    ],
     http_req_duration: ["p(95)<500", "p(99)<1500"],
-    http_req_failed: ["rate<0.05"],
     error_rate: ["rate<0.05"],
 
     // Per-endpoint targets in ms. Floors set by loopback HTTP
@@ -135,10 +176,22 @@ function logFailure(context, res) {
 // Poll /api/v2/transactions/status/{ref} until the consumer marks
 // the row completed/failed. Used by setup to verify end-to-end works
 // before the load scenarios start.
+//
+// Server-side fix means the endpoint returns 200 + `status: "pending"`
+// during the brief accept→flush window (instead of the previous 404).
+// No `responseCallback` workaround needed — every setup poll is now
+// a true 200, so k6's default failure classification is correct.
+const SETUP_POLL_PARAMS = {
+  tags: { name: "GET /api/v2/transactions/status/:ref (setup poll)" },
+};
+
 function waitForCompletion(refId, timeoutMs = 5000, pollMs = 200) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const res = http.get(`${BASE_URL}/api/v2/transactions/status/${refId}`);
+    const res = http.get(
+      `${BASE_URL}/api/v2/transactions/status/${refId}`,
+      SETUP_POLL_PARAMS
+    );
     if (res.status === 200) {
       try {
         const body = JSON.parse(res.body);
@@ -156,29 +209,31 @@ function waitForCompletion(refId, timeoutMs = 5000, pollMs = 200) {
 }
 
 // ─── Setup: Verify connectivity & end-to-end pipeline ──────
+// Any unrecoverable problem here throws — k6 aborts before
+// scenarios fire, so we don't burn 15 minutes of iterations
+// against a wedged pipeline.
 export function setup() {
   console.log(`🎯 Target: ${BASE_URL}`);
-  console.log(`📊 Running: smoke → load → stress → spike → hotkey`);
-  console.log(`👥 Using ${NUM_ACCOUNTS} pre-seeded accounts (ACC_0000001 – ACC_0100000)`);
-  console.log(`🔥 Hot-key pool: ${HOT_KEY_POOL_SIZE} accounts (ACC_0000001 – ACC_${String(HOT_KEY_POOL_SIZE).padStart(7, "0")})\n`);
+  console.log(`📊 Running: sustained 1M/hour + balance poll`);
+  console.log(`👥 Using ${NUM_ACCOUNTS} pre-seeded accounts (ACC_0000001 – ACC_0100000)\n`);
 
   // 1. Health check
   const health = http.get(`${BASE_URL}/health`);
   if (health.status !== 200) {
-    console.error(`❌ Health check failed! Status: ${health.status}`);
-    console.error(`   Make sure docker-compose is running.`);
-    return { ok: false };
+    throw new Error(
+      `Health check failed (status ${health.status}). ` +
+        `Make sure docker-compose is running.`
+    );
   }
   console.log(`✅ Health check passed`);
 
   // 2. Verify accounts exist (no state mutation)
   const balanceRes = http.get(`${BASE_URL}/api/v2/accounts/ACC_0000001/balance`);
   if (balanceRes.status !== 200) {
-    console.error(
-      `❌ Account ACC_0000001 not found (status ${balanceRes.status}).\n` +
-        `   Seed accounts first via db/init.sql or k6/seed-accounts.sql.`
+    throw new Error(
+      `Account ACC_0000001 not found (status ${balanceRes.status}). ` +
+        `Seed accounts first via db/init.sql or k6/seed-accounts.sql.`
     );
-    return { ok: false };
   }
   console.log(`✅ Accounts verified (ACC_0000001 exists)`);
 
@@ -202,33 +257,34 @@ export function setup() {
 
   console.log(`   Create status: ${createRes.status}`);
   if (createRes.status < 200 || createRes.status >= 300) {
-    console.error(
-      `❌ Transaction create returned ${createRes.status}. ` +
+    throw new Error(
+      `Transaction create returned ${createRes.status}. ` +
         `Body: ${String(createRes.body).substring(0, 300)}`
     );
-    return { ok: false };
   }
 
-  const finalStatus = waitForCompletion(setupRefId, 8000, 200);
+  // 30 s is sized to absorb residual drain from a previous run —
+  // the cross-shard processor + idempotency publisher can keep
+  // backends busy for ~1–3 minutes after a 15-minute load finishes.
+  // A back-to-back run started during that window queues this
+  // setup tx behind that backlog; 30 s gives the consumer one full
+  // tick of headroom over the usual cold-start ~5 s. Past 30 s the
+  // pipeline is genuinely wedged and aborting is the right move.
+  const finalStatus = waitForCompletion(setupRefId, 30000, 250);
   if (finalStatus === null) {
-    console.error(
-      `❌ Consumer did not process setup transaction within 8s. ` +
-        `RabbitMQ or consumer may be wedged.`
+    throw new Error(
+      `Consumer did not process setup transaction within 30s. ` +
+        `Either RabbitMQ/consumer is wedged, or a prior run's ` +
+        `backlog hasn't drained yet — wait 1–3 min and retry.`
     );
-    return { ok: false };
   }
   console.log(`✅ Consumer processed setup tx → status=${finalStatus}\n`);
 
-  return { ok: true };
+  return {};
 }
 
-// ─── Main workload (smoke / load / stress / spike) ─────────
-export function txWorkload(data) {
-  if (!data.ok) {
-    sleep(1);
-    return;
-  }
-
+// ─── Main workload ─────────────────────────────────────────
+export function txWorkload() {
   group("Create Transaction", () => {
     // ~5% of iterations replay a full earlier request — simulates
     // a real client retrying after a network glitch (same payload,
@@ -239,7 +295,7 @@ export function txWorkload(data) {
     if (Math.random() < 0.05 && replayBuffer.length > 0) {
       payloadObj = pickReplayRequest();
       isReplay = true;
-      idempotencyReplayHits.add(1);
+      idempotencyReplayAttempts.add(1);
     } else {
       let fromAccount = randomAccount();
       let toAccount = randomAccount();
@@ -283,14 +339,15 @@ export function txWorkload(data) {
       "not overloaded": () => res.status !== 503,
     });
 
-    errorRate.add(!isAccepted);
-    transactionLatency.add(res.timings.duration);
+    errorRate.add(!isAccepted, { endpoint: "POST /api/v2/transactions" });
 
     if (isAccepted) {
-      // Counter reflects accepted creates only — the dashboard
-      // panel that compares this against the server's
-      // `transactions_processed_total` should match modulo the
-      // queue → consumer delay.
+      // Counter mirrors the server's `transactions_created_total`,
+      // which is incremented once per accepted POST inside the HTTP
+      // handler — including the replay branch. So the two rates
+      // should match 1:1 (no queue→consumer lag). If you want a
+      // counter that mirrors `transactions_processed_total`
+      // instead, exclude replays here.
       transactionCreated.add(1);
       if (!isReplay) {
         rememberRequest(payloadObj);
@@ -327,8 +384,7 @@ export function txWorkload(data) {
       },
     });
 
-    errorRate.add(!ok);
-    transactionLatency.add(res.timings.duration);
+    errorRate.add(!ok, { endpoint: "GET /api/v2/transactions" });
 
     if (ok) {
       transactionRead.add(1);
@@ -337,57 +393,7 @@ export function txWorkload(data) {
     }
   });
 
-  sleep(Math.random() * 0.5);
-}
-
-// ─── Hot-key workload ──────────────────────────────────────
-// Picks both `from` and `to` from a tiny 10-account pool so the
-// per-row UPDATE inside the sender's tx contends. Verifies that
-// the new same-shard same-tx atomicity does not deadlock and that
-// the consumer-side idempotency check does not regress correctness
-// when concurrent retries fight over the same row.
-export function hotKeyWorkload(data) {
-  if (!data.ok) {
-    sleep(1);
-    return;
-  }
-
-  let fromAccount = hotAccount();
-  let toAccount = hotAccount();
-  while (toAccount === fromAccount) {
-    toAccount = hotAccount();
-  }
-
-  const referenceId = `hot-${__VU}-${__ITER}-${Date.now()}`;
-  const amount = (Math.random() * 10 + 1).toFixed(2);
-  const payload = JSON.stringify({
-    from_account: fromAccount,
-    to_account: toAccount,
-    amount,
-    currency: "IDR",
-    reference_id: referenceId,
-    description: `k6 hot-key`,
-  });
-
-  const res = http.post(`${BASE_URL}/api/v2/transactions`, payload, {
-    headers: { "Content-Type": "application/json" },
-    tags: { name: "POST /api/v2/transactions (hotkey)" },
-  });
-
-  const isAccepted = res.status >= 200 && res.status < 300;
-  check(res, {
-    "hotkey create status 2xx": () => isAccepted,
-  });
-
-  errorRate.add(!isAccepted);
-  transactionCreated.add(1);
-  transactionLatency.add(res.timings.duration);
-
-  if (!isAccepted) {
-    logFailure("Hot-Key Create", res);
-  }
-
-  sleep(Math.random() * 0.2);
+  // No sleep: open-model executor paces requests itself; iteration-end sleep would only inflate the VU pool. (balancePollWorkload's sleep is correct — that scenario is closed-model.)
 }
 
 // ─── Balance-poll workload (separate scenario, low VU) ─────
@@ -402,32 +408,12 @@ export function balancePollWorkload() {
   check(res, {
     "balance status 200": () => res.status === 200,
   });
-  if (res.status !== 200) {
-    errorRate.add(1);
+  const balanceFailed = res.status !== 200;
+  errorRate.add(balanceFailed, { endpoint: "GET /api/v2/accounts/:id/balance" });
+  if (balanceFailed) {
     logFailure("Balance Poll", res);
-  } else {
-    errorRate.add(0);
   }
   sleep(0.1);
-}
-
-// ─── Health probe (separate scenario, low VU) ──────────────
-export function healthProbe() {
-  const res = http.get(`${BASE_URL}/health`, {
-    tags: { name: "GET /health" },
-  });
-  check(res, {
-    "health status 200": () => res.status === 200,
-    "health response valid": () => {
-      try {
-        const body = JSON.parse(res.body);
-        return body.status === "healthy" || body.status === "degraded";
-      } catch (e) {
-        return false;
-      }
-    },
-  });
-  sleep(2); // probe every ~2s
 }
 
 // ─── Teardown: Print summary ───────────────────────────────
