@@ -87,6 +87,18 @@ pub(crate) trait TransactionRepository: Send + Sync + 'static {
         &self,
         reference_id: &str,
     ) -> Result<Option<TransactionStatus>, RepoError>;
+
+    /// Cross-shard existence check by reference_id against
+    /// `idempotency_keys`. Returns `true` as soon as any shard
+    /// reports a hit. Used by `get_status_by_reference` to
+    /// disambiguate the accept→flush window: if `transactions`
+    /// has no row but `idempotency_keys` does, the request was
+    /// accepted and is still in flight (200 + pending), not
+    /// genuinely missing (404).
+    async fn idempotency_exists_for_reference(
+        &self,
+        reference_id: &str,
+    ) -> Result<bool, RepoError>;
 }
 
 // ─── Idempotency-aware writer trait ─────────────────────────
