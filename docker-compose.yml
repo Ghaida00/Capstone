@@ -332,6 +332,11 @@ services:
       # OPS-2 / S-5: rendered by the official image's envsubst step
       # (20-envsubst-on-templates.sh) at container start.
       - ./nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+      # Demo dashboard: static assets served by the /dashboard/
+      # location block. Cleanly detachable — drop this line and
+      # the location block to remove the feature with no Rust
+      # changes.
+      - ./dashboard:/var/www/dashboard:ro
     environment:
       # Edge rate-limit knobs. Default = production-safe ceiling.
       # Benchmarks restore bench throughput by exporting the high
