@@ -181,6 +181,28 @@ http {
             proxy_next_upstream_timeout 5s;
         }
 
+        # Dashboard: static demo UI served from /var/www/dashboard/
+        # (mounted in docker-compose). The global CSP `default-src 'none'`
+        # is overridden ONLY for this prefix — every API route keeps the
+        # locked-down default. 'unsafe-eval' is required because
+        # Babel-standalone transpiles JSX at runtime; would be pre-compiled
+        # away in any prod variant. Cleanly detachable — drop this block
+        # and the docker-compose volume to remove the feature.
+        location /dashboard/ {
+            alias /var/www/dashboard/;
+            index index.html;
+            try_files $uri $uri/ /dashboard/index.html;
+
+            add_header Content-Security-Policy
+                "default-src 'self'; script-src 'self' 'unsafe-eval'; "
+                "style-src 'self' 'unsafe-inline'; font-src 'self'; "
+                "img-src 'self' data:; connect-src 'self'" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header X-Frame-Options "DENY" always;
+
+            expires 5m;
+        }
+
         location / {
             return 404 '{"error":"not_found","message":"Route not found"}';
             default_type application/json;
