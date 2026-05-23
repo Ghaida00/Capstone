@@ -107,7 +107,7 @@ export const options = {
       stages: [
         { duration: "1m",  target: 278 },   // warmup: 50 → 278 rps
         { duration: "13m", target: 278 },   // sustained at 1M/hour
-        { duration: "1m",  target: 0 },     // cooldown: 278 → 0
+        { duration: "55s",  target: 0 },     // cooldown: 278 → 0
       ],
       exec: "txWorkload",
       gracefulStop: "30s",

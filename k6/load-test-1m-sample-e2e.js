@@ -2,47 +2,41 @@ import http from "k6/http";
 import { check, sleep, group } from "k6";
 import { Rate, Counter, Trend } from "k6/metrics";
 
-// ─── Load test: 1M *completed* per hour (end-to-end) ────────
-// Companion to load-test-1m.js. Same arrival shape (~278 rps for
-// 13 min sustained), same payload mix, same replay rate. The
-// difference: every fresh POST also polls /status/{ref} until the
-// transaction reaches a terminal state, and the per-request
-// wall-clock from "request issued" to "completed/failed" is
-// recorded into `transaction_e2e_ms`.
+// ─── Load test: 1M/hour, accept-only baseline + sampled e2e ──
+// Sibling to load-test-1m.js. Same arrival shape (~278 rps for
+// 13 min sustained), same payload mix, same replay rate. Adds a
+// sample-based end-to-end measurement: 5% of fresh accepted
+// transactions are also polled to terminal status, and the
+// per-request wall-clock from "request issued" to
+// "completed/failed" is recorded into `transaction_e2e_ms`.
 //
-// Why a separate file:
+// Why sampling and not full e2e (the now-removed load-test-e2e.js):
 //
-//   - load-test-1m.js measures **accept latency** only — the time
-//     from POST to 202. That's the right number for "does the API
-//     feel responsive?" SLOs (p95 < 50 ms), but it hides the
-//     batched async write path: queue → consumer batch → DB flush
-//     → outbox publish. End-to-end is typically 0.8–1.5 s per
-//     transaction.
-//   - This file measures the **honest tap-to-Successful** time.
-//     It's a stronger claim: not just "1M accepted per hour" but
-//     "1M *completed* per hour, with bounded end-to-end latency".
+//   - Full e2e at 278 rps added ~1400-2800 status polls/sec.
+//     That blew through the production-safe nginx per-IP rate
+//     limit (NGINX_PER_IP_RATE=2000 in .env) and dominated total
+//     read load on /status. The "what's our e2e under load?"
+//     question got polluted with "...with the system also under
+//     a self-inflicted poll storm".
+//   - 5% sampling adds only ~14 polls/sec — total client traffic
+//     stays at ~620 rps, comfortably under the per-IP ceiling.
+//   - 5% × 217k iters over 13 min ≈ 10,850 samples. Plenty for
+//     stable p50/p95/p99 without saturating the system from one
+//     k6 host.
 //
-// Why this also stresses the system harder than load-test-1m:
-//
-//   - Every iteration now does POST + ~5–10 GETs on /status (one
-//     every 100 ms until terminal). At 278 POST/s that's an extra
-//     ~1400–2800 read/s on the status endpoint. The status
-//     handler is Redis-cached, so most polls land sub-ms, but the
-//     fan-out is more realistic — real payment clients DO poll.
-//   - Each VU is busy ~1.5 s per iter (vs ~50 ms in load-test-1m).
-//     Little's law: 278 rps × 1.5 s = ~420 concurrent VUs. We
-//     pre-allocate 600 and cap maxVUs at 2000 for safety under
-//     end-to-end latency spikes.
+// The accept-side SLOs are identical to load-test-1m so this
+// script also serves as a stricter superset: regressions on
+// accept latency AND end-to-end completion are both caught.
 
 const transactionCreated = new Counter("transactions_created");
 const transactionRead = new Counter("transactions_read");
 const errorRate = new Rate("error_rate");
 const idempotencyReplayAttempts = new Counter("idempotency_replay_attempts");
 
-// End-to-end latency: from POST issuance to terminal status visible
-// on /status/{ref}. Trend so we get p50/p95/p99 reported. Replays
-// are EXCLUDED from this Trend — they hit the idempotency cache and
-// return near-instantly, which would skew the distribution optimistic.
+// End-to-end latency Trend (sampled). Trend so k6 reports
+// p50/p95/p99. Replays are NOT recorded — they hit the
+// idempotency cache and return ~instantly, which would skew the
+// distribution optimistic.
 const transactionE2eMs = new Trend("transaction_e2e_ms", true);
 const transactionsE2eCompleted = new Counter("transactions_e2e_completed");
 const transactionsE2eTimeout = new Counter("transactions_e2e_timeout");
@@ -52,10 +46,9 @@ const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";
 const NUM_ACCOUNTS = 100000;
 const BALANCE_POLL_POOL_SIZE = 100;
 
-// Per-iter e2e budget. 10 s gives plenty of headroom over the
-// observed ~1.5 s typical end-to-end while still failing fast on
-// genuinely stuck transactions. Timed-out polls increment
-// `transactions_e2e_timeout` and are NOT added to the Trend.
+// 5% of fresh accepts → e2e poll. Override via env var if needed:
+//   k6 run -e E2E_SAMPLE_RATE=0.10 k6/load-test-1m-sample-e2e.js
+const E2E_SAMPLE_RATE = parseFloat(__ENV.E2E_SAMPLE_RATE || "0.05");
 const E2E_POLL_TIMEOUT_MS = 10000;
 const E2E_POLL_INTERVAL_MS = 100;
 
@@ -99,31 +92,24 @@ export const options = {
   insecureSkipTLSVerify: false,
 
   scenarios: {
-    sustained_1m_per_hour_e2e: {
-      // Same arrival shape as load-test-1m.js, but each iter is
-      // ~30× longer wall-clock because of e2e polling. The
-      // ramping-arrival-rate executor pins the rate regardless of
-      // iter duration — k6 spins up VUs from the pool to meet it.
+    sustained_1m_per_hour: {
+      // Identical to load-test-1m.js. 5% e2e sampling adds only
+      // ~14 polls/sec, so no VU pool bump needed (each sampled VU
+      // spends ~1 extra second in pollStatus → ~14 concurrent
+      // VUs additional × 300 preAllocated is plenty).
       executor: "ramping-arrival-rate",
       startRate: 50,
       timeUnit: "1s",
-      // Little's law: 278 rps × ~1.5 s/iter ≈ 420 concurrent VUs.
-      // Pre-allocate 600 so the warmup doesn't stall on VU spawn;
-      // cap maxVUs at 2000 to ride out latency tails without
-      // hitting the default 1500 ceiling.
-      preAllocatedVUs: 600,
-      maxVUs: 2000,
+      preAllocatedVUs: 300,
+      maxVUs: 1500,
       stages: [
         { duration: "1m",  target: 278 },
         { duration: "13m", target: 278 },
-        { duration: "1m",  target: 0 },
+        { duration: "55s", target: 0 },
       ],
       exec: "txWorkload",
-      // 30 s isn't enough when iters can take 10 s — bump to 60 s
-      // so the cooldown phase actually drains in-flight e2e polls
-      // instead of orphaning them as interrupted iterations.
-      gracefulStop: "60s",
-      tags: { scenario: "sustained_1m_per_hour_e2e" },
+      gracefulStop: "30s",
+      tags: { scenario: "sustained_1m_per_hour" },
     },
 
     balance_poll: {
@@ -137,8 +123,7 @@ export const options = {
   },
 
   thresholds: {
-    // Same accept-side SLOs as load-test-1m, repeated here so a
-    // regression on POST latency is caught by this run too.
+    // Same accept-side SLOs as load-test-1m.
     http_req_failed: [
       { threshold: "rate<0.05", abortOnFail: true, delayAbortEval: "2m" },
     ],
@@ -149,23 +134,22 @@ export const options = {
     "http_req_duration{name:POST /api/v2/transactions}": ["p(50)<10", "p(95)<50", "p(99)<150"],
     "http_req_duration{name:GET /api/v2/transactions}": ["p(95)<50"],
 
-    // End-to-end SLOs. The hot path is bounded by batch fill +
-    // flush cadence (consumer batch size ~200; at 278 rps batches
-    // fill every ~0.7 s). A fresh transaction arrives somewhere
-    // in the cycle — average ~0.35 s queue wait + ~0.1 s DB write
-    // + accept ~0.05 s ≈ 0.5–1 s typical, up to ~1.5 s worst.
-    // p99 < 5 s allows headroom for batch-timeout flushes during
-    // load lulls.
+    // End-to-end SLOs. Bound by consumer batch fill + flush
+    // cadence (~200 txn batches at 278 rps fill every ~0.7 s).
+    // A fresh transaction averages ~0.35 s queue wait + ~0.1 s
+    // DB write + ~0.05 s accept ≈ 0.5–1 s typical, up to ~1.5 s
+    // worst. p99<5000 ms allows headroom for batch-timeout
+    // flushes during load lulls.
     "transaction_e2e_ms": [
       "p(50)<1500",
       "p(95)<3000",
       "p(99)<5000",
     ],
-    // Anything beyond 10 s is genuinely stuck. Bound the timeout
-    // count to <0.5% of expected accepted volume (~218k over
-    // 13 min × 0.005 ≈ 1090). If this trips, the consumer or
-    // outbox is wedged, not just slow.
-    "transactions_e2e_timeout": ["count<1090"],
+    // Stuck transactions: anything beyond E2E_POLL_TIMEOUT_MS
+    // (10 s) is genuinely wedged. 5% × 217k iters = ~10,850
+    // samples; 0.5% timeout = ~55. If this trips, the consumer
+    // or outbox is wedged, not just slow.
+    "transactions_e2e_timeout": ["count<55"],
   },
 };
 
@@ -190,17 +174,16 @@ function logFailure(context, res) {
   );
 }
 
-// Tag for setup-phase status polls. Kept separate from the e2e
-// poll tag so the threshold buckets stay clean.
+// Tag for setup-phase status polls.
 const SETUP_POLL_PARAMS = {
   tags: { name: "GET /api/v2/transactions/status/:ref (setup poll)" },
 };
 
-// Tag for in-load e2e status polls. Distinct from setup so each
+// Tag for in-load e2e sample polls. Distinct from setup so each
 // shows its own latency distribution in the k6 summary, and so
 // http_req_duration threshold buckets don't conflate the two.
 const E2E_POLL_PARAMS = {
-  tags: { name: "GET /api/v2/transactions/status/:ref (e2e poll)" },
+  tags: { name: "GET /api/v2/transactions/status/:ref (e2e sample poll)" },
 };
 
 // Poll /status/{ref} until terminal. Returns "completed" / "failed"
@@ -232,7 +215,7 @@ function waitForCompletion(refId, params, timeoutMs, pollMs) {
 // ─── Setup ─────────────────────────────────────────────────
 export function setup() {
   console.log(`🎯 Target: ${BASE_URL}`);
-  console.log(`📊 Running: sustained 1M/hour END-TO-END + balance poll`);
+  console.log(`📊 Running: sustained 1M/hour + ${(E2E_SAMPLE_RATE * 100).toFixed(1)}% e2e sample + balance poll`);
   console.log(`👥 Using ${NUM_ACCOUNTS} pre-seeded accounts (ACC_0000001 – ACC_0100000)\n`);
 
   const health = http.get(`${BASE_URL}/health`);
@@ -254,14 +237,14 @@ export function setup() {
   console.log(`✅ Accounts verified (ACC_0000001 exists)`);
 
   console.log(`\n🔍 End-to-end smoke test (create + wait for consumer)...`);
-  const setupRefId = `setup-e2e-${__ENV.HOSTNAME || "host"}-${Date.now()}`;
+  const setupRefId = `setup-sampled-${__ENV.HOSTNAME || "host"}-${Date.now()}`;
   const testPayload = JSON.stringify({
     from_account: "ACC_0000001",
     to_account: "ACC_0000002",
     amount: "1.00",
     currency: "IDR",
     reference_id: setupRefId,
-    description: "k6 e2e setup diagnostic test",
+    description: "k6 sampled-e2e setup diagnostic test",
   });
 
   const createRes = http.post(`${BASE_URL}/api/v2/transactions`, testPayload, {
@@ -289,7 +272,7 @@ export function setup() {
   return {};
 }
 
-// ─── Main workload (end-to-end per iter) ───────────────────
+// ─── Main workload ─────────────────────────────────────────
 export function txWorkload() {
   let referenceIdForE2e = null;
   let txStartTime = null;
@@ -316,7 +299,7 @@ export function txWorkload() {
         amount,
         currency: "IDR",
         reference_id: referenceId,
-        description: `k6 e2e load test`,
+        description: `k6 sampled-e2e load test`,
       };
     }
 
@@ -326,9 +309,8 @@ export function txWorkload() {
       tags: { name: "POST /api/v2/transactions" },
     };
 
-    // Capture t0 BEFORE the POST so the recorded e2e includes the
-    // accept latency — the honest "request → done" wall-clock the
-    // user's phone would see, not just the post-202 polling delay.
+    // Capture t0 BEFORE the POST so any e2e sample we take below
+    // includes the accept latency (honest tap-to-Successful clock).
     txStartTime = Date.now();
     const res = http.post(`${BASE_URL}/api/v2/transactions`, payload, params);
     const isAccepted = res.status >= 200 && res.status < 300;
@@ -362,14 +344,13 @@ export function txWorkload() {
     }
   });
 
-  // ── End-to-end completion track ──
-  // Only for fresh accepted transactions. Replays return cached
-  // accepted-payload immediately and would skew the Trend toward
-  // 0 ms; their e2e doesn't represent fresh-write latency. Failed
-  // accepts (4xx/5xx) skip naturally because referenceIdForE2e
-  // is null.
-  if (isFreshAccepted && referenceIdForE2e) {
-    group("Wait for Completion", () => {
+  // ── E2E sample (5% of fresh accepts) ──
+  // Replays are excluded (cached response → would skew Trend toward
+  // 0 ms). Failed accepts skip naturally because isFreshAccepted
+  // stays false. The Math.random() gate lives outside the group so
+  // un-sampled iters don't pay any group-tracking overhead.
+  if (isFreshAccepted && referenceIdForE2e && Math.random() < E2E_SAMPLE_RATE) {
+    group("E2E Sample", () => {
       const finalStatus = waitForCompletion(
         referenceIdForE2e,
         E2E_POLL_PARAMS,
@@ -377,13 +358,11 @@ export function txWorkload() {
         E2E_POLL_INTERVAL_MS,
       );
       if (finalStatus === "completed" || finalStatus === "failed") {
-        const e2eMs = Date.now() - txStartTime;
-        transactionE2eMs.add(e2eMs);
+        transactionE2eMs.add(Date.now() - txStartTime);
         transactionsE2eCompleted.add(1);
       } else {
-        // Timeout — consumer/outbox is stuck for this ref. Don't
-        // pollute the Trend with a fixed-ceiling value; count it
-        // separately so the threshold catches drift.
+        // Timeout — don't pollute the Trend with a fixed-ceiling
+        // value; count separately so the threshold catches drift.
         transactionsE2eTimeout.add(1);
       }
     });
@@ -444,7 +423,6 @@ export function balancePollWorkload() {
 export function teardown() {
   console.log(`\n📈 Load test complete!`);
   console.log(`   Check Grafana dashboard: http://localhost:3001`);
-  console.log(`   Dashboard: Peakload Capstone — Performance Dashboard`);
-  console.log(`   End-to-end Trend: 'transaction_e2e_ms' in k6 summary above`);
-  console.log(`   Timeouts (consumer drift signal): 'transactions_e2e_timeout'`);
+  console.log(`   E2E sample Trend: 'transaction_e2e_ms' in k6 summary`);
+  console.log(`   Sample size: ~${Math.round(217000 * E2E_SAMPLE_RATE)} of ~217k iters`);
 }
