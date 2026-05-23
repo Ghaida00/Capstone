@@ -1,0 +1,2 @@
+# Vendor and fonts are tracked (they're load-bearing for the demo
+# to work offline). Nothing in dashboard/ is generated.
