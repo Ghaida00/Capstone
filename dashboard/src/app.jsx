@@ -23,43 +23,32 @@ const SUMMARY_EVERY_N_TICKS = 8;
 const STATUS_POLL_INTERVAL_MS = 250;
 const STATUS_POLL_TIMEOUT_MS  = 5000;
 const BURST_CONCURRENCY = 20;
-const DASHBOARD_PATHS_RX = /^\/(metrics|health|dashboard)/;
+
+// Exclude the dashboard's own /health and /prom polls from the
+// observed request totals. Slim regex; we don't filter /metrics
+// since the dashboard doesn't hit it anymore (PromQL replaces it).
+const EXCLUDE_PATHS_PROMQL = 'http_response_status_code=~"5..",url_path!~"/(health|metrics|dashboard.*).*"';
 
 const deps = { fetch: window.fetch.bind(window) };
 
 /* ---------- Pure helpers ---------- */
 
-// Sum http_requests_total{...} entries where the status_code label
-// starts with "5". Returns the cumulative counter total (not rate).
-function sum5xxFromMetrics(metrics) {
-  let total = 0;
-  for (const [k, v] of Object.entries(metrics)) {
-    if (!k.startsWith('http_requests_total{')) continue;
-    const m = k.match(/http_response_status_code="(\d+)"/);
-    if (!m) continue;
-    if (!m[1].startsWith('5')) continue;
-    // Exclude the dashboard's own paths so we don't count ourselves.
-    const path = (k.match(/url_path="([^"]*)"/) || [])[1] || '';
-    if (DASHBOARD_PATHS_RX.test(path)) continue;
-    total += v;
-  }
-  return total;
-}
-
-// Build the bucket map for http_request_duration_seconds (excluding
-// the dashboard's own request paths). Returns { "0.005": cum, ..., "+Inf": cum }.
-function buildLatencyBuckets(metrics) {
-  const byLe = {};
-  for (const [k, v] of Object.entries(metrics)) {
-    if (!k.startsWith('http_request_duration_seconds_bucket{')) continue;
-    const path = (k.match(/url_path="([^"]*)"/) || [])[1] || '';
-    if (DASHBOARD_PATHS_RX.test(path)) continue;
-    const le = (k.match(/le="([^"]+)"/) || [])[1];
-    if (!le) continue;
-    byLe[le] = (byLe[le] || 0) + v;
-  }
-  return byLe;
-}
+// All metrics now come from Prometheus PromQL queries against the
+// /prom/ nginx proxy. Prometheus aggregates the per-replica counters
+// across both app instances server-side (sum()), eliminating the
+// "alternating reads under nginx least_conn" problem that made
+// client-side aggregation off /metrics produce phantom rates.
+//
+// Rate windows: 15s for counters (3 scrapes at 5s scrape_interval),
+// 60s for histograms (more samples = stabler quantile estimates).
+const PROM_QUERIES = {
+  acceptedRps:   'sum(rate(transactions_created_total[15s]))',
+  processedRps: 'sum(rate(transactions_processed_total[15s]))',
+  errorsRps:    `sum(rate(http_requests_total{${EXCLUDE_PATHS_PROMQL}}[15s]))`,
+  p95Ms:        'histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[1m]))) * 1000',
+  p99Ms:        'histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[1m]))) * 1000',
+  acceptedTotal: 'sum(transactions_created_total)',
+};
 
 // Map /health JSON → 6 + N rows (one per service + one per replica).
 // B2 fix: when health is null (fetch failed), the caller is expected
@@ -112,7 +101,6 @@ function App() {
   const [sending, setSending] = useState(false);
   const [bursting, setBursting] = useState(false);
 
-  const prevMetricsRef = useRef({ counters: null, t: null });
   const tickRef = useRef(0);
   const prevHealthRef = useRef(null);
 
@@ -130,60 +118,63 @@ function App() {
     }, 400);
   }, []);
 
-  /* ----- Metrics poll ----- */
+  /* ----- Metrics poll (PromQL via /prom/ proxy) ----- */
 
   useEffect(() => {
     let cancelled = false;
 
     async function tick() {
       try {
-        const text = await PL.getMetrics(deps);
+        // Fire all 6 queries in parallel; Prometheus handles each one
+        // in microseconds and the round-trip is the only cost.
+        const [aRps, pRps, eRps, p95v, p99v, accTotal] = await Promise.all([
+          PL.queryProm(deps, PROM_QUERIES.acceptedRps),
+          PL.queryProm(deps, PROM_QUERIES.processedRps),
+          PL.queryProm(deps, PROM_QUERIES.errorsRps),
+          PL.queryProm(deps, PROM_QUERIES.p95Ms),
+          PL.queryProm(deps, PROM_QUERIES.p99Ms),
+          PL.queryProm(deps, PROM_QUERIES.acceptedTotal),
+        ]);
         if (cancelled) return;
-        const metrics = PL.parseProm(text);
-        const now = Date.now();
 
-        const created = metrics['transactions_created_total'] || 0;
-        const processed = metrics['transactions_processed_total'] || 0;
-        const errors5xx = sum5xxFromMetrics(metrics);
-        const buckets = buildLatencyBuckets(metrics);
-        const p95v = PL.histogramQuantile(buckets, 0.95) * 1000; // → ms
-        const p99v = PL.histogramQuantile(buckets, 0.99) * 1000;
+        // queryProm returns null when a series has no data yet (e.g.
+        // p95 right after restart with zero observations). Coerce to
+        // 0 for display.
+        const accepted   = aRps    ?? 0;
+        const processed  = pRps    ?? 0;
+        const errors     = eRps    ?? 0;
+        const p95v_      = p95v    ?? 0;
+        const p99v_      = p99v    ?? 0;
+        const totalAcc   = Math.round(accTotal ?? 0);
 
-        const prev = prevMetricsRef.current;
-        if (prev.counters !== null) {
-          const dtSec = (now - prev.t) / 1000;
-          const aRps = PL.rateOf(prev.counters.created,   created,   dtSec);
-          const pRps = PL.rateOf(prev.counters.processed, processed, dtSec);
-          const eRps = PL.rateOf(prev.counters.errors5xx, errors5xx, dtSec);
+        setAcceptedRps(accepted);
+        setProcessedRps(processed);
+        setErrRps(errors);
+        setP95(p95v_);
+        setP99(p99v_);
+        setAcceptedTotal(totalAcc);
 
-          setAcceptedRps(aRps);
-          setProcessedRps(pRps);
-          setErrRps(eRps);
-          setP95(p95v);
-          setP99(p99v);
-          setAcceptedTotal(created);
+        setRps(arr => PL.rollingPush(arr, Math.round(accepted), RPS_WINDOW));
+        setLat(arr => PL.rollingPush(arr, Math.round(p95v_), LAT_WINDOW));
+        setAccSpark(arr => PL.rollingPush(arr, Math.round(accepted), SPARK_WINDOW));
+        setProcSpark(arr => PL.rollingPush(arr, Math.round(processed), SPARK_WINDOW));
+        setP95Spark(arr => PL.rollingPush(arr, Math.round(p95v_), SPARK_WINDOW));
+        setP99Spark(arr => PL.rollingPush(arr, Math.round(p99v_), SPARK_WINDOW));
+        setErrSpark(arr => PL.rollingPush(arr, Math.round(errors * 100) / 100, SPARK_WINDOW));
 
-          setRps(arr => PL.rollingPush(arr, Math.round(aRps), RPS_WINDOW));
-          setLat(arr => PL.rollingPush(arr, Math.round(p95v), LAT_WINDOW));
-          setAccSpark(arr => PL.rollingPush(arr, Math.round(aRps), SPARK_WINDOW));
-          setProcSpark(arr => PL.rollingPush(arr, Math.round(pRps), SPARK_WINDOW));
-          setP95Spark(arr => PL.rollingPush(arr, Math.round(p95v), SPARK_WINDOW));
-          setP99Spark(arr => PL.rollingPush(arr, Math.round(p99v), SPARK_WINDOW));
-          setErrSpark(arr => PL.rollingPush(arr, Math.round(eRps * 100) / 100, SPARK_WINDOW));
-
-          tickRef.current++;
-          if (tickRef.current % SUMMARY_EVERY_N_TICKS === 0) {
-            addLog({
-              tag: 'info',
-              msg: <>k6 sustained <span className="num">{Math.round(aRps)} rps</span> · p95 <span className="num">{Math.round(p95v)} ms</span> · {Math.round(eRps)} 5xx/s</>,
-            });
-          }
+        tickRef.current++;
+        if (tickRef.current % SUMMARY_EVERY_N_TICKS === 0) {
+          addLog({
+            tag: 'info',
+            msg: <>k6 sustained <span className="num">{Math.round(accepted)} rps</span> · p95 <span className="num">{Math.round(p95v_)} ms</span> · {Math.round(errors)} 5xx/s</>,
+          });
         }
-
-        prevMetricsRef.current = { counters: { created, processed, errors5xx }, t: now };
       } catch (e) {
+        // Prometheus down or query parse error. Only log every 10th
+        // failure to avoid drowning the activity stream.
+        if (cancelled) return;
         if (tickRef.current % 10 === 0) {
-          addLog({ tag: 'warn', msg: <>/metrics fetch failed: {String(e.message)}</> });
+          addLog({ tag: 'warn', msg: <>Prometheus query failed: {String(e.message)}</> });
         }
         tickRef.current++;
       }

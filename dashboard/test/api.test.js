@@ -2,6 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   sendTxn, getBalance, listRecent, getStatus, pollStatus, getHealth, getMetrics,
+  queryProm,
 } = require('../src/api.js');
 
 function fakeResponse({ status = 200, body }) {
@@ -141,6 +142,67 @@ test('pollStatus: keeps polling on 404 (race window) and resolves later', async 
   };
   const out = await pollStatus({ fetch }, 'x', { intervalMs: 1, timeoutMs: 1000 });
   assert.equal(out.status, 'completed');
+});
+
+test('queryProm: returns scalar from a vector result', async () => {
+  let captured;
+  const fetch = async (url) => {
+    captured = url;
+    return fakeResponse({
+      status: 200,
+      body: {
+        status: 'success',
+        data: { resultType: 'vector', result: [{ metric: {}, value: [1779523510.955, '56650'] }] },
+      },
+    });
+  };
+  const out = await queryProm({ fetch }, 'sum(transactions_created_total)');
+  assert.equal(out, 56650);
+  assert.match(captured, /^\/prom\/api\/v1\/query\?query=/);
+  assert.ok(captured.includes(encodeURIComponent('sum(transactions_created_total)')));
+});
+
+test('queryProm: returns null on empty result', async () => {
+  const fetch = async () => fakeResponse({
+    status: 200,
+    body: { status: 'success', data: { resultType: 'vector', result: [] } },
+  });
+  const out = await queryProm({ fetch }, 'sum(nonexistent_metric)');
+  assert.equal(out, null);
+});
+
+test('queryProm: throws on non-success status', async () => {
+  const fetch = async () => fakeResponse({
+    status: 200,
+    body: { status: 'error', errorType: 'bad_data', error: 'parse error at char 1' },
+  });
+  await assert.rejects(
+    () => queryProm({ fetch }, 'bad query'),
+    (err) => /parse error/.test(err.message),
+  );
+});
+
+test('queryProm: throws on HTTP failure', async () => {
+  const fetch = async () => ({
+    ok: false, status: 502,
+    json: async () => null,
+  });
+  await assert.rejects(
+    () => queryProm({ fetch }, 'sum(foo)'),
+    (err) => /502/.test(err.message),
+  );
+});
+
+test('queryProm: NaN response value returns null', async () => {
+  const fetch = async () => fakeResponse({
+    status: 200,
+    body: {
+      status: 'success',
+      data: { resultType: 'vector', result: [{ metric: {}, value: [1779523510, 'NaN'] }] },
+    },
+  });
+  const out = await queryProm({ fetch }, 'histogram_quantile(0.95, ...)');
+  assert.equal(out, null);
 });
 
 test('pollStatus: rejects with POLL_TIMEOUT', async () => {

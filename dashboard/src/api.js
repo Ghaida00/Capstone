@@ -73,6 +73,34 @@
     return await res.text();
   }
 
+  // Prometheus instant-query client. Same-origin via the nginx
+  // /prom/ proxy → prometheus:9090. We always issue queries that
+  // aggregate via sum()/avg()/histogram_quantile() so the result is
+  // a single scalar; this helper returns that scalar (or null if
+  // the query yielded no series).
+  async function queryProm(deps, query) {
+    const url = `/prom/api/v1/query?query=${encodeURIComponent(query)}`;
+    const res = await deps.fetch(url);
+    if (!res.ok) {
+      throw new Error(`prometheus HTTP ${res.status}`);
+    }
+    const body = await readBody(res);
+    if (!body || body.status !== 'success') {
+      const msg = (body && body.error) || (body && body.errorType) || 'unknown';
+      throw new Error(`prometheus query failed: ${msg}`);
+    }
+    const result = body.data && body.data.result;
+    if (!Array.isArray(result) || result.length === 0) return null;
+    const raw = result[0].value && result[0].value[1];
+    if (raw === undefined) return null;
+    // PromQL returns 'NaN' as a string when histogram_quantile etc.
+    // can't compute (zero observations in window). Surface as null
+    // rather than letting Number.NaN leak into rolling buffers.
+    if (raw === 'NaN') return null;
+    const n = parseFloat(raw);
+    return Number.isNaN(n) ? null : n;
+  }
+
   async function pollStatus(deps, refId, opts) {
     const intervalMs = (opts && opts.intervalMs) || 250;
     const timeoutMs = (opts && opts.timeoutMs) || 5000;
@@ -102,6 +130,7 @@
 
   const api = {
     sendTxn, getBalance, listRecent, getStatus, getHealth, getMetrics, pollStatus,
+    queryProm,
   };
   if (typeof module !== 'undefined') module.exports = api;
   if (typeof window !== 'undefined') window.PL = Object.assign(window.PL || {}, api);
