@@ -1,13 +1,25 @@
 name: peakload
 
 # ============================================================
-# TOTAL RESOURCE BUDGET (steady-state, semua service jalan)
+# TOTAL RESOURCE BUDGET — Profile A defaults
 # ------------------------------------------------------------
-# Hitungan dari `deploy.resources.limits` tiap service.
-# Shard 2 (pg-shard2-*) di-disable, jadi tidak masuk total.
-# `db-bootstrap-schema` one-shot (exit setelah init), jadi
-# tidak dihitung di steady-state — hanya nambah 0.1 CPU /
-# 64 MB selama beberapa detik di startup.
+# Every `deploy.resources.limits` value below is env-driven
+# (see .env.example sections 3.7 / 4.5 / 5 / 6.11 / 7 / 8.1).
+# Numbers in this comment are the SHIPPED defaults — i.e.
+# Profile A, the 2-shard / 8 GB-host configuration. Other
+# profiles (B = 1-shard high-memory, C = 2-shard high-capacity,
+# D = 3-shard maximum) live in .env.example §9 and override
+# selected env vars only.
+#
+# Shard 1 and shard 2 are profile-gated. The totals below are
+# the default 2-shard topology (`shard1` profile active):
+#   1 shard:  COMPOSE_PROFILES=...                 (drop shard1/shard2)
+#   2 shard:  COMPOSE_PROFILES=...,shard1          (DEFAULT)
+#   3 shard:  COMPOSE_PROFILES=...,shard1,shard2   (+ ~3 CPU / 1 GB per shard)
+#
+# `db-bootstrap-schema` + `db-migrator` are one-shots (exit
+# after init); not counted in steady-state — they add ~0.3 CPU
+# / 160 MB for a few seconds at startup.
 #
 #  service                          CPU      MEM
 #  ───────────────────────────────  ───────  ────────
@@ -15,7 +27,7 @@ name: peakload
 #  app          (× 2 replicas)      2.0       768 M     (1.0 CPU × 2, 384 M × 2)
 #  etcd-1/2/3   (× 3)               0.45     192 M      (0.15 × 3, 64 M × 3)
 #  pg-shard0-node-a/b   (× 2)       3.0      1024 M     (1.5 × 2, 512 M × 2)
-#  pg-shard1-node-a/b   (× 2)       3.0      1024 M
+#  pg-shard1-node-a/b   (× 2)*      3.0      1024 M     (* profile shard1)
 #  pgbouncer-shard0/1   (× 2)       0.2      64 M       (0.1 × 2, 32 M × 2)
 #  pg-haproxy                       0.15     64 M
 #  redis-master                     1.0      384 M
@@ -25,7 +37,7 @@ name: peakload
 #  ───────────────────────────────  ───────  ────────
 #  CORE TOTAL                       13.10    4768 M (~4.66 GB)
 #
-#  Observability (profile-gated — set COMPOSE_PROFILES in .env):
+#  Observability (opt-in via COMPOSE_PROFILES):
 #  prometheus                       0.5      256 M
 #  grafana                          0.5      256 M
 #  cadvisor                         0.2      128 M
@@ -34,23 +46,26 @@ name: peakload
 #  ───────────────────────────────  ───────  ────────
 #  OBSERVABILITY TOTAL              1.8      1408 M (~1.37 GB)
 #
-#  FULL  (observability ON)         14.90    6176 M (~6.03 GB)
-#  LEAN  (observability OFF)        13.10    4768 M (~4.66 GB)
-#  TOTAL termasuk bootstrap (FULL)  15.00    6240 M (~6.09 GB)
+#  Profile A FULL  (observability ON)   14.90    6176 M (~6.03 GB)
+#  Profile A LEAN  (observability OFF)  13.10    4768 M (~4.66 GB)
 #
-# Catatan:
-# * Ini limit, bukan request — pemakaian aktual idle jauh
-#   lebih rendah. Cores fisik 8 + 8 GB RAM cukup; di bawah
-#   itu mulai contended.
-# * Replica `app` sudah di angka konservatif 2 (cocok untuk
-#   8-core host). Kalau host < 8 GB RAM atau < 6 cores,
-#   turunkan PG node ke 0.5 CPU / 256 M lewat anchor
-#   `x-pg-node-deploy` di bawah.
+# Other profiles (see .env.example §9 for full var lists):
+#  Profile B  1-shard high-memory       ~12.0    ~5.0 GB
+#  Profile C  2-shard high-capacity     ~16.0    ~7.0 GB
+#  Profile D  3-shard maximum           ~20.0    ~9.0 GB
+#
+# Notes:
+# * Limits, not requests — idle usage is well below these.
+#   8 cores + 8 GB RAM is the comfortable floor for Profile A;
+#   Profile B/C/D need more.
+# * `app` replicas fixed at 2 (deploy.replicas) — host scaling
+#   below 8 cores / 8 GB? Either stay on Profile A and drop
+#   APP_CPU_LIMIT to 0.5 in .env, or switch to Profile B
+#   (single shard) for the lowest-overhead layout.
 # * Observability (prometheus/grafana/cadvisor/otel-collector/
-#   jaeger) di-gate lewat Compose profiles. Set COMPOSE_PROFILES
-#   di .env: `observability` untuk FULL, kosongkan untuk LEAN
-#   (k6 perf runs). Granular: `tracing`, `metrics`, atau
-#   nama service spesifik (`jaeger,prometheus`).
+#   jaeger) is gated via Compose profiles in COMPOSE_PROFILES:
+#   `observability` = all; `tracing` / `metrics` = subset;
+#   blank = LEAN (k6 perf runs).
 # ============================================================
 
 # ============================================================
@@ -119,6 +134,17 @@ x-pg-node-env: &pg-node-env
   PG_SYNCHRONOUS_COMMIT: ${PG_SYNCHRONOUS_COMMIT:-remote_write}
   PG_COMMIT_DELAY: ${PG_COMMIT_DELAY:-0}
   PG_COMMIT_SIBLINGS: ${PG_COMMIT_SIBLINGS:-5}
+  # Cluster-wide max_connections — rendered into the DCS
+  # parameters of patroni.yml.tmpl. Default 120 mirrors the
+  # entrypoint. Pair changes with `PG_MEMORY_LIMIT` because
+  # each backend slot needs ~10 MB resident.
+  PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-120}
+  # PG buffer pool size. Rendered into DCS-level
+  # `shared_buffers`. Default 64MB matches the 512m container;
+  # raise to 256MB if PG_MEMORY_LIMIT goes to 1024m. Same
+  # DCS-bootstrap caveat as PG_MAX_CONNECTIONS — see .env
+  # for the patronictl edit-config workflow.
+  PG_SHARED_BUFFERS: ${PG_SHARED_BUFFERS:-64MB}
 
 # Per-node resource envelope. 1.5 CPU / 512 MB gives the
 # primary headroom for both request-driven INSERT/UPDATE
@@ -132,8 +158,12 @@ x-pg-node-env: &pg-node-env
 x-pg-node-deploy: &pg-node-deploy
   resources:
     limits:
-      memory: 512M
-      cpus: "1.5"
+      # Rendered from PG_MEMORY_LIMIT in .env (default 512m).
+      # When raising, also bump shared_buffers / effective_cache_size
+      # in patroni.yml.tmpl OR raise PG_MAX_CONNECTIONS to consume
+      # the headroom — otherwise the extra RAM sits unused.
+      memory: ${PG_MEMORY_LIMIT:-512m}
+      cpus: ${PG_CPU_LIMIT:-1.5}
 
 # ============================================================
 # etcd anchors
@@ -162,8 +192,8 @@ x-etcd-common: &etcd-common
   deploy:
     resources:
       limits:
-        memory: 64M
-        cpus: "0.15"
+        memory: ${ETCD_MEMORY_LIMIT:-64M}
+        cpus: "${ETCD_CPU_LIMIT:-0.15}"
 
 x-etcd-env-common: &etcd-env-common
   # Upstream etcd has auth disabled by default — no
@@ -198,16 +228,18 @@ x-pgbouncer-common: &pgbouncer-common
 x-pgbouncer-env: &pgbouncer-env
   AUTH_TYPE: scram-sha-256
   POOL_MODE: transaction
-  # Pool sizes soak a 1000-VU spike split across 2 shards
-  # (~500 concurrent writers per shard), so pgBouncer multiplexes
-  # them onto Postgres without queueing. DEFAULT_POOL_SIZE caps
-  # backend conns per (db,user); MAX_CLIENT_CONN caps front-end
-  # conns from the app.
-  DEFAULT_POOL_SIZE: 80
-  MAX_CLIENT_CONN: 2000
-  MAX_DB_CONNECTIONS: 200
-  MIN_POOL_SIZE: 30
-  RESERVE_POOL_SIZE: 20
+  # Pool sizes are env-driven so the per-profile scaling
+  # rungs in .env.example §9 work end-to-end. Defaults below
+  # match Profile A (2-shard, 2 app × 40 write-pool). The full
+  # connection-stack invariant is documented in .env.example
+  # §3.3; raising DB_WRITE_POOL_SIZE without raising
+  # PGBOUNCER_DEFAULT_POOL_SIZE causes silent client-side
+  # queueing inside pgBouncer (audit D-2).
+  DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-80}
+  MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-2000}
+  MAX_DB_CONNECTIONS: ${PGBOUNCER_MAX_DB_CONNECTIONS:-200}
+  MIN_POOL_SIZE: ${PGBOUNCER_MIN_POOL_SIZE:-30}
+  RESERVE_POOL_SIZE: ${PGBOUNCER_RESERVE_POOL_SIZE:-20}
   RESERVE_POOL_TIMEOUT: 2
   # server_lifetime is deliberately short (1h) so that
   # long-lived pgBouncer→HAProxy conns get recycled, which
@@ -230,8 +262,8 @@ x-pgbouncer-healthcheck: &pgbouncer-healthcheck
 x-pgbouncer-deploy: &pgbouncer-deploy
   resources:
     limits:
-      memory: 32M
-      cpus: "0.1"
+      memory: ${PGBOUNCER_MEMORY_LIMIT:-32M}
+      cpus: "${PGBOUNCER_CPU_LIMIT:-0.1}"
 
 # ============================================================
 # Redis anchors
@@ -284,8 +316,8 @@ x-sentinel-common: &sentinel-common
   deploy:
     resources:
       limits:
-        memory: 32M
-        cpus: "0.1"
+        memory: ${REDIS_SENTINEL_MEMORY_LIMIT:-32M}
+        cpus: "${REDIS_SENTINEL_CPU_LIMIT:-0.1}"
 
 services:
   # ============================================================
@@ -323,8 +355,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
-          cpus: "1.0"
+          memory: ${NGINX_MEMORY_LIMIT:-256M}
+          cpus: "${NGINX_CPU_LIMIT:-1.0}"
 
   # ============================================================
   # Rust Application — 2 replicas
@@ -385,11 +417,17 @@ services:
     depends_on:
       pgbouncer-shard0:
         condition: service_healthy
+      # Shards 1 and 2 are profile-gated (see "SHARD 1" / "SHARD 2"
+      # blocks below). `required: false` makes the dependency
+      # non-fatal when the corresponding profile is not active —
+      # `docker compose up` without `shard1` in COMPOSE_PROFILES
+      # still boots the app, in single-shard mode.
       pgbouncer-shard1:
         condition: service_healthy
-      # Shard 2 disabled — see "SHARD 2" block below.
-      # pgbouncer-shard2:
-      #   condition: service_healthy
+        required: false
+      pgbouncer-shard2:
+        condition: service_healthy
+        required: false
       db-bootstrap-schema:
         condition: service_completed_successfully
       db-migrator:
@@ -426,8 +464,8 @@ services:
       replicas: 2
       resources:
         limits:
-          memory: 384M
-          cpus: "1.0"
+          memory: ${APP_MEMORY_LIMIT:-384M}
+          cpus: "${APP_CPU_LIMIT:-1.0}"
           pids: 256
 
   # ============================================================
@@ -553,9 +591,15 @@ services:
   # ============================================================
   # SHARD 1 — two Patroni-managed nodes (scope peakload-shard1)
   # ============================================================
+  # SHARD 1 — profile-gated. The 3 services below activate only
+  # when `shard1` is in COMPOSE_PROFILES (see .env). Without the
+  # profile, the app boots in single-shard mode and `app` /
+  # `pg-haproxy` skip their `pgbouncer-shard1` / `pg-shard1-*`
+  # dependencies via `required: false`.
   pg-shard1-node-a:
     <<: *pg-node-common
     container_name: peakload-pg-shard1-node-a
+    profiles: ["shard1"]
     environment:
       <<: *pg-node-env
       PATRONI_SCOPE:    peakload-shard1
@@ -576,6 +620,7 @@ services:
   pg-shard1-node-b:
     <<: *pg-node-common
     container_name: peakload-pg-shard1-node-b
+    profiles: ["shard1"]
     environment:
       <<: *pg-node-env
       PATRONI_SCOPE:    peakload-shard1
@@ -598,6 +643,7 @@ services:
   pgbouncer-shard1:
     <<: *pgbouncer-common
     container_name: peakload-pgbouncer-shard1
+    profiles: ["shard1"]
     environment:
       <<: *pgbouncer-env
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-haproxy:5001/${POSTGRES_DB}
@@ -608,75 +654,71 @@ services:
     deploy: *pgbouncer-deploy
 
   # ============================================================
-  # SHARD 2 — DISABLED (resource-conservation mode)
+  # SHARD 2 — profile-gated (resource-conservation by default)
   # ------------------------------------------------------------
-  # Temporarily commented out to keep host memory/CPU within
-  # capstone-dev limits. The Rust shard router, HAProxy, and
-  # bootstrap script have all been narrowed to two shards in
-  # lockstep — re-enabling shard 2 means flipping all of:
-  #   * this block + the `pg_shard2_*` volumes at the bottom
-  #   * pgbouncer-shard2 dependency on the `app` service above
-  #   * pg-shard2-node-{a,b} entries in pg-haproxy.depends_on
-  #   * PG_HAPROXY_PORTS env on db-bootstrap-schema (add 5002)
-  #   * SHARD 2 frontend/backend in haproxy/haproxy.cfg
-  #   * NUM_SHARDS = 3 in crates/shared_kernel/src/db/shard.rs
-  #   * the third ShardUrls entry in crates/app/src/bootstrap.rs
-  #   * database_shard2_* fields in crates/app/src/config.rs
-  #   * DATABASE_SHARD2_* in .env.example / .env
+  # Activates only when `shard2` is in COMPOSE_PROFILES. The Rust
+  # shard router enforces a contiguity rule (shard 2 requires
+  # shard 1), so enabling shard 2 means setting:
+  #     COMPOSE_PROFILES=...,shard1,shard2
+  # plus the matching DATABASE_SHARD1_* + DATABASE_SHARD2_* env
+  # vars. `Config::validate` rejects half-set toggles at boot.
   # ============================================================
-  # pg-shard2-node-a:
-  #   <<: *pg-node-common
-  #   container_name: peakload-pg-shard2-node-a
-  #   environment:
-  #     <<: *pg-node-env
-  #     PATRONI_SCOPE:    peakload-shard2
-  #     PATRONI_NAME:     shard2-a
-  #     PATRONI_HOSTNAME: pg-shard2-node-a
-  #   volumes:
-  #     # Mounted at parent path — see pg-shard0-node-a for rationale.
-  #     - pg_shard2_node_a_data:/var/lib/postgresql
-  #   depends_on:
-  #     etcd-1:
-  #       condition: service_healthy
-  #     etcd-2:
-  #       condition: service_healthy
-  #     etcd-3:
-  #       condition: service_healthy
-  #   deploy: *pg-node-deploy
-  #
-  # pg-shard2-node-b:
-  #   <<: *pg-node-common
-  #   container_name: peakload-pg-shard2-node-b
-  #   environment:
-  #     <<: *pg-node-env
-  #     PATRONI_SCOPE:    peakload-shard2
-  #     PATRONI_NAME:     shard2-b
-  #     PATRONI_HOSTNAME: pg-shard2-node-b
-  #   volumes:
-  #     # Mounted at parent path — see pg-shard0-node-a for rationale.
-  #     - pg_shard2_node_b_data:/var/lib/postgresql
-  #   depends_on:
-  #     etcd-1:
-  #       condition: service_healthy
-  #     etcd-2:
-  #       condition: service_healthy
-  #     etcd-3:
-  #       condition: service_healthy
-  #     pg-shard2-node-a:
-  #       condition: service_started
-  #   deploy: *pg-node-deploy
-  #
-  # pgbouncer-shard2:
-  #   <<: *pgbouncer-common
-  #   container_name: peakload-pgbouncer-shard2
-  #   environment:
-  #     <<: *pgbouncer-env
-  #     DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-haproxy:5002/${POSTGRES_DB}
-  #   depends_on:
-  #     pg-haproxy:
-  #       condition: service_healthy
-  #   healthcheck: *pgbouncer-healthcheck
-  #   deploy: *pgbouncer-deploy
+  pg-shard2-node-a:
+    <<: *pg-node-common
+    container_name: peakload-pg-shard2-node-a
+    profiles: ["shard2"]
+    environment:
+      <<: *pg-node-env
+      PATRONI_SCOPE:    peakload-shard2
+      PATRONI_NAME:     shard2-a
+      PATRONI_HOSTNAME: pg-shard2-node-a
+    volumes:
+      # Mounted at parent path — see pg-shard0-node-a for rationale.
+      - pg_shard2_node_a_data:/var/lib/postgresql
+    depends_on:
+      etcd-1:
+        condition: service_healthy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+    deploy: *pg-node-deploy
+
+  pg-shard2-node-b:
+    <<: *pg-node-common
+    container_name: peakload-pg-shard2-node-b
+    profiles: ["shard2"]
+    environment:
+      <<: *pg-node-env
+      PATRONI_SCOPE:    peakload-shard2
+      PATRONI_NAME:     shard2-b
+      PATRONI_HOSTNAME: pg-shard2-node-b
+    volumes:
+      # Mounted at parent path — see pg-shard0-node-a for rationale.
+      - pg_shard2_node_b_data:/var/lib/postgresql
+    depends_on:
+      etcd-1:
+        condition: service_healthy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
+        condition: service_healthy
+      pg-shard2-node-a:
+        condition: service_started
+    deploy: *pg-node-deploy
+
+  pgbouncer-shard2:
+    <<: *pgbouncer-common
+    container_name: peakload-pgbouncer-shard2
+    profiles: ["shard2"]
+    environment:
+      <<: *pgbouncer-env
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-haproxy:5002/${POSTGRES_DB}
+    depends_on:
+      pg-haproxy:
+        condition: service_healthy
+    healthcheck: *pgbouncer-healthcheck
+    deploy: *pgbouncer-deploy
 
   # ============================================================
   # pg-haproxy — role-aware write router
@@ -707,22 +749,29 @@ services:
     expose:
       - "5000"
       - "5001"
-      # Shard 2 disabled.
-      # - "5002"
+      - "5002"
     depends_on:
       pg-shard0-node-a:
         condition: service_healthy
       pg-shard0-node-b:
         condition: service_healthy
+      # Shards 1 and 2 are profile-gated. `required: false` means
+      # HAProxy boots even when those profiles are inactive — the
+      # corresponding backends simply stay DOWN (their health probe
+      # has no target), which is harmless because nothing routes
+      # to them in single-shard mode.
       pg-shard1-node-a:
         condition: service_healthy
+        required: false
       pg-shard1-node-b:
         condition: service_healthy
-      # Shard 2 disabled.
-      # pg-shard2-node-a:
-      #   condition: service_healthy
-      # pg-shard2-node-b:
-      #   condition: service_healthy
+        required: false
+      pg-shard2-node-a:
+        condition: service_healthy
+        required: false
+      pg-shard2-node-b:
+        condition: service_healthy
+        required: false
     healthcheck:
       # Stats page on :7000 is served unconditionally once
       # HAProxy is up, so this is a cheap liveness probe.
@@ -741,8 +790,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 64M
-          cpus: "0.15"
+          memory: ${PG_HAPROXY_MEMORY_LIMIT:-64M}
+          cpus: "${PG_HAPROXY_CPU_LIMIT:-0.15}"
 
   # ============================================================
   # db-bootstrap-schema — one-shot init.sql applier
@@ -779,8 +828,11 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB:       ${POSTGRES_DB:?set POSTGRES_DB in .env}
       PG_HAPROXY_HOST:   pg-haproxy
-      # Shard 2 disabled — was "5000 5001 5002".
-      PG_HAPROXY_PORTS:  "5000 5001"
+      # Space-separated shard primary ports — set via env so the
+      # bootstrap container processes only the shards activated in
+      # COMPOSE_PROFILES. Default is the 2-shard topology; override
+      # in .env to "5000" (single-shard) or "5000 5001 5002" (3-shard).
+      PG_HAPROXY_PORTS:  "${PG_HAPROXY_PORTS:-5000 5001}"
       # D-1/R-3: server-side statement/lock/idle-in-tx timeouts (milliseconds), applied per shard primary as ALTER DATABASE defaults by bootstrap-schema.sh.
       DB_STATEMENT_TIMEOUT_MS:   "2000"
       DB_LOCK_TIMEOUT_MS:        "500"
@@ -798,8 +850,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 64M
-          cpus: "0.1"
+          memory: ${DB_BOOTSTRAP_MEMORY_LIMIT:-64M}
+          cpus: "${DB_BOOTSTRAP_CPU_LIMIT:-0.1}"
 
   # ============================================================
   # DB migrator — one-shot sqlx::migrate! runner (D-7)
@@ -827,9 +879,15 @@ services:
     container_name: peakload-db-migrator
     command: ["/app/peakload-capstone", "--migrate"]
     environment:
-      # Direct-to-primary URLs via HAProxy ports (5000=shard0, 5001=shard1).
-      # Uses the superuser so DDL (ALTER TABLE, CREATE INDEX) is permitted.
-      MIGRATE_SHARD_URLS: "postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@pg-haproxy:5000/${POSTGRES_DB:?},postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@pg-haproxy:5001/${POSTGRES_DB:?}"
+      # CSV of direct-to-primary URLs via HAProxy ports
+      # (5000=shard0, 5001=shard1, 5002=shard2). The migrator
+      # filters empty CSV entries, so trailing commas are safe.
+      # Default targets the 2-shard topology; override in .env when
+      # toggling shard 1 off (single-shard) or shard 2 on (3 shards).
+      # Note: Compose's .env files do NOT recursively interpolate
+      # `${VAR}` references — an override there must hard-code the
+      # username/password. See .env.example for copy-paste examples.
+      MIGRATE_SHARD_URLS: "${MIGRATE_SHARD_URLS:-postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@pg-haproxy:5000/${POSTGRES_DB:?},postgres://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@pg-haproxy:5001/${POSTGRES_DB:?}}"
       # The migrator only needs sqlx + dotenv; suppress noisy app-startup
       # env to keep the log output focused on migration progress.
       RUST_LOG: "info,sqlx::query=warn"
@@ -845,8 +903,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 96M
-          cpus: "0.2"
+          memory: ${DB_MIGRATOR_MEMORY_LIMIT:-96M}
+          cpus: "${DB_MIGRATOR_CPU_LIMIT:-0.2}"
 
   # ============================================================
   # Redis HA — Master + Replica + Sentinel
@@ -867,8 +925,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 384M
-          cpus: "1.0"
+          memory: ${REDIS_MASTER_MEMORY_LIMIT:-384M}
+          cpus: "${REDIS_MASTER_CPU_LIMIT:-1.0}"
 
   redis-replica:
     image: redis:8.6.1-alpine3.23
@@ -901,8 +959,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 384M
-          cpus: "1.0"
+          memory: ${REDIS_REPLICA_MEMORY_LIMIT:-384M}
+          cpus: "${REDIS_REPLICA_CPU_LIMIT:-1.0}"
 
   redis-sentinel-1:
     <<: *sentinel-common
@@ -945,8 +1003,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
-          cpus: "1.0"
+          memory: ${RABBITMQ_MEMORY_LIMIT:-512M}
+          cpus: "${RABBITMQ_CPU_LIMIT:-1.0}"
 
   # ============================================================
   # Prometheus — Metrics Collection
@@ -988,8 +1046,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
-          cpus: "0.5"
+          memory: ${PROMETHEUS_MEMORY_LIMIT:-256M}
+          cpus: "${PROMETHEUS_CPU_LIMIT:-0.5}"
 
   # ============================================================
   # OpenTelemetry Collector — receives OTLP traces from app
@@ -1024,8 +1082,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
-          cpus: "0.3"
+          memory: ${OTEL_COLLECTOR_MEMORY_LIMIT:-256M}
+          cpus: "${OTEL_COLLECTOR_CPU_LIMIT:-0.3}"
 
   # ============================================================
   # Jaeger — trace UI + storage back-end for the collector
@@ -1055,8 +1113,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
-          cpus: "0.3"
+          memory: ${JAEGER_MEMORY_LIMIT:-512M}
+          cpus: "${JAEGER_CPU_LIMIT:-0.3}"
 
   # ============================================================
   # Grafana — Metrics Visualization
@@ -1091,8 +1149,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
-          cpus: "0.5"
+          memory: ${GRAFANA_MEMORY_LIMIT:-256M}
+          cpus: "${GRAFANA_CPU_LIMIT:-0.5}"
 
   # ============================================================
   # cAdvisor — Per-Container Resource Monitoring
@@ -1120,8 +1178,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 128M
-          cpus: "0.2"
+          memory: ${CADVISOR_MEMORY_LIMIT:-128M}
+          cpus: "${CADVISOR_CPU_LIMIT:-0.2}"
 
 # ============================================================
 # Volumes
@@ -1138,9 +1196,12 @@ volumes:
   pg_shard0_node_b_data:
   pg_shard1_node_a_data:
   pg_shard1_node_b_data:
-  # Shard 2 disabled.
-  # pg_shard2_node_a_data:
-  # pg_shard2_node_b_data:
+  # Shard 2 — declared unconditionally so the (profile-gated)
+  # pg-shard2-node-{a,b} services can reference them. Docker
+  # only materializes a named volume on first use; declaring
+  # it without an active service is harmless.
+  pg_shard2_node_a_data:
+  pg_shard2_node_b_data:
   redis_data:
   rabbitmq_data:
   prometheus_data:

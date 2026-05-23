@@ -98,15 +98,27 @@ bootstrap:
         hot_standby: "on"
 
         # --- Performance / resource-bounded capstone -----
-        # Matches the 192 MB per-node compose limit. PG 18's
-        # new async I/O and sequential-scan improvements are
-        # what motivated keeping the current major version
+        # PG 18's new async I/O and sequential-scan improvements
+        # are what motivated keeping the current major version
         # rather than downgrading to 15 under pg_auto_failover.
-        shared_buffers: 64MB
+        #
+        # `shared_buffers` is rendered from PG_SHARED_BUFFERS in
+        # .env (default 64MB to match the 512m container). Common
+        # rule of thumb: 25 % of container memory. Raising past
+        # 50 % offers diminishing returns and starves the kernel
+        # page cache. For a 1024 MB container, 256MB is a
+        # reasonable bump.
+        shared_buffers: ${PG_SHARED_BUFFERS}
         effective_cache_size: 192MB
         work_mem: 4MB
         maintenance_work_mem: 32MB
-        max_connections: 120
+        # Rendered from PG_MAX_CONNECTIONS (default 120; range
+        # 50..1000 enforced by patroni-entrypoint.sh). Tied to
+        # the pgBouncer + replication + admin headroom stack
+        # documented in db/patroni/README.md. Raising this
+        # without raising container memory (PG_MEMORY_LIMIT)
+        # risks OOM — each backend slot is ~10 MB resident.
+        max_connections: ${PG_MAX_CONNECTIONS}
 
         # --- Checkpoint smoothing -------------------------
         checkpoint_completion_target: 0.9

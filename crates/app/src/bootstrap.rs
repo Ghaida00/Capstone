@@ -364,6 +364,54 @@ pub struct Infrastructure {
     pub backpressure: BackpressureController,
 }
 
+/// Convert a `(Option<write_url>, Option<read_urls>)` pair from
+/// `Config` into `Option<ShardUrls>`. Returns `None` if either side
+/// is missing or the read list is empty — i.e. the operator has
+/// not configured this shard. `Config::validate` rejects half-set
+/// pairs at boot, so a `Some/None` mix here would already have
+/// aborted the process; the empty-list guard is belt-and-braces.
+pub fn optional_shard_urls(
+    write_url: Option<&String>,
+    read_urls: Option<&Vec<String>>,
+) -> Option<ShardUrls> {
+    match (write_url, read_urls) {
+        (Some(write), Some(reads)) if !reads.is_empty() => Some(ShardUrls {
+            write_url: write.clone(),
+            read_urls: reads.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// Assemble the shard list given each optional URL pair.
+///
+/// Shard 0 is always required (`ShardRouter::new` rejects empty
+/// configs); shards 1 and 2 are independently toggleable via env.
+/// Order is fixed (0, 1, 2) because `ShardRouter` stores shards
+/// positionally and `shard_for` hashes against `NUM_SHARDS` set
+/// from this vector's length — changing the order, or skipping
+/// shard 1 while keeping shard 2, would re-shard live data.
+///
+/// Contiguity is enforced here too: if `shard1` is `None`, `shard2`
+/// is silently dropped. `Config::validate` already rejects that
+/// pairing at boot, so this branch is a defence-in-depth guard for
+/// any internal call path that might bypass validation.
+pub fn build_shards(
+    shard0: ShardUrls,
+    shard1: Option<ShardUrls>,
+    shard2: Option<ShardUrls>,
+) -> Vec<ShardUrls> {
+    let mut shards = Vec::with_capacity(3);
+    shards.push(shard0);
+    if let Some(s1) = shard1 {
+        shards.push(s1);
+        if let Some(s2) = shard2 {
+            shards.push(s2);
+        }
+    }
+    shards
+}
+
 /// Create all infrastructure resources (DB shards, Redis, RabbitMQ,
 /// middleware components).
 ///
@@ -374,25 +422,31 @@ pub async fn init_infrastructure(
     cancel: CancellationToken,
 ) -> anyhow::Result<Infrastructure> {
     tracing::info!("Connecting to database shards...");
+    let shard0 = ShardUrls {
+        write_url: config.database_shard0_write_url.clone(),
+        read_urls: config.database_shard0_read_urls.clone(),
+    };
+    // Shards 1 and 2 are appended only when both URLs are
+    // configured. `Config::validate` already rejected a half-set
+    // pair and the shard-2-without-shard-1 contiguity violation,
+    // so an inconsistent combination cannot reach here.
+    let shard1 = optional_shard_urls(
+        config.database_shard1_write_url.as_ref(),
+        config.database_shard1_read_urls.as_ref(),
+    );
+    let shard2 = optional_shard_urls(
+        config.database_shard2_write_url.as_ref(),
+        config.database_shard2_read_urls.as_ref(),
+    );
+    let shards = build_shards(shard0, shard1, shard2);
+    let num_shards = shards.len();
     let shard_config = ShardRouterConfig {
-        shards: vec![
-            ShardUrls {
-                write_url: config.database_shard0_write_url.clone(),
-                read_urls: config.database_shard0_read_urls.clone(),
-            },
-            ShardUrls {
-                write_url: config.database_shard1_write_url.clone(),
-                read_urls: config.database_shard1_read_urls.clone(),
-            },
-            // Shard 2 disabled — see "shard 2 disabled" markers in
-            // docker-compose.yml / haproxy.cfg / shard.rs. Re-enabling
-            // requires re-adding `database_shard2_read_urls` to Config
-            // and the env-parsing block, then a ShardUrls entry here.
-        ],
+        shards,
         write_pool_size: config.db_write_pool_size,
         read_pool_size: config.db_read_pool_size,
         health_check_interval_secs: config.db_health_check_interval_secs,
     };
+    tracing::info!(num_shards, "Shard topology resolved");
     let shard_router = ShardRouter::new(&shard_config, cancel.child_token()).await?;
 
     tracing::info!("Connecting to Redis...");
@@ -749,5 +803,64 @@ mod tests {
             resolve_otlp_endpoint(Some("  http://x:4317  ".to_string())),
             Some("http://x:4317".to_string())
         );
+    }
+
+    fn dummy_shard(tag: &str) -> ShardUrls {
+        ShardUrls {
+            write_url: format!("postgres://u:p@{tag}-write:5432/db"),
+            read_urls: vec![format!("postgres://u:p@{tag}-read:5432/db")],
+        }
+    }
+
+    #[test]
+    fn build_shards_returns_one_when_only_shard0() {
+        let s0 = dummy_shard("s0");
+        let out = build_shards(s0.clone(), None, None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].write_url, s0.write_url);
+    }
+
+    #[test]
+    fn build_shards_returns_two_when_shard1_only() {
+        let s0 = dummy_shard("s0");
+        let s1 = dummy_shard("s1");
+        let out = build_shards(s0.clone(), Some(s1.clone()), None);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].write_url, s0.write_url);
+        assert_eq!(out[1].write_url, s1.write_url);
+    }
+
+    #[test]
+    fn build_shards_returns_three_when_all_set() {
+        let s0 = dummy_shard("s0");
+        let s1 = dummy_shard("s1");
+        let s2 = dummy_shard("s2");
+        let out = build_shards(s0.clone(), Some(s1.clone()), Some(s2.clone()));
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2].write_url, s2.write_url);
+    }
+
+    #[test]
+    fn build_shards_preserves_order() {
+        let s0 = dummy_shard("s0");
+        let s1 = dummy_shard("s1");
+        let s2 = dummy_shard("s2");
+        let out = build_shards(s0.clone(), Some(s1.clone()), Some(s2.clone()));
+        assert_eq!(out[0].write_url, s0.write_url);
+        assert_eq!(out[1].write_url, s1.write_url);
+        assert_eq!(out[2].write_url, s2.write_url);
+    }
+
+    #[test]
+    fn build_shards_drops_shard2_when_shard1_missing() {
+        // Contiguity: a Vec like [shard0, shard2] would silently
+        // relabel shard 2 to position 1 and re-hash every key.
+        // `Config::validate` already rejects this at boot, but
+        // `build_shards` belts-and-braces by ignoring shard 2.
+        let s0 = dummy_shard("s0");
+        let s2 = dummy_shard("s2");
+        let out = build_shards(s0.clone(), None, Some(s2.clone()));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].write_url, s0.write_url);
     }
 }

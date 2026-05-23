@@ -19,14 +19,24 @@ pub struct Config {
     // shared_kernel/src/db/shard.rs.
     pub database_shard0_write_url: String,
     pub database_shard0_read_urls: Vec<String>,
-    pub database_shard1_write_url: String,
-    pub database_shard1_read_urls: Vec<String>,
-    /// Disabled shard 2 — kept as `Option` after S-6 dropped
-    /// credentialed defaults from `from_env`. `None` is the
-    /// normal state (the compose service for shard 2 is
-    /// commented out); re-enabling shard 2 requires the env var
-    /// AND a corresponding pgBouncer/Patroni stack.
+    /// Optional shard 1 — `None` runs the single-shard topology
+    /// (everything routes to shard 0). `Some` enables shard 1.
+    /// `validate()` requires both `_write_url` and `_read_urls`
+    /// to be set together. Shard 2 cannot be enabled without
+    /// shard 1 — see the contiguity check in `validate()`.
+    pub database_shard1_write_url: Option<String>,
+    pub database_shard1_read_urls: Option<Vec<String>>,
+    /// Optional shard 2 — `None` in the normal 2-shard profile,
+    /// `Some` when the operator brings up the third shard via
+    /// `COMPOSE_PROFILES=shard2` (or any deploy that supplies both
+    /// `DATABASE_SHARD2_WRITE_URL` + `DATABASE_SHARD2_READ_URLS`).
+    /// `validate()` requires either both vars or neither — a
+    /// half-set pair is a fail-closed misconfiguration. Bootstrap
+    /// assembles `Option<ShardUrls>` from these two fields and
+    /// feeds it to `build_shards`. See "shard 2 toggle" markers
+    /// across the stack.
     pub database_shard2_write_url: Option<String>,
+    pub database_shard2_read_urls: Option<Vec<String>>,
     pub db_write_pool_size: u32,
     pub db_read_pool_size: u32,
 
@@ -211,14 +221,31 @@ impl Config {
             // Shard 0
             database_shard0_write_url: must_env("DATABASE_SHARD0_WRITE_URL"),
             database_shard0_read_urls: must_csv_env("DATABASE_SHARD0_READ_URLS"),
-            // Shard 1
-            database_shard1_write_url: must_env("DATABASE_SHARD1_WRITE_URL"),
-            database_shard1_read_urls: must_csv_env("DATABASE_SHARD1_READ_URLS"),
-            // Shard 2 — disabled in compose; .env does not define
-            // the URL. Optional so unset is the normal case, not
-            // a boot failure. Re-enabling shard 2 requires setting
-            // the env var alongside the corresponding compose service.
+            // Shard 1 — toggleable via env. Same both-or-neither
+            // rule enforced in `validate()` as for shard 2. Unset
+            // both vars to boot the single-shard topology
+            // (everything hashes to shard 0).
+            database_shard1_write_url: std::env::var("DATABASE_SHARD1_WRITE_URL").ok(),
+            database_shard1_read_urls: std::env::var("DATABASE_SHARD1_READ_URLS").ok().map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }),
+            // Shard 2 — gated by COMPOSE_PROFILES=shard2 (and the
+            // corresponding pgBouncer/Patroni stack). Both URLs
+            // unset is the normal 2-shard topology; both set
+            // promotes the router to 3 shards. `validate()`
+            // rejects a half-set pair so a deploy that wires the
+            // write URL but forgets the read list (or vice versa)
+            // fails closed at boot.
             database_shard2_write_url: std::env::var("DATABASE_SHARD2_WRITE_URL").ok(),
+            database_shard2_read_urls: std::env::var("DATABASE_SHARD2_READ_URLS").ok().map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }),
             // Pool sizes raised: previous defaults bottlenecked at the
             // app↔pgBouncer hop. With 4 replicas each pool is now sized
             // to soak its share of 1000 concurrent VUs without queueing.
@@ -362,6 +389,53 @@ impl Config {
 
         // Server
         ensure!(self.port > 0, "APP_PORT must be > 0");
+
+        // Shard 1 toggle: both URL fields must be set together, or
+        // both unset (running the single-shard topology).
+        let shard1_write_set = self.database_shard1_write_url.is_some();
+        let shard1_reads_set = self
+            .database_shard1_read_urls
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        ensure!(
+            shard1_write_set == shard1_reads_set,
+            "DATABASE_SHARD1_WRITE_URL and DATABASE_SHARD1_READ_URLS must be set together \
+             (or both unset). Got write_url={:?}, read_urls={:?}",
+            shard1_write_set,
+            self.database_shard1_read_urls
+                .as_ref()
+                .map(|v| v.len())
+                .unwrap_or(0)
+        );
+
+        // Shard 2 toggle: same both-or-neither rule as shard 1.
+        let shard2_write_set = self.database_shard2_write_url.is_some();
+        let shard2_reads_set = self
+            .database_shard2_read_urls
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        ensure!(
+            shard2_write_set == shard2_reads_set,
+            "DATABASE_SHARD2_WRITE_URL and DATABASE_SHARD2_READ_URLS must be set together \
+             (or both unset). Got write_url={:?}, read_urls={:?}",
+            shard2_write_set,
+            self.database_shard2_read_urls
+                .as_ref()
+                .map(|v| v.len())
+                .unwrap_or(0)
+        );
+
+        // Contiguity: shard 2 cannot be enabled without shard 1.
+        // Allowing it would force `build_shards` to silently relabel
+        // shard 2 to index 1, which re-hashes every key under
+        // `shard_for = hash % NUM_SHARDS` — a deeply corrupting bug.
+        ensure!(
+            !(shard2_write_set && !shard1_write_set),
+            "DATABASE_SHARD2_* cannot be set while DATABASE_SHARD1_* is unset \
+             (shard topology must be contiguous: 0, 0+1, or 0+1+2)"
+        );
 
         // Pool sizes
         ensure!(
@@ -611,7 +685,10 @@ impl fmt::Display for Config {
         writeln!(
             f,
             "  database_shard1_write_url:    {}",
-            mask_url(&self.database_shard1_write_url)
+            self.database_shard1_write_url
+                .as_deref()
+                .map(mask_url)
+                .unwrap_or_else(|| "(unset — shard 1 disabled, single-shard mode)".to_string())
         )?;
         writeln!(
             f,
@@ -619,6 +696,19 @@ impl fmt::Display for Config {
             self.database_shard2_write_url
                 .as_deref()
                 .map(mask_url)
+                .unwrap_or_else(|| "(unset — shard 2 disabled)".to_string())
+        )?;
+        writeln!(
+            f,
+            "  database_shard2_read_urls:    {}",
+            self.database_shard2_read_urls
+                .as_ref()
+                .map(|urls| {
+                    urls.iter()
+                        .map(|u| mask_url(u))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
                 .unwrap_or_else(|| "(unset — shard 2 disabled)".to_string())
         )?;
         writeln!(
@@ -706,9 +796,10 @@ mod tests {
             port: 3000,
             database_shard0_write_url: "postgres://user:pass@host:5432/db".to_string(),
             database_shard0_read_urls: vec!["postgres://user:pass@host:5432/db".to_string()],
-            database_shard1_write_url: "postgres://user:pass@host:5432/db".to_string(),
-            database_shard1_read_urls: vec!["postgres://user:pass@host:5432/db".to_string()],
+            database_shard1_write_url: Some("postgres://user:pass@host:5432/db".to_string()),
+            database_shard1_read_urls: Some(vec!["postgres://user:pass@host:5432/db".to_string()]),
             database_shard2_write_url: Some("postgres://user:pass@host:5432/db".to_string()),
+            database_shard2_read_urls: Some(vec!["postgres://user:pass@host:5432/db".to_string()]),
             db_write_pool_size: 30,
             db_read_pool_size: 50,
             redis_command_timeout_secs: 3,
@@ -903,5 +994,80 @@ mod tests {
         let mut cfg = test_config();
         cfg.redis_intake_batch_size = 25;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn shard2_both_unset_passes() {
+        let mut cfg = test_config();
+        cfg.database_shard2_write_url = None;
+        cfg.database_shard2_read_urls = None;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn shard2_write_only_fails() {
+        let mut cfg = test_config();
+        cfg.database_shard2_write_url = Some("postgres://u:p@h:5432/db".to_string());
+        cfg.database_shard2_read_urls = None;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn shard2_reads_only_fails() {
+        let mut cfg = test_config();
+        cfg.database_shard2_write_url = None;
+        cfg.database_shard2_read_urls = Some(vec!["postgres://u:p@h:5432/db".to_string()]);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn shard2_write_set_with_empty_reads_fails() {
+        // A read URL list containing only empties degenerates to an
+        // unusable shard; treat it identically to the missing case.
+        let mut cfg = test_config();
+        cfg.database_shard2_write_url = Some("postgres://u:p@h:5432/db".to_string());
+        cfg.database_shard2_read_urls = Some(vec![]);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn shard1_both_unset_passes_single_shard_mode() {
+        // The 1-shard topology (everything hashes to shard 0) is
+        // a supported deployment mode.
+        let mut cfg = test_config();
+        cfg.database_shard1_write_url = None;
+        cfg.database_shard1_read_urls = None;
+        cfg.database_shard2_write_url = None;
+        cfg.database_shard2_read_urls = None;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn shard1_write_only_fails() {
+        let mut cfg = test_config();
+        cfg.database_shard1_write_url = Some("postgres://u:p@h:5432/db".to_string());
+        cfg.database_shard1_read_urls = None;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn shard1_reads_only_fails() {
+        let mut cfg = test_config();
+        cfg.database_shard1_write_url = None;
+        cfg.database_shard1_read_urls = Some(vec!["postgres://u:p@h:5432/db".to_string()]);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn shard2_without_shard1_fails_contiguity() {
+        // Skipping shard 1 while configuring shard 2 would silently
+        // relabel shard 2 to index 1 and re-hash every key. Reject
+        // the deploy at boot.
+        let mut cfg = test_config();
+        cfg.database_shard1_write_url = None;
+        cfg.database_shard1_read_urls = None;
+        cfg.database_shard2_write_url = Some("postgres://u:p@h:5432/db".to_string());
+        cfg.database_shard2_read_urls = Some(vec!["postgres://u:p@h:5432/db".to_string()]);
+        assert!(cfg.validate().is_err());
     }
 }
