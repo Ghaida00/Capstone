@@ -14,7 +14,7 @@ use sqlx::FromRow;
 use shared_kernel::db::failover::retry_transient_with_breaker;
 use shared_kernel::db::shard::ShardRouter;
 
-use super::super::domain::{Account, AccountRepository, RepoError};
+use super::super::domain::{Account, AccountRepository, NewAccount, RepoError};
 use super::super::ports::{AccountId, AccountStatus};
 
 /// Minimal row projection — we only read what the port DTO
@@ -25,6 +25,15 @@ struct UsersRow {
     account_number: String,
     balance: Decimal,
     status: String,
+}
+
+/// Projection returned by the INSERT RETURNING clause.
+#[derive(Debug, FromRow)]
+struct InsertedRow {
+    account_number: String,
+    full_name: String,
+    email: Option<String>,
+    balance: Decimal,
 }
 
 /// Concrete repo. Holds a clone of the shard router rather
@@ -95,5 +104,39 @@ impl AccountRepository for SqlxAccountRepository {
                 },
             }
         }))
+    }
+
+    async fn insert_account(&self, account: NewAccount) -> Result<NewAccount, RepoError> {
+        // Always write to shard derived from account_number so
+        // the account lives on the same shard that debit/credit
+        // queries will target.
+        let shard = self.shards.shard_for_account(&account.account_number);
+        let pool = self.shards.writer(shard);
+
+        let balance: Decimal = account
+            .balance_str
+            .parse()
+            .unwrap_or(Decimal::ZERO);
+
+        let row = sqlx::query_as::<_, InsertedRow>(
+            r#"
+            INSERT INTO users (account_number, full_name, email, balance, status)
+            VALUES ($1, $2, $3, $4, 'active')
+            RETURNING account_number, full_name, email, balance
+            "#,
+        )
+        .bind(&account.account_number)
+        .bind(&account.full_name)
+        .bind(&account.email)
+        .bind(balance)
+        .fetch_one(pool)
+        .await?;
+
+        Ok(NewAccount {
+            account_number: row.account_number,
+            full_name: row.full_name,
+            email: row.email,
+            balance_str: row.balance.to_string(),
+        })
     }
 }
