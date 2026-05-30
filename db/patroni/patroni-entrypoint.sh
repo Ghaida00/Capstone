@@ -47,6 +47,10 @@
 #                           Default: 0.
 #   PG_COMMIT_SIBLINGS      commit_delay concurrency floor.
 #                           Default: 5.
+#   PG_WAL_COMPRESSION      Compress WAL full-page images so the
+#                           log writes fewer bytes — trades CPU
+#                           for disk write throughput.
+#                           Default: off.
 #
 # The template at /etc/patroni/patroni.yml.tmpl is rendered
 # once per container start via `envsubst` and written to
@@ -81,6 +85,7 @@ set -eu
 : "${PG_SYNCHRONOUS_COMMIT:=remote_write}"
 : "${PG_COMMIT_DELAY:=0}"
 : "${PG_COMMIT_SIBLINGS:=5}"
+: "${PG_WAL_COMPRESSION:=off}"
 : "${PG_MAX_CONNECTIONS:=120}"
 : "${PG_SHARED_BUFFERS:=64MB}"
 
@@ -91,6 +96,18 @@ case "$PG_SYNCHRONOUS_COMMIT" in
     *)
         echo "[patroni-entrypoint] FATAL: PG_SYNCHRONOUS_COMMIT='$PG_SYNCHRONOUS_COMMIT'" \
              "must be one of: on off local remote_write remote_apply" >&2
+        exit 1
+        ;;
+esac
+
+# Fail fast on a bad WAL-compression method. lz4/zstd need a
+# server built with that support — the bookworm postgres image
+# this stage builds on has both.
+case "$PG_WAL_COMPRESSION" in
+    on|off|pglz|lz4|zstd) ;;
+    *)
+        echo "[patroni-entrypoint] FATAL: PG_WAL_COMPRESSION='$PG_WAL_COMPRESSION'" \
+             "must be one of: on off pglz lz4 zstd" >&2
         exit 1
         ;;
 esac
@@ -128,7 +145,7 @@ export PGDATA PATRONI_SCOPE PATRONI_NAME PATRONI_HOSTNAME ETCD_HOSTS \
        POSTGRES_SUPERUSER_PASSWORD POSTGRES_USER POSTGRES_PASSWORD \
        POSTGRES_DB REPL_PASSWORD \
        PG_SYNCHRONOUS_COMMIT PG_COMMIT_DELAY PG_COMMIT_SIBLINGS \
-       PG_MAX_CONNECTIONS PG_SHARED_BUFFERS
+       PG_WAL_COMPRESSION PG_MAX_CONNECTIONS PG_SHARED_BUFFERS
 
 # ------------------------------------------------------------
 # 1. Render the Patroni config from the template.
@@ -154,6 +171,7 @@ envsubst '
     ${PG_SYNCHRONOUS_COMMIT}
     ${PG_COMMIT_DELAY}
     ${PG_COMMIT_SIBLINGS}
+    ${PG_WAL_COMPRESSION}
     ${PG_MAX_CONNECTIONS}
     ${PG_SHARED_BUFFERS}
 ' < /etc/patroni/patroni.yml.tmpl > "$RENDERED"

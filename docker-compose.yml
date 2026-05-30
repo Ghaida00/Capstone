@@ -134,6 +134,10 @@ x-pg-node-env: &pg-node-env
   PG_SYNCHRONOUS_COMMIT: ${PG_SYNCHRONOUS_COMMIT:-remote_write}
   PG_COMMIT_DELAY: ${PG_COMMIT_DELAY:-0}
   PG_COMMIT_SIBLINGS: ${PG_COMMIT_SIBLINGS:-5}
+  # WAL full-page-image compression — trades CPU for fewer WAL
+  # bytes on disk. off (default); set lz4 when the disk is the
+  # bottleneck (slow SSD / capped cloud volume). See .env §3.5.
+  PG_WAL_COMPRESSION: ${PG_WAL_COMPRESSION:-off}
   # Cluster-wide max_connections — rendered into the DCS
   # parameters of patroni.yml.tmpl. Default 120 mirrors the
   # entrypoint. Pair changes with `PG_MEMORY_LIMIT` because

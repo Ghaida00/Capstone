@@ -223,13 +223,18 @@ postgresql:
   #                       fsync — group commit. 0 = off.
   #   commit_siblings     concurrent-transaction floor
   #                       before commit_delay engages.
+  #   wal_compression     compress WAL full-page images so the
+  #                       log writes fewer bytes — trades CPU
+  #                       for disk throughput. off (default),
+  #                       lz4 (cheap), zstd (smaller), on/pglz.
   #
   # patroni-entrypoint.sh defaults these to
-  # remote_write / 0 / 5 when the PG_* vars are unset.
+  # remote_write / 0 / 5 / off when the PG_* vars are unset.
   parameters:
     synchronous_commit: "${PG_SYNCHRONOUS_COMMIT}"
     commit_delay: ${PG_COMMIT_DELAY}
     commit_siblings: ${PG_COMMIT_SIBLINGS}
+    wal_compression: "${PG_WAL_COMPRESSION}"
 
   authentication:
     superuser:
