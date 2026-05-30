@@ -149,6 +149,14 @@ x-pg-node-env: &pg-node-env
   # DCS-bootstrap caveat as PG_MAX_CONNECTIONS — see .env
   # for the patronictl edit-config workflow.
   PG_SHARED_BUFFERS: ${PG_SHARED_BUFFERS:-64MB}
+  # WAL / checkpoint cadence — DCS-level (applies on fresh bootstrap
+  # or via `patronictl edit-config`). Larger max_wal_size / longer
+  # checkpoint_timeout space checkpoints out → fewer full-page images
+  # → less disk write. Costs pg_wal space + slower recovery. See .env §3.6b.
+  PG_MAX_WAL_SIZE: ${PG_MAX_WAL_SIZE:-2GB}
+  PG_MIN_WAL_SIZE: ${PG_MIN_WAL_SIZE:-512MB}
+  PG_CHECKPOINT_TIMEOUT: ${PG_CHECKPOINT_TIMEOUT:-15min}
+  PG_CHECKPOINT_COMPLETION_TARGET: ${PG_CHECKPOINT_COMPLETION_TARGET:-0.9}
 
 # Per-node resource envelope. 1.5 CPU / 512 MB gives the
 # primary headroom for both request-driven INSERT/UPDATE
