@@ -802,8 +802,8 @@ mod tests {
     // (return 404). The pure helper below isolates that decision
     // so we can test it without standing up a repo mock.
 
-    use chrono::Utc;
     use super::super::domain::TransactionStatus;
+    use chrono::Utc;
 
     #[test]
     fn resolve_status_view_returns_terminal_status_when_in_transactions() {

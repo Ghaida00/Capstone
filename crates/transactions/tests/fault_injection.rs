@@ -46,8 +46,8 @@ use testcontainers_modules::redis::Redis;
 use tokio_util::sync::CancellationToken;
 
 use accounts::ports::{
-    AccountCreated, AccountError, AccountId, AccountService, Balance,
-    CreateAccountInput, DynAccountService,
+    AccountCreated, AccountError, AccountId, AccountService, Balance, CreateAccountInput,
+    DynAccountService,
 };
 use shared_kernel::cache::redis::{RedisCache, RedisCacheConfig};
 use shared_kernel::db::shard::{ShardRouter, ShardRouterConfig, ShardUrls};

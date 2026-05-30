@@ -225,10 +225,7 @@ impl AccountService for GetBalanceService {
         // Validate and parse initial_balance.
         let balance: Decimal = match input.initial_balance.as_deref() {
             Some(s) => s.parse::<Decimal>().map_err(|_| {
-                AccountError::Validation(format!(
-                    "initial_balance '{}' is not a valid decimal",
-                    s
-                ))
+                AccountError::Validation(format!("initial_balance '{}' is not a valid decimal", s))
             })?,
             None => Decimal::ZERO,
         };

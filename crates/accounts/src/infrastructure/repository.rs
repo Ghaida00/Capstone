@@ -113,10 +113,7 @@ impl AccountRepository for SqlxAccountRepository {
         let shard = self.shards.shard_for_account(&account.account_number);
         let pool = self.shards.writer(shard);
 
-        let balance: Decimal = account
-            .balance_str
-            .parse()
-            .unwrap_or(Decimal::ZERO);
+        let balance: Decimal = account.balance_str.parse().unwrap_or(Decimal::ZERO);
 
         let row = sqlx::query_as::<_, InsertedRow>(
             r#"

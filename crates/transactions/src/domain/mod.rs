@@ -95,10 +95,8 @@ pub(crate) trait TransactionRepository: Send + Sync + 'static {
     /// has no row but `idempotency_keys` does, the request was
     /// accepted and is still in flight (200 + pending), not
     /// genuinely missing (404).
-    async fn idempotency_exists_for_reference(
-        &self,
-        reference_id: &str,
-    ) -> Result<bool, RepoError>;
+    async fn idempotency_exists_for_reference(&self, reference_id: &str)
+        -> Result<bool, RepoError>;
 }
 
 // ─── Idempotency-aware writer trait ─────────────────────────
