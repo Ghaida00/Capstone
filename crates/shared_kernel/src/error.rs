@@ -27,6 +27,15 @@ pub enum AppError {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
+    /// HTTP 409 — resource already exists (duplicate
+    /// `account_number` or `email` on `POST /api/v2/accounts`,
+    /// or any future endpoint that creates a uniquely-keyed
+    /// resource). Distinct from `BadRequest` so callers can
+    /// distinguish "your input is malformed" from "your input
+    /// is valid but the resource already exists".
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     #[error("Rate limited")]
     RateLimited,
 
@@ -94,6 +103,7 @@ impl IntoResponse for AppError {
             }
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg.clone()),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg.clone()),
             AppError::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limited",
