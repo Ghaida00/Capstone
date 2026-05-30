@@ -428,6 +428,16 @@ impl RedisCache {
         Ok(removed)
     }
 
+    /// `LLEN list` — current element count of a list. Reads the
+    /// master pool so the sample reflects the authoritative queue,
+    /// not a lagging replica. Used to sample the live intake backlog
+    /// (pending + inflight) for the self-correcting drift gauge.
+    pub async fn llen(&self, list: &str) -> Result<i64, AppError> {
+        let mut conn = self.write_conn().await?;
+        let len: i64 = self.map_redis(conn.llen(list).await)?;
+        Ok(len)
+    }
+
     /// Pipelined batched `RPOPLPUSH src dst` — N invocations in one
     /// network round-trip. Each `RPOPLPUSH` is individually atomic
     /// and inflight-safe; the pipeline only removes per-call network

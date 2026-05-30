@@ -97,13 +97,13 @@
       }
     },
     {
-      "title": "Drift (replay-adjusted)",
-      "description": "Lifetime created − processed − idempotency_replays (both Redis and PG paths). Should be ~0 in steady state. A non-zero reading is real loss to investigate: DLQ, requeued, or cross-shard terminal-failed. The raw created − processed includes idempotency replays — those are accepted POSTs that intentionally short-circuit to the cached response and never reach the consumer, so they accumulate in the delta despite being correct behaviour.",
+      "title": "Backlog (live intake depth)",
+      "description": "Current unprocessed work: pending + inflight reservation keys in the Redis intake lists, sampled every 5s by transactions_intake_pending. Self-correcting — returns to ~0 when the consumers catch up, and reconciles with the DB (count of status='processing'). This replaces the old lifetime counter delta (created − processed − replays), which accumulated phantom drift under failover because Prometheus counters reset on restart and miss scrapes during the storm. Aggregated max by (shard) across app replicas (every replica samples the same shared lists) then summed across shards.",
       "type": "stat",
       "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
       "targets": [
         {
-          "expr": "sum(transactions_created_total) - sum(transactions_processed_total) - sum(idempotency_redis_replay_total) - sum(idempotency_hits_total)",
+          "expr": "sum(max by (shard) (transactions_intake_pending))",
           "refId": "A"
         }
       ],
