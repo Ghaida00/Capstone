@@ -38,6 +38,15 @@ impl Account {
     }
 }
 
+/// Minimal projection used by `insert_account` returning clause.
+#[derive(Debug, Clone)]
+pub(crate) struct NewAccount {
+    pub account_number: String,
+    pub full_name: String,
+    pub email: Option<String>,
+    pub balance_str: String,
+}
+
 // ─── Repository abstraction ─────────────────────────────────
 
 /// The port the infrastructure must satisfy. Declared inside
@@ -58,4 +67,13 @@ pub(crate) enum RepoError {
 #[async_trait]
 pub(crate) trait AccountRepository: Send + Sync + 'static {
     async fn find_active_by_id(&self, id: &AccountId) -> Result<Option<Account>, RepoError>;
+
+    /// INSERT a new row into `users`. Returns the created row on
+    /// success. The caller is responsible for validating
+    /// `account_number` uniqueness at the domain level; the repo
+    /// maps UNIQUE violations to `RepoError::Sqlx` with the
+    /// underlying `sqlx::Error::Database` variant — the
+    /// application layer then converts that to
+    /// `AccountError::AlreadyExists`.
+    async fn insert_account(&self, account: NewAccount) -> Result<NewAccount, RepoError>;
 }
