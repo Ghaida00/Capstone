@@ -1,48 +1,67 @@
 import http from "k6/http";
 import { check, sleep, group } from "k6";
-import { Rate, Counter } from "k6/metrics";
+import { Rate, Counter, Trend } from "k6/metrics";
 
-// ─── Custom Metrics ────────────────────────────────────────
-// Per-endpoint latency lives on the built-in `http_req_duration`
-// metric, sliced by `tags.name`. A separate `transaction_latency`
-// Trend mixed POST and GET into one distribution, making its p95
-// meaningless — dropped in favour of the per-endpoint thresholds.
+// ─── Load test: 1M/hour, accept-only baseline + sampled e2e ──
+// Sibling to load-test-1m.js. Same arrival shape (~278 rps for
+// 13 min sustained), same payload mix, same replay rate. Adds a
+// sample-based end-to-end measurement: 5% of fresh accepted
+// transactions are also polled to terminal status, and the
+// per-request wall-clock from "request issued" to
+// "completed/failed" is recorded into `transaction_e2e_ms`.
+//
+// Why sampling and not full e2e (the now-removed load-test-e2e.js):
+//
+//   - Full e2e at 278 rps added ~1400-2800 status polls/sec.
+//     That blew through the production-safe nginx per-IP rate
+//     limit (NGINX_PER_IP_RATE=2000 in .env) and dominated total
+//     read load on /status. The "what's our e2e under load?"
+//     question got polluted with "...with the system also under
+//     a self-inflicted poll storm".
+//   - 5% sampling adds only ~14 polls/sec — total client traffic
+//     stays at ~620 rps, comfortably under the per-IP ceiling.
+//   - 5% × 217k iters over 13 min ≈ 10,850 samples. Plenty for
+//     stable p50/p95/p99 without saturating the system from one
+//     k6 host.
+//
+// The accept-side SLOs are identical to load-test-1m so this
+// script also serves as a stricter superset: regressions on
+// accept latency AND end-to-end completion are both caught.
+
 const transactionCreated = new Counter("transactions_created");
 const transactionRead = new Counter("transactions_read");
 const errorRate = new Rate("error_rate");
 const idempotencyReplayAttempts = new Counter("idempotency_replay_attempts");
 
+// End-to-end latency Trend (sampled). Trend so k6 reports
+// p50/p95/p99. Replays are NOT recorded — they hit the
+// idempotency cache and return ~instantly, which would skew the
+// distribution optimistic.
+const transactionE2eMs = new Trend("transaction_e2e_ms", true);
+const transactionsE2eCompleted = new Counter("transactions_e2e_completed");
+const transactionsE2eTimeout = new Counter("transactions_e2e_timeout");
+
 // ─── Configuration ─────────────────────────────────────────
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";
-
-// Must match the accounts seeded by db/init.sql (ACC_0000001 – ACC_0100000)
 const NUM_ACCOUNTS = 100000;
-
-// Pool fits inside the `v1:balance:` 10 s Redis TTL
-// (BALANCE_CACHE_TTL_SECS in crates/accounts/src/application/mod.rs)
-// so steady-state polls hit warm.
 const BALANCE_POLL_POOL_SIZE = 100;
 
-// Random account from the 100k pool. Generated on-the-fly so we never
-// allocate a 100k array per VU.
+// 5% of fresh accepts → e2e poll. Override via env var if needed:
+//   k6 run -e E2E_SAMPLE_RATE=0.10 k6/load-test-1m-sample-e2e.js
+const E2E_SAMPLE_RATE = parseFloat(__ENV.E2E_SAMPLE_RATE || "0.05");
+const E2E_POLL_TIMEOUT_MS = 10000;
+const E2E_POLL_INTERVAL_MS = 100;
+
 function randomAccount() {
   const i = Math.floor(Math.random() * NUM_ACCOUNTS) + 1;
   return `ACC_${String(i).padStart(7, "0")}`;
 }
 
-// Random account from the balance-poll pool.
 function balancePollAccount() {
   const i = Math.floor(Math.random() * BALANCE_POLL_POOL_SIZE) + 1;
   return `ACC_${String(i).padStart(7, "0")}`;
 }
 
-// Per-VU buffer of recently-issued requests. Storing the FULL
-// payload (not just the reference_id) is what makes the replay
-// fire the server's Replay branch: idempotency_key embeds
-// `shard_for_account(from_account)` and the cached entry is keyed
-// on `(idempotency_key, request_hash)`. Replaying with a fresh
-// from_account or amount produces a different shard / hash and
-// would land as either a fresh reservation or a HashConflict 400.
 const REPLAY_BUFFER_SIZE = 32;
 let replayBuffer = [];
 
@@ -61,63 +80,38 @@ function pickReplayRequest() {
 // ─── Test Scenarios ────────────────────────────────────────
 
 export const options = {
-  // Default summary stats include only avg/min/med/max/p(90)/p(95).
-  // Add p(99) + p(99.9) explicitly so the per-run stdout shows the
-  // tail percentiles the thresholds gate on (otherwise you must
-  // reach for Grafana even to see whether the p(99)<150 threshold
-  // was tight or loose).
   summaryTrendStats: ["avg", "min", "med", "max", "p(90)", "p(95)", "p(99)", "p(99.9)", "count"],
 
-  // Global tags get attached to every sample so Grafana/k6 Cloud
-  // can filter runs by environment + commit. Run-local default to
-  // ms-since-epoch so back-to-back local runs do not overlap in
-  // the same series.
   tags: {
     environment: __ENV.K6_ENV || "local",
     run_id: __ENV.RUN_ID || String(Date.now()),
     git_sha: __ENV.GIT_SHA || "dev",
   },
 
-  // Don't reuse TCP connections across iterations — this is the
-  // k6 default but stated explicitly here for reproducibility
-  // across k6 versions and against external readers.
   noConnectionReuse: false,
   insecureSkipTLSVerify: false,
 
   scenarios: {
     sustained_1m_per_hour: {
-      // Ramping arrival rate: a 1-minute warmup avoids the cold-
-      // pool / cold-cache thundering herd that briefly spikes p99
-      // at t=0 with constant-arrival-rate. The 1-minute cooldown
-      // exposes whether p99 recovers cleanly after load stops —
-      // a leak / queue-buildup bug shows up here as p99 staying
-      // high after the load drops to zero.
-      //
-      // Note: the progress bar may show a non-zero rate (~3 iter/s)
-      // at t=14:59.x because target=0 is reached at the END of the
-      // last stage, not before. That is a k6 progress-display
-      // quirk for ramping-arrival-rate, not a real "scenario did
-      // not complete" condition — `iterations` counts all
-      // dispatched, all complete, no orphans.
+      // Identical to load-test-1m.js. 5% e2e sampling adds only
+      // ~14 polls/sec, so no VU pool bump needed (each sampled VU
+      // spends ~1 extra second in pollStatus → ~14 concurrent
+      // VUs additional × 300 preAllocated is plenty).
       executor: "ramping-arrival-rate",
       startRate: 50,
       timeUnit: "1s",
       preAllocatedVUs: 300,
       maxVUs: 1500,
       stages: [
-        { duration: "1m",  target: 278 },   // warmup: 50 → 278 rps
-        { duration: "13m", target: 278 },   // sustained at 1M/hour
-        { duration: "55s",  target: 0 },     // cooldown: 278 → 0
+        { duration: "1m",  target: 278 },
+        { duration: "13m", target: 278 },
+        { duration: "55s", target: 0 },
       ],
       exec: "txWorkload",
       gracefulStop: "30s",
       tags: { scenario: "sustained_1m_per_hour" },
     },
 
-    // 5 VUs polling GET /balance. Starts after a 10s warmup so
-    // cold pool / replica-health-probe blips at t=0 don't poison
-    // the check-rate threshold. Runs 14m50s to stay inside the
-    // 15m envelope.
     balance_poll: {
       executor: "constant-vus",
       vus: 5,
@@ -129,31 +123,38 @@ export const options = {
   },
 
   thresholds: {
-    // `abortOnFail` kills the run if the error rate breaches the
-    // SLO — no point burning 15 minutes against a wedged server
-    // once the gate has tripped. `delayAbortEval: "2m"` rides
-    // through the warmup window (cold pools, cache misses) where
-    // a 1-minute moving rate can spike harmlessly.
+    // Same accept-side SLOs as load-test-1m.
     http_req_failed: [
       { threshold: "rate<0.05", abortOnFail: true, delayAbortEval: "2m" },
     ],
     http_req_duration: ["p(95)<500", "p(99)<1500"],
     error_rate: ["rate<0.05"],
 
-    // Per-endpoint targets in ms. Floors set by loopback HTTP
-    // round-trip (~1ms) + handler work, not by server CPU. Sub-ms
-    // p(50) is unachievable here regardless of optimization.
     "http_req_duration{name:GET /api/v2/accounts/:id/balance}": ["p(50)<3", "p(95)<10"],
     "http_req_duration{name:POST /api/v2/transactions}": ["p(50)<10", "p(95)<50", "p(99)<150"],
     "http_req_duration{name:GET /api/v2/transactions}": ["p(95)<50"],
+
+    // End-to-end SLOs. Bound by consumer batch fill + flush
+    // cadence (~200 txn batches at 278 rps fill every ~0.7 s).
+    // A fresh transaction averages ~0.35 s queue wait + ~0.1 s
+    // DB write + ~0.05 s accept ≈ 0.5–1 s typical, up to ~1.5 s
+    // worst. p99<5000 ms allows headroom for batch-timeout
+    // flushes during load lulls.
+    "transaction_e2e_ms": [
+      "p(50)<1500",
+      "p(95)<3000",
+      "p(99)<5000",
+    ],
+    // Stuck transactions: anything beyond E2E_POLL_TIMEOUT_MS
+    // (10 s) is genuinely wedged. 5% × 217k iters = ~10,850
+    // samples; 0.5% timeout = ~55. If this trips, the consumer
+    // or outbox is wedged, not just slow.
+    "transactions_e2e_timeout": ["count<55"],
   },
 };
 
 // ─── Helpers ───────────────────────────────────────────────
 
-// Per-VU error log budget. Logging is silently dropped above
-// 200 VU (spike / late-stress) to avoid drowning the k6 stdout
-// in 10k+ lines per run.
 const MAX_LOGGED_ERRORS = 5;
 const LOG_VU_CEILING = 200;
 let loggedErrors = 0;
@@ -173,24 +174,27 @@ function logFailure(context, res) {
   );
 }
 
-// Poll /api/v2/transactions/status/{ref} until the consumer marks
-// the row completed/failed. Used by setup to verify end-to-end works
-// before the load scenarios start.
-//
-// Server-side fix means the endpoint returns 200 + `status: "pending"`
-// during the brief accept→flush window (instead of the previous 404).
-// No `responseCallback` workaround needed — every setup poll is now
-// a true 200, so k6's default failure classification is correct.
+// Tag for setup-phase status polls.
 const SETUP_POLL_PARAMS = {
   tags: { name: "GET /api/v2/transactions/status/:ref (setup poll)" },
 };
 
-function waitForCompletion(refId, timeoutMs = 5000, pollMs = 200) {
+// Tag for in-load e2e sample polls. Distinct from setup so each
+// shows its own latency distribution in the k6 summary, and so
+// http_req_duration threshold buckets don't conflate the two.
+const E2E_POLL_PARAMS = {
+  tags: { name: "GET /api/v2/transactions/status/:ref (e2e sample poll)" },
+};
+
+// Poll /status/{ref} until terminal. Returns "completed" / "failed"
+// on success, or null on timeout. The `params` argument lets the
+// caller tag the poll requests distinctly (setup vs in-load e2e).
+function waitForCompletion(refId, params, timeoutMs, pollMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const res = http.get(
       `${BASE_URL}/api/v2/transactions/status/${refId}`,
-      SETUP_POLL_PARAMS
+      params,
     );
     if (res.status === 200) {
       try {
@@ -208,16 +212,12 @@ function waitForCompletion(refId, timeoutMs = 5000, pollMs = 200) {
   return null;
 }
 
-// ─── Setup: Verify connectivity & end-to-end pipeline ──────
-// Any unrecoverable problem here throws — k6 aborts before
-// scenarios fire, so we don't burn 15 minutes of iterations
-// against a wedged pipeline.
+// ─── Setup ─────────────────────────────────────────────────
 export function setup() {
   console.log(`🎯 Target: ${BASE_URL}`);
-  console.log(`📊 Running: sustained 1M/hour + balance poll`);
+  console.log(`📊 Running: sustained 1M/hour + ${(E2E_SAMPLE_RATE * 100).toFixed(1)}% e2e sample + balance poll`);
   console.log(`👥 Using ${NUM_ACCOUNTS} pre-seeded accounts (ACC_0000001 – ACC_0100000)\n`);
 
-  // 1. Health check
   const health = http.get(`${BASE_URL}/health`);
   if (health.status !== 200) {
     throw new Error(
@@ -227,7 +227,6 @@ export function setup() {
   }
   console.log(`✅ Health check passed`);
 
-  // 2. Verify accounts exist (no state mutation)
   const balanceRes = http.get(`${BASE_URL}/api/v2/accounts/ACC_0000001/balance`);
   if (balanceRes.status !== 200) {
     throw new Error(
@@ -237,18 +236,15 @@ export function setup() {
   }
   console.log(`✅ Accounts verified (ACC_0000001 exists)`);
 
-  // 3. End-to-end smoke test: create + poll status until consumer
-  // marks the row processed. Confirms the entire path (HTTP → queue
-  // → consumer → DB) is alive before the load scenarios fire.
   console.log(`\n🔍 End-to-end smoke test (create + wait for consumer)...`);
-  const setupRefId = `setup-${__ENV.HOSTNAME || "host"}-${Date.now()}`;
+  const setupRefId = `setup-sampled-${__ENV.HOSTNAME || "host"}-${Date.now()}`;
   const testPayload = JSON.stringify({
     from_account: "ACC_0000001",
     to_account: "ACC_0000002",
     amount: "1.00",
     currency: "IDR",
     reference_id: setupRefId,
-    description: "k6 setup diagnostic test",
+    description: "k6 sampled-e2e setup diagnostic test",
   });
 
   const createRes = http.post(`${BASE_URL}/api/v2/transactions`, testPayload, {
@@ -263,14 +259,7 @@ export function setup() {
     );
   }
 
-  // 30 s is sized to absorb residual drain from a previous run —
-  // the cross-shard processor + idempotency publisher can keep
-  // backends busy for ~1–3 minutes after a 15-minute load finishes.
-  // A back-to-back run started during that window queues this
-  // setup tx behind that backlog; 30 s gives the consumer one full
-  // tick of headroom over the usual cold-start ~5 s. Past 30 s the
-  // pipeline is genuinely wedged and aborting is the right move.
-  const finalStatus = waitForCompletion(setupRefId, 30000, 250);
+  const finalStatus = waitForCompletion(setupRefId, SETUP_POLL_PARAMS, 30000, 250);
   if (finalStatus === null) {
     throw new Error(
       `Consumer did not process setup transaction within 30s. ` +
@@ -285,11 +274,11 @@ export function setup() {
 
 // ─── Main workload ─────────────────────────────────────────
 export function txWorkload() {
+  let referenceIdForE2e = null;
+  let txStartTime = null;
+  let isFreshAccepted = false;
+
   group("Create Transaction", () => {
-    // ~5% of iterations replay a full earlier request — simulates
-    // a real client retrying after a network glitch (same payload,
-    // same reference_id). Server takes the Replay branch.
-    // The other 95% are fresh random traffic.
     let payloadObj;
     let isReplay = false;
     if (Math.random() < 0.05 && replayBuffer.length > 0) {
@@ -302,7 +291,6 @@ export function txWorkload() {
       while (toAccount === fromAccount) {
         toAccount = randomAccount();
       }
-      // toFixed(2) avoids JS float JSON artefacts; server validates scale<=2.
       const amount = (Math.random() * 1000 + 1).toFixed(2);
       const referenceId = `${__VU}-${__ITER}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       payloadObj = {
@@ -311,7 +299,7 @@ export function txWorkload() {
         amount,
         currency: "IDR",
         reference_id: referenceId,
-        description: `k6 load test`,
+        description: `k6 sampled-e2e load test`,
       };
     }
 
@@ -321,6 +309,9 @@ export function txWorkload() {
       tags: { name: "POST /api/v2/transactions" },
     };
 
+    // Capture t0 BEFORE the POST so any e2e sample we take below
+    // includes the accept latency (honest tap-to-Successful clock).
+    txStartTime = Date.now();
     const res = http.post(`${BASE_URL}/api/v2/transactions`, payload, params);
     const isAccepted = res.status >= 200 && res.status < 300;
 
@@ -342,25 +333,42 @@ export function txWorkload() {
     errorRate.add(!isAccepted, { endpoint: "POST /api/v2/transactions" });
 
     if (isAccepted) {
-      // Counter mirrors the server's `transactions_created_total`,
-      // which is incremented once per accepted POST inside the HTTP
-      // handler — including the replay branch. So the two rates
-      // should match 1:1 (no queue→consumer lag). If you want a
-      // counter that mirrors `transactions_processed_total`
-      // instead, exclude replays here.
       transactionCreated.add(1);
       if (!isReplay) {
         rememberRequest(payloadObj);
+        referenceIdForE2e = payloadObj.reference_id;
+        isFreshAccepted = true;
       }
     } else {
       logFailure("Create Transaction", res);
     }
   });
 
+  // ── E2E sample (5% of fresh accepts) ──
+  // Replays are excluded (cached response → would skew Trend toward
+  // 0 ms). Failed accepts skip naturally because isFreshAccepted
+  // stays false. The Math.random() gate lives outside the group so
+  // un-sampled iters don't pay any group-tracking overhead.
+  if (isFreshAccepted && referenceIdForE2e && Math.random() < E2E_SAMPLE_RATE) {
+    group("E2E Sample", () => {
+      const finalStatus = waitForCompletion(
+        referenceIdForE2e,
+        E2E_POLL_PARAMS,
+        E2E_POLL_TIMEOUT_MS,
+        E2E_POLL_INTERVAL_MS,
+      );
+      if (finalStatus === "completed" || finalStatus === "failed") {
+        transactionE2eMs.add(Date.now() - txStartTime);
+        transactionsE2eCompleted.add(1);
+      } else {
+        // Timeout — don't pollute the Trend with a fixed-ceiling
+        // value; count separately so the threshold catches drift.
+        transactionsE2eTimeout.add(1);
+      }
+    });
+  }
+
   group("List Transactions", () => {
-    // Vary the cursor in half the calls so we don't all hit the
-    // same `txn_list:10:latest` cache key. Realistic clients page
-    // back through history with a `before` cursor.
     let url = `${BASE_URL}/api/v2/transactions?limit=10`;
     if (Math.random() < 0.5) {
       const minutesBack = Math.floor(Math.random() * 60) + 1;
@@ -392,14 +400,9 @@ export function txWorkload() {
       logFailure("List Transactions", res);
     }
   });
-
-  // No sleep: open-model executor paces requests itself; iteration-end sleep would only inflate the VU pool. (balancePollWorkload's sleep is correct — that scenario is closed-model.)
 }
 
 // ─── Balance-poll workload (separate scenario, low VU) ─────
-// Polls GET /api/v2/accounts/:id/balance over BALANCE_POLL_POOL_SIZE
-// accounts. Tagged `name:GET /api/v2/accounts/:id/balance` for the
-// per-endpoint threshold.
 export function balancePollWorkload() {
   const acc = balancePollAccount();
   const res = http.get(`${BASE_URL}/api/v2/accounts/${acc}/balance`, {
@@ -416,9 +419,10 @@ export function balancePollWorkload() {
   sleep(0.1);
 }
 
-// ─── Teardown: Print summary ───────────────────────────────
+// ─── Teardown ──────────────────────────────────────────────
 export function teardown() {
   console.log(`\n📈 Load test complete!`);
   console.log(`   Check Grafana dashboard: http://localhost:3001`);
-  console.log(`   Dashboard: Peakload Capstone — Performance Dashboard`);
+  console.log(`   E2E sample Trend: 'transaction_e2e_ms' in k6 summary`);
+  console.log(`   Sample size: ~${Math.round(217000 * E2E_SAMPLE_RATE)} of ~217k iters`);
 }

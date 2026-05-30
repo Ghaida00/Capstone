@@ -1,0 +1,25 @@
+# Demo dashboard add-on. Mount with:
+#   docker compose -f docker-compose.yml -f docker-compose.dashboard.yml up -d
+# Or set COMPOSE_FILE in your shell:
+#   export COMPOSE_FILE=docker-compose.yml:docker-compose.dashboard.yml
+#
+# Base bring-up (`docker compose up -d`) ignores this file entirely —
+# the dashboard does not exist as far as the base stack is concerned.
+#
+# Detach completely by deleting:
+#   - dashboard/
+#   - nginx/server.d/
+#   - this file
+# The two `include` lines in nginx.conf.template stay; they're benign
+# no-ops when their target dirs don't exist.
+
+services:
+  nginx:
+    volumes:
+      # Static dashboard assets — served by the location block in
+      # nginx/server.d/dashboard.conf
+      - ./dashboard:/var/www/dashboard:ro
+      # Per-feature nginx location blocks. The base nginx.conf.template
+      # `include`s /etc/nginx/server.d/*.conf — when this volume isn't
+      # mounted the dir is empty and the include is a no-op.
+      - ./nginx/server.d:/etc/nginx/server.d:ro

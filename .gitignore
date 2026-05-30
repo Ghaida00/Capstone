@@ -43,3 +43,6 @@ k6/output/
 docs/audit/
 docs/codemap/
 docs/superpowers/
+
+# ─── Scratch / throwaway ──────────────────────────────────
+.tmp-*

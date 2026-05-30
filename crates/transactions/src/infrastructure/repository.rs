@@ -349,6 +349,50 @@ impl TransactionRepository for SqlxTransactionRepository {
         }
         Ok(None)
     }
+
+    async fn idempotency_exists_for_reference(
+        &self,
+        reference_id: &str,
+    ) -> Result<bool, RepoError> {
+        // The `idempotency_key` column is the unique
+        // `txn:<shard_idx>:<reference_id>` composite. We don't
+        // know which from_account drove the request, so the
+        // exact key on each shard is the one whose prefix
+        // matches that shard's own index. First-hit wins —
+        // duplicates across shards would require the same
+        // reference_id to have been used with from_accounts on
+        // both shards, which is a degenerate case.
+        let mut handles = Vec::with_capacity(self.shards.num_shards());
+        for shard_idx in 0..self.shards.num_shards() {
+            let pool = self.shards.reader(shard_idx).clone();
+            let key = format!("txn:{}:{}", shard_idx, reference_id);
+            handles.push(tokio::spawn(async move {
+                sqlx::query_scalar::<_, i32>(
+                    "SELECT 1 FROM idempotency_keys WHERE idempotency_key = $1",
+                )
+                .bind(key)
+                .fetch_optional(&pool)
+                .await
+            }));
+        }
+        let mut last_err: Option<String> = None;
+        for h in handles {
+            match h.await {
+                Ok(Ok(Some(_))) => return Ok(true),
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => last_err = Some(e.to_string()),
+                Err(e) => last_err = Some(format!("join: {}", e)),
+            }
+        }
+        // No shard hit. If any shard erred, surface the error so
+        // a partial outage doesn't masquerade as a clean miss
+        // (which would mean a 404 to the caller for a reference
+        // we couldn't actually check).
+        if let Some(err) = last_err {
+            return Err(RepoError::Other(err));
+        }
+        Ok(false)
+    }
 }
 
 fn status_priority(s: &str) -> u8 {
@@ -603,5 +647,17 @@ impl IdempotencyAwareWriter for SqlxIdempotencyWriter {
             .unwrap_or_else(|| accepted_payload.clone());
         metrics::counter!("idempotency_hits_total").increment(1);
         Ok(ReserveOutcome::Replay(payload))
+    }
+
+    async fn reservation_exists_for_reference(
+        &self,
+        _reference_id: &str,
+        _num_shards: usize,
+    ) -> Result<bool, RepoError> {
+        // Pure-PG backend never writes to the Redis idempotency
+        // namespace. The PG-side check in
+        // `TransactionRepository::idempotency_exists_for_reference`
+        // is already authoritative for this backend.
+        Ok(false)
     }
 }

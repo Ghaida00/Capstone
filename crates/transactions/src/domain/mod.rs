@@ -87,6 +87,18 @@ pub(crate) trait TransactionRepository: Send + Sync + 'static {
         &self,
         reference_id: &str,
     ) -> Result<Option<TransactionStatus>, RepoError>;
+
+    /// Cross-shard existence check by reference_id against
+    /// `idempotency_keys`. Returns `true` as soon as any shard
+    /// reports a hit. Used by `get_status_by_reference` to
+    /// disambiguate the accept→flush window: if `transactions`
+    /// has no row but `idempotency_keys` does, the request was
+    /// accepted and is still in flight (200 + pending), not
+    /// genuinely missing (404).
+    async fn idempotency_exists_for_reference(
+        &self,
+        reference_id: &str,
+    ) -> Result<bool, RepoError>;
 }
 
 // ─── Idempotency-aware writer trait ─────────────────────────
@@ -108,6 +120,27 @@ pub(crate) trait IdempotencyAwareWriter: Send + Sync + 'static {
         accepted_payload: &serde_json::Value,
         outbox_payload: &serde_json::Value,
     ) -> Result<ReserveOutcome, RepoError>;
+
+    /// Cross-shard existence check by reference_id against the
+    /// Redis idempotency namespace. Returns `true` if any shard's
+    /// `v1:idemp:txn:{shard}:{reference_id}` key is present.
+    ///
+    /// Closes the second accept→commit race that the spec's
+    /// original PG-only fix left open. Under the Hybrid (or pure
+    /// Redis) backend the reservation lives in Redis from the
+    /// moment `reserve()` returns until the `redis_intake` worker
+    /// flushes it to PG. During that window
+    /// `TransactionRepository::idempotency_exists_for_reference`
+    /// (which only checks PG) returns false even though the request
+    /// is genuinely in flight; this method covers the gap.
+    ///
+    /// PG-only impls return `Ok(false)` — they never write to the
+    /// Redis namespace, so checking it would always miss.
+    async fn reservation_exists_for_reference(
+        &self,
+        reference_id: &str,
+        num_shards: usize,
+    ) -> Result<bool, RepoError>;
 }
 
 #[derive(Debug)]

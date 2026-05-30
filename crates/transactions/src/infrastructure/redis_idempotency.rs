@@ -205,6 +205,31 @@ impl IdempotencyAwareWriter for RedisIdempotencyWriter {
             }
         }
     }
+
+    async fn reservation_exists_for_reference(
+        &self,
+        reference_id: &str,
+        num_shards: usize,
+    ) -> Result<bool, RepoError> {
+        // Mirror the PG path's cross-shard fan-out: the idempotency_key
+        // composite is `txn:{shard_idx}:{reference_id}`, so we check
+        // that exact Redis key on each shard. First hit wins.
+        // Sequential rather than concurrent — num_shards is small
+        // (1-3 in this project) and the master GET is sub-ms; the
+        // join overhead would dominate.
+        for shard_idx in 0..num_shards {
+            let key = entry_key(&format!("txn:{}:{}", shard_idx, reference_id));
+            let raw = self
+                .cache
+                .get_master_raw(&key)
+                .await
+                .map_err(|e| RepoError::Other(format!("redis GET: {}", e)))?;
+            if raw.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// Tries the Redis path first; on any Redis error, falls through
@@ -277,5 +302,21 @@ impl IdempotencyAwareWriter for HybridIdempotencyWriter {
                 Ok(pg_outcome)
             }
         }
+    }
+
+    async fn reservation_exists_for_reference(
+        &self,
+        reference_id: &str,
+        num_shards: usize,
+    ) -> Result<bool, RepoError> {
+        // Hybrid backend's primary write path is Redis — the entry
+        // exists there from the moment `reserve()` returns and stays
+        // until the `redis_intake` worker flushes it to PG. Delegate
+        // to the Redis half. The caller (`get_status_by_reference`)
+        // has already checked PG via the repo — this method covers
+        // the OTHER half.
+        self.redis
+            .reservation_exists_for_reference(reference_id, num_shards)
+            .await
     }
 }

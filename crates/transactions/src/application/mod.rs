@@ -14,7 +14,9 @@ use uuid::Uuid;
 use accounts::ports::{AccountError, AccountId, DynAccountService};
 use shared_kernel::db::shard::ShardRouter;
 
-use super::domain::{IdempotencyAwareWriter, ReserveOutcome, Transaction, TransactionRepository};
+use super::domain::{
+    IdempotencyAwareWriter, ReserveOutcome, Transaction, TransactionRepository, TransactionStatus,
+};
 use super::ports::{
     CreateTransactionInput, ListFilter, TransactionAccepted, TransactionError, TransactionId,
     TransactionService, TransactionStatusView, TransactionView,
@@ -464,15 +466,76 @@ impl TransactionService for TransactionsService {
         }
         validate_reference_id(reference_id)?;
 
-        match self.repo.find_status_by_reference(reference_id).await {
-            Ok(Some(s)) => Ok(TransactionStatusView {
-                reference_id: s.reference_id,
-                status: s.status,
-                processed_at: s.processed_at,
-            }),
-            Ok(None) => Err(TransactionError::NotFound(reference_id.to_owned())),
-            Err(e) => Err(TransactionError::Infra(e.to_string())),
-        }
+        let tx_status = self
+            .repo
+            .find_status_by_reference(reference_id)
+            .await
+            .map_err(|e| TransactionError::Infra(e.to_string()))?;
+
+        // Hot path: `transactions` already has the row, skip both
+        // idempotency checks. Cold path: `transactions` missed, ask
+        // both idempotency stores in turn.
+        //
+        // The PG check covers the "consumer hasn't materialised the
+        // transactions row yet but the idempotency row is already
+        // in PG" gap (the case the spec's original fix was written
+        // for — applies fully under IDEMPOTENCY_BACKEND=pg).
+        //
+        // The Redis check covers the further gap introduced by the
+        // Hybrid / Redis backends: the reservation lives in Redis
+        // from POST until the `redis_intake` worker flushes it to
+        // PG. During that window the PG check misses but the
+        // reservation is genuinely in flight; pre-this-fix, every
+        // poll-immediately-after-POST returned a spurious 404
+        // (empirically 20/20 first-polls). PG-only backend impls
+        // return false from this method so the cost is zero there.
+        let idem_exists = if tx_status.is_some() {
+            false
+        } else {
+            let in_pg = self
+                .repo
+                .idempotency_exists_for_reference(reference_id)
+                .await
+                .map_err(|e| TransactionError::Infra(e.to_string()))?;
+            if in_pg {
+                true
+            } else {
+                self.idempotency
+                    .reservation_exists_for_reference(reference_id, self.shards.num_shards())
+                    .await
+                    .map_err(|e| TransactionError::Infra(e.to_string()))?
+            }
+        };
+
+        resolve_status_view(tx_status, idem_exists, reference_id)
+    }
+}
+
+// ─── Status resolution helper (pure) ─────────────────────────
+//
+// Decides what `GET /status/{ref}` should return given the two
+// repo lookups: the authoritative `transactions` row (if any)
+// and whether the reference exists in `idempotency_keys`. Pure
+// so the decision logic is unit-testable in isolation; the async
+// wiring that fetches the two inputs lives in
+// `get_status_by_reference`.
+fn resolve_status_view(
+    tx_status: Option<TransactionStatus>,
+    idem_exists: bool,
+    reference_id: &str,
+) -> Result<TransactionStatusView, TransactionError> {
+    match tx_status {
+        Some(s) => Ok(TransactionStatusView {
+            reference_id: s.reference_id,
+            status: s.status,
+            processed_at: s.processed_at,
+        }),
+        None if idem_exists => Ok(TransactionStatusView {
+            reference_id: reference_id.to_string(),
+            status: "pending".to_string(),
+            processed_at: None,
+        }),
+        None => Err(TransactionError::NotFound(reference_id.to_owned())),
     }
 }
 
@@ -726,6 +789,65 @@ mod tests {
         let h = hash_request("a", "b", "1.00", "IDR", "ref", None);
         assert_eq!(h.len(), 64);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ── resolve_status_view — pure decision function for #5 ──
+    //
+    // The handler queries `transactions` first; if missing, it
+    // queries `idempotency_keys` to disambiguate "accepted but
+    // not yet flushed" (return 200+pending) from "never accepted"
+    // (return 404). The pure helper below isolates that decision
+    // so we can test it without standing up a repo mock.
+
+    use chrono::Utc;
+    use super::super::domain::TransactionStatus;
+
+    #[test]
+    fn resolve_status_view_returns_terminal_status_when_in_transactions() {
+        // When the transactions table already has the row, the
+        // helper returns it as-is and never consults idempotency.
+        let now = Utc::now();
+        let view = resolve_status_view(
+            Some(TransactionStatus {
+                reference_id: "abc-123".to_string(),
+                status: "completed".to_string(),
+                processed_at: Some(now),
+            }),
+            false, // idem_exists irrelevant when tx_status is Some
+            "abc-123",
+        )
+        .expect("must return Ok when transactions has the row");
+
+        assert_eq!(view.reference_id, "abc-123");
+        assert_eq!(view.status, "completed");
+        assert_eq!(view.processed_at, Some(now));
+    }
+
+    #[test]
+    fn resolve_status_view_returns_pending_when_only_idempotency_has_row() {
+        // The accept→flush gap: HTTP handler wrote the
+        // idempotency row, but the consumer hasn't materialised
+        // the transactions row yet. Surface "pending" so the
+        // client doesn't see a 404 right after their 202.
+        let view = resolve_status_view(None, true, "in-flight-ref")
+            .expect("must return Ok when idempotency has the row");
+
+        assert_eq!(view.reference_id, "in-flight-ref");
+        assert_eq!(view.status, "pending");
+        assert_eq!(view.processed_at, None);
+    }
+
+    #[test]
+    fn resolve_status_view_returns_not_found_when_both_miss() {
+        // Neither table has the reference — the request was never
+        // accepted (or was reaped long ago). Genuine 404.
+        let err = resolve_status_view(None, false, "nonexistent")
+            .expect_err("must return Err when neither table has the row");
+
+        match err {
+            TransactionError::NotFound(rid) => assert_eq!(rid, "nonexistent"),
+            other => panic!("expected NotFound, got {:?}", other),
+        }
     }
 }
 
