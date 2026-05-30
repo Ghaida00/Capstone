@@ -348,6 +348,9 @@ impl TransactionService for TransactionsService {
                 Err(AccountError::Validation(m)) => {
                     return Err(TransactionError::Validation(m));
                 }
+                Err(AccountError::AlreadyExists(m)) => {
+                    return Err(TransactionError::Validation(m));
+                }
                 Err(AccountError::Infra(m)) => {
                     return Err(TransactionError::Infra(m));
                 }
