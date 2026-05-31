@@ -57,12 +57,9 @@ impl AccountRepository for SqlxAccountRepository {
         let router = &self.shards;
 
         // Reads are idempotent — retry transient connection
-        // errors over the read-replica pool. Matches the
-        // semantics of the legacy handler in
-        // src/api/handlers::get_balance. R-7: routes through the
-        // ShardRouter's DB breaker so a known-down DB fails fast
-        // (`AppError::DependencyDown { name: "db" }` -> 503 +
-        // Retry-After) instead of consuming the retry budget.
+        // errors over the read-replica pool. R-7: routes through
+        // the ShardRouter's DB breaker so a known-down DB fails
+        // fast instead of consuming the retry budget.
         let row: Option<UsersRow> = retry_transient_with_breaker(
             router.db_breaker(),
             || {
@@ -88,21 +85,19 @@ impl AccountRepository for SqlxAccountRepository {
         .await
         .map_err(|e| RepoError::Other(e.to_string()))?;
 
-        Ok(row.map(|r| {
-            Account {
-                id: AccountId(r.account_number),
-                amount_str: r.balance.to_string(),
-                currency: "IDR".to_string(),
-                // DB-level CHECK constraint guarantees the
-                // status is one of the three known values;
-                // anything else means the DB is ahead of the
-                // code and we fail safely as `Blocked`.
-                status: match r.status.as_str() {
-                    "active" => AccountStatus::Active,
-                    "inactive" => AccountStatus::Inactive,
-                    _ => AccountStatus::Blocked,
-                },
-            }
+        Ok(row.map(|r| Account {
+            id: AccountId(r.account_number),
+            amount_str: r.balance.to_string(),
+            currency: "IDR".to_string(),
+            // DB-level CHECK constraint guarantees the
+            // status is one of the three known values;
+            // anything else means the DB is ahead of the
+            // code and we fail safely as `Blocked`.
+            status: match r.status.as_str() {
+                "active" => AccountStatus::Active,
+                "inactive" => AccountStatus::Inactive,
+                _ => AccountStatus::Blocked,
+            },
         }))
     }
 
@@ -112,8 +107,6 @@ impl AccountRepository for SqlxAccountRepository {
         // queries will target.
         let shard = self.shards.shard_for_account(&account.account_number);
         let pool = self.shards.writer(shard);
-
-        let balance: Decimal = account.balance_str.parse().unwrap_or(Decimal::ZERO);
 
         let row = sqlx::query_as::<_, InsertedRow>(
             r#"
@@ -125,7 +118,7 @@ impl AccountRepository for SqlxAccountRepository {
         .bind(&account.account_number)
         .bind(&account.full_name)
         .bind(&account.email)
-        .bind(balance)
+        .bind(account.balance)
         .fetch_one(pool)
         .await?;
 
@@ -133,7 +126,7 @@ impl AccountRepository for SqlxAccountRepository {
             account_number: row.account_number,
             full_name: row.full_name,
             email: row.email,
-            balance_str: row.balance.to_string(),
+            balance: row.balance,
         })
     }
 }
