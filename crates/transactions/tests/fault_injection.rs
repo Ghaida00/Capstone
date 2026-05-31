@@ -45,7 +45,10 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::redis::Redis;
 use tokio_util::sync::CancellationToken;
 
-use accounts::ports::{AccountError, AccountId, AccountService, Balance, DynAccountService};
+use accounts::ports::{
+    AccountCreated, AccountError, AccountId, AccountService, Balance, CreateAccountInput,
+    DynAccountService,
+};
 use shared_kernel::cache::redis::{RedisCache, RedisCacheConfig};
 use shared_kernel::db::shard::{ShardRouter, ShardRouterConfig, ShardUrls};
 
@@ -63,6 +66,13 @@ struct UnreachableAccountService;
 #[async_trait]
 impl AccountService for UnreachableAccountService {
     async fn get_balance(&self, _id: &AccountId) -> Result<Balance, AccountError> {
+        panic!("verify_from_account was disabled — this fake must not be called");
+    }
+
+    async fn create_account(
+        &self,
+        _input: CreateAccountInput,
+    ) -> Result<AccountCreated, AccountError> {
         panic!("verify_from_account was disabled — this fake must not be called");
     }
 }

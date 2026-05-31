@@ -9,6 +9,7 @@
 //! `repository.rs`, etc. once the file crosses ~200 lines.
 
 use async_trait::async_trait;
+use rust_decimal::Decimal;
 
 use super::ports::{AccountId, AccountStatus, Balance};
 
@@ -38,6 +39,21 @@ impl Account {
     }
 }
 
+/// Minimal projection used by `insert_account` returning clause.
+///
+/// `balance` is kept as `Decimal` (not `String`) to avoid a
+/// lossy `Decimal → String → Decimal` round-trip and to
+/// eliminate the silent `unwrap_or(Decimal::ZERO)` fallback
+/// that the previous `balance_str: String` design required in
+/// the repository. (#3+#4)
+#[derive(Debug, Clone)]
+pub(crate) struct NewAccount {
+    pub account_number: String,
+    pub full_name: String,
+    pub email: Option<String>,
+    pub balance: Decimal,
+}
+
 // ─── Repository abstraction ─────────────────────────────────
 
 /// The port the infrastructure must satisfy. Declared inside
@@ -58,4 +74,13 @@ pub(crate) enum RepoError {
 #[async_trait]
 pub(crate) trait AccountRepository: Send + Sync + 'static {
     async fn find_active_by_id(&self, id: &AccountId) -> Result<Option<Account>, RepoError>;
+
+    /// INSERT a new row into `users`. Returns the created row on
+    /// success. The caller is responsible for validating
+    /// `account_number` uniqueness at the domain level; the repo
+    /// maps UNIQUE violations to `RepoError::Sqlx` with the
+    /// underlying `sqlx::Error::Database` variant — the
+    /// application layer then converts that to
+    /// `AccountError::AlreadyExists`.
+    async fn insert_account(&self, account: NewAccount) -> Result<NewAccount, RepoError>;
 }

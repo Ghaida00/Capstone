@@ -74,10 +74,14 @@ async fn run_sweep(pool: &PgPool, published_grace_secs: i32) -> Result<i32, sqlx
 
 pub fn spawn_idempotency_cleanup(shards: ShardRouter, cancel: CancellationToken) -> JoinHandle<()> {
     let interval_secs = parse_cleanup_interval_secs(
-        std::env::var("IDEMPOTENCY_CLEANUP_INTERVAL_SECS").ok().as_deref(),
+        std::env::var("IDEMPOTENCY_CLEANUP_INTERVAL_SECS")
+            .ok()
+            .as_deref(),
     );
     let grace_secs = parse_published_grace_secs(
-        std::env::var("IDEMPOTENCY_PUBLISHED_GRACE_SECS").ok().as_deref(),
+        std::env::var("IDEMPOTENCY_PUBLISHED_GRACE_SECS")
+            .ok()
+            .as_deref(),
     );
     tracing::info!(
         interval_secs,
@@ -131,7 +135,10 @@ mod tests {
 
     #[test]
     fn parse_published_grace_secs_returns_default_when_unset() {
-        assert_eq!(parse_published_grace_secs(None), DEFAULT_PUBLISHED_GRACE_SECS);
+        assert_eq!(
+            parse_published_grace_secs(None),
+            DEFAULT_PUBLISHED_GRACE_SECS
+        );
     }
 
     #[test]
@@ -152,8 +159,14 @@ mod tests {
     fn parse_published_grace_secs_falls_back_to_default_on_garbage() {
         // Operator typo (non-numeric, empty, negative-with-suffix):
         // ignore and fall back to default rather than panic or zero.
-        assert_eq!(parse_published_grace_secs(Some("not-a-number")), DEFAULT_PUBLISHED_GRACE_SECS);
-        assert_eq!(parse_published_grace_secs(Some("")), DEFAULT_PUBLISHED_GRACE_SECS);
+        assert_eq!(
+            parse_published_grace_secs(Some("not-a-number")),
+            DEFAULT_PUBLISHED_GRACE_SECS
+        );
+        assert_eq!(
+            parse_published_grace_secs(Some("")),
+            DEFAULT_PUBLISHED_GRACE_SECS
+        );
     }
 
     // ── parse_cleanup_interval_secs — same shape, different bounds ──
@@ -179,7 +192,10 @@ mod tests {
 
     #[test]
     fn parse_cleanup_interval_secs_falls_back_to_default_on_garbage() {
-        assert_eq!(parse_cleanup_interval_secs(Some("bad")), DEFAULT_INTERVAL_SECS);
+        assert_eq!(
+            parse_cleanup_interval_secs(Some("bad")),
+            DEFAULT_INTERVAL_SECS
+        );
         assert_eq!(parse_cleanup_interval_secs(Some("")), DEFAULT_INTERVAL_SECS);
     }
 }

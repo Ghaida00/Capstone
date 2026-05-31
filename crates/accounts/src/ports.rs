@@ -73,6 +73,34 @@ pub struct Balance {
     pub status: AccountStatus,
 }
 
+/// Input to the `create_account` use case.
+///
+/// `account_number` is optional — when absent the service
+/// generates a canonical `ACC_XXXXXXX` number. When present
+/// the caller supplies the number and the service validates it
+/// before inserting.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CreateAccountInput {
+    /// Caller-supplied account number, e.g. `"ACC_0001234"`.
+    /// `None` → auto-generate in the service layer.
+    pub account_number: Option<String>,
+    pub full_name: String,
+    pub email: Option<String>,
+    /// Opening balance in IDR. Defaults to `0.00` when absent.
+    pub initial_balance: Option<String>,
+}
+
+/// What the `create_account` use case returns on success.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountCreated {
+    pub account_number: String,
+    pub full_name: String,
+    pub email: Option<String>,
+    pub balance: String,
+    pub currency: String,
+    pub status: String,
+}
+
 // ─── Errors ──────────────────────────────────────────────────
 
 /// Every service call returns this. Infrastructure-level
@@ -89,6 +117,10 @@ pub enum AccountError {
 
     #[error("invalid account identifier: {0}")]
     Validation(String),
+
+    /// `account_number` or `email` already taken.
+    #[error("account already exists: {0}")]
+    AlreadyExists(String),
 
     #[error("infrastructure: {0}")]
     Infra(String),
@@ -107,6 +139,14 @@ pub trait AccountService: Send + Sync + 'static {
     /// [`AccountError::NotFound`] if no active account with that
     /// id exists.
     async fn get_balance(&self, id: &AccountId) -> Result<Balance, AccountError>;
+
+    /// Register a new account. Returns
+    /// [`AccountError::AlreadyExists`] when `account_number` or
+    /// `email` collides with an existing row.
+    async fn create_account(
+        &self,
+        input: CreateAccountInput,
+    ) -> Result<AccountCreated, AccountError>;
 }
 
 /// Convenience alias — prefer this in constructor signatures.
