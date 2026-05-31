@@ -237,10 +237,7 @@ impl AccountService for GetBalanceService {
         // needed. (#3+#4)
         let balance: Decimal = match input.initial_balance.as_deref() {
             Some(s) => s.parse::<Decimal>().map_err(|_| {
-                AccountError::Validation(format!(
-                    "initial_balance '{}' is not a valid decimal",
-                    s
-                ))
+                AccountError::Validation(format!("initial_balance '{}' is not a valid decimal", s))
             })?,
             None => Decimal::ZERO,
         };
@@ -279,12 +276,9 @@ impl AccountService for GetBalanceService {
                         currency: "IDR".to_string(),
                         status: AccountStatus::Active.as_str().to_owned(),
                     }),
-                    Err(ref e) if is_unique_violation(e) => {
-                        Err(AccountError::AlreadyExists(format!(
-                            "account_number '{}' is already registered",
-                            num
-                        )))
-                    }
+                    Err(ref e) if is_unique_violation(e) => Err(AccountError::AlreadyExists(
+                        format!("account_number '{}' is already registered", num),
+                    )),
                     Err(e) => Err(AccountError::Infra(e.to_string())),
                 }
             }
@@ -295,9 +289,8 @@ impl AccountService for GetBalanceService {
             // (#2: ~0.37% collision at 1M accounts, bounded retry
             // makes the failure probability ~(0.0037)^5 ≈ 7×10⁻¹²)
             None => {
-                let mut last_err = AccountError::Infra(
-                    "exhausted auto-generate attempts (internal error)".into(),
-                );
+                let mut last_err =
+                    AccountError::Infra("exhausted auto-generate attempts (internal error)".into());
                 for _ in 0..MAX_AUTO_GENERATE_ATTEMPTS {
                     let account_number = generate_account_number();
                     let new_account = NewAccount {
