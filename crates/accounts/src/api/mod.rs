@@ -10,7 +10,7 @@
 
 pub(crate) mod handlers;
 
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 
 use super::infrastructure::AccountsDeps;
@@ -19,6 +19,7 @@ use super::infrastructure::AccountsDeps;
 /// the `/api/v2/accounts` prefix.
 pub fn router(deps: AccountsDeps) -> Router {
     Router::new()
+        .route("/", post(handlers::create_account))
         .route("/{account_number}/balance", get(handlers::get_balance))
         .with_state(deps)
 }

@@ -10,6 +10,7 @@
 //! second error framework.
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +19,7 @@ use shared_kernel::responses::ApiResponse;
 
 use super::super::application::BALANCE_CACHE_TTL_SECS;
 use super::super::infrastructure::AccountsDeps;
-use super::super::ports::{AccountError, AccountId, Balance};
+use super::super::ports::{AccountCreated, AccountError, AccountId, Balance, CreateAccountInput};
 
 // ─── Validation constants (match the legacy handler) ────────
 
@@ -53,6 +54,43 @@ impl From<Balance> for BalanceResponse {
     }
 }
 
+/// Wire shape for `POST /api/v2/accounts` request body.
+#[derive(Debug, Deserialize)]
+pub(crate) struct CreateAccountRequest {
+    /// Optional caller-supplied account number. If absent the
+    /// service auto-generates an `ACC_XXXXXXX` number.
+    pub account_number: Option<String>,
+    pub full_name: String,
+    pub email: Option<String>,
+    /// Opening balance as a decimal string, e.g. `"500000.00"`.
+    /// Defaults to `"0.00"` when absent.
+    pub initial_balance: Option<String>,
+}
+
+/// Wire shape returned by `POST /api/v2/accounts`.
+#[derive(Debug, Serialize)]
+pub(crate) struct CreateAccountResponse {
+    pub account_number: String,
+    pub full_name: String,
+    pub email: Option<String>,
+    pub balance: String,
+    pub currency: String,
+    pub status: String,
+}
+
+impl From<AccountCreated> for CreateAccountResponse {
+    fn from(a: AccountCreated) -> Self {
+        Self {
+            account_number: a.account_number,
+            full_name: a.full_name,
+            email: a.email,
+            balance: a.balance,
+            currency: a.currency,
+            status: a.status,
+        }
+    }
+}
+
 // ─── Error mapping ─────────────────────────────────────────
 
 impl From<AccountError> for AppError {
@@ -60,6 +98,7 @@ impl From<AccountError> for AppError {
         match err {
             AccountError::NotFound(msg) => AppError::NotFound(format!("Account {} not found", msg)),
             AccountError::Validation(msg) => AppError::BadRequest(msg),
+            AccountError::AlreadyExists(msg) => AppError::Conflict(msg),
             AccountError::Infra(msg) => AppError::Internal(msg),
         }
     }
@@ -135,6 +174,38 @@ pub(crate) async fn get_balance(
 
     Ok(Json(ApiResponse::success(response)))
 }
+
+/// POST /api/v2/accounts
+///
+/// Register a new bank account. HTTP 201 Created on success.
+/// HTTP 409 Conflict when `account_number` or `email` is
+/// already taken. HTTP 400 on validation errors.
+///
+/// The handler is intentionally thin — all business logic
+/// (account number generation, balance validation, duplicate
+/// detection) lives in the `application` layer so it is
+/// testable without a web framework.
+pub(crate) async fn create_account(
+    State(deps): State<AccountsDeps>,
+    Json(req): Json<CreateAccountRequest>,
+) -> AppResult<(StatusCode, Json<ApiResponse<CreateAccountResponse>>)> {
+    let input = CreateAccountInput {
+        account_number: req.account_number,
+        full_name: req.full_name,
+        email: req.email,
+        initial_balance: req.initial_balance,
+    };
+
+    let created = deps.service.create_account(input).await?;
+    metrics::counter!("accounts_created_total").increment(1);
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::success(created.into())),
+    ))
+}
+
+// ─── Shared validation ──────────────────────────────────────
 
 fn validate_account_number(s: &str) -> AppResult<()> {
     if s.is_empty() {
