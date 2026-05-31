@@ -9,6 +9,7 @@
 //! `repository.rs`, etc. once the file crosses ~200 lines.
 
 use async_trait::async_trait;
+use rust_decimal::Decimal;
 
 use super::ports::{AccountId, AccountStatus, Balance};
 
@@ -39,12 +40,18 @@ impl Account {
 }
 
 /// Minimal projection used by `insert_account` returning clause.
+///
+/// `balance` is kept as `Decimal` (not `String`) to avoid a
+/// lossy `Decimal → String → Decimal` round-trip and to
+/// eliminate the silent `unwrap_or(Decimal::ZERO)` fallback
+/// that the previous `balance_str: String` design required in
+/// the repository. (#3+#4)
 #[derive(Debug, Clone)]
 pub(crate) struct NewAccount {
     pub account_number: String,
     pub full_name: String,
     pub email: Option<String>,
-    pub balance_str: String,
+    pub balance: Decimal,
 }
 
 // ─── Repository abstraction ─────────────────────────────────
