@@ -52,15 +52,24 @@ fn validate_account_id(id: &AccountId) -> Result<(), AccountError> {
 // ─── Validation helpers for create_account ──────────────────
 
 const MAX_ACCOUNT_NUMBER_LEN: usize = 50;
+/// VARCHAR(150) in the DB counts characters, not bytes.
+/// Use `s.chars().count()` for all non-ASCII-restricted fields. (#5)
 const MAX_FULL_NAME_LEN: usize = 150;
 const MAX_EMAIL_LEN: usize = 150;
 /// Prefix for auto-generated account numbers.
 const ACCOUNT_NUMBER_PREFIX: &str = "ACC_";
+/// Maximum INSERT attempts when auto-generating an account number.
+/// Retries absorb the ~0.37% collision rate at 1 M accounts
+/// without ever surfacing a 409 to a caller who supplied no
+/// account_number. (#2)
+const MAX_AUTO_GENERATE_ATTEMPTS: u32 = 5;
 
 /// Validate a caller-supplied account number. Rules mirror
 /// the `users.account_number` column: VARCHAR(50), and the
 /// same charset as `validate_account_number` in the handler
 /// (alphanumeric, hyphens, underscores, dots).
+/// account_number is ASCII-only (charset check above), so
+/// byte length == char length and `s.len()` is correct here.
 fn validate_account_number(s: &str) -> Result<(), AccountError> {
     if s.is_empty() {
         return Err(AccountError::Validation(
@@ -86,13 +95,15 @@ fn validate_account_number(s: &str) -> Result<(), AccountError> {
     Ok(())
 }
 
+/// VARCHAR(150) counts characters. Use `chars().count()` so a name
+/// like "Ångström" (8 chars, >8 bytes) is not wrongly rejected. (#5)
 fn validate_full_name(s: &str) -> Result<(), AccountError> {
     if s.trim().is_empty() {
         return Err(AccountError::Validation(
             "full_name must not be empty".into(),
         ));
     }
-    if s.len() > MAX_FULL_NAME_LEN {
+    if s.chars().count() > MAX_FULL_NAME_LEN {
         return Err(AccountError::Validation(format!(
             "full_name must be at most {} characters",
             MAX_FULL_NAME_LEN
@@ -101,8 +112,10 @@ fn validate_full_name(s: &str) -> Result<(), AccountError> {
     Ok(())
 }
 
+/// VARCHAR(150) counts characters. Use `chars().count()` for the
+/// same reason as `validate_full_name`. (#5)
 fn validate_email(s: &str) -> Result<(), AccountError> {
-    if s.len() > MAX_EMAIL_LEN {
+    if s.chars().count() > MAX_EMAIL_LEN {
         return Err(AccountError::Validation(format!(
             "email must be at most {} characters",
             MAX_EMAIL_LEN
@@ -110,7 +123,15 @@ fn validate_email(s: &str) -> Result<(), AccountError> {
     }
     // Minimal sanity: must contain exactly one `@` with at least
     // one char on each side. Full RFC 5321 validation is out of
-    // scope — rely on the DB UNIQUE constraint for duplicates.
+    // scope.
+    //
+    // NOTE (#1): email uniqueness is enforced per-shard only
+    // (the UNIQUE(email) constraint lives on each PostgreSQL
+    // instance). Two accounts with the same email on different
+    // shards will both succeed. This is documented behaviour for
+    // the capstone scope; a global uniqueness mechanism (e.g. a
+    // Redis SET or a dedicated directory table) would be required
+    // for a production deployment.
     let at_count = s.chars().filter(|&c| c == '@').count();
     if at_count != 1 {
         return Err(AccountError::Validation(
@@ -138,6 +159,18 @@ fn is_unique_violation(err: &RepoError) -> bool {
             .unwrap_or(false);
     }
     false
+}
+
+/// Generate one candidate auto-account-number.
+fn generate_account_number() -> String {
+    let suffix = uuid::Uuid::new_v4()
+        .to_string()
+        .replace('-', "")
+        .chars()
+        .take(7)
+        .collect::<String>()
+        .to_uppercase();
+    format!("{}{}", ACCOUNT_NUMBER_PREFIX, suffix)
 }
 
 /// Implementation of [`AccountService`] backed by repo + Redis cache.
@@ -199,33 +232,15 @@ impl AccountService for GetBalanceService {
             validate_email(email)?;
         }
 
-        // Validate or generate account_number.
-        let account_number = match input.account_number {
-            Some(ref num) => {
-                validate_account_number(num)?;
-                num.clone()
-            }
-            None => {
-                // Auto-generate a unique number using a UUID v4
-                // suffix. Keeps the `ACC_` prefix convention
-                // used by the seed data. Collision probability
-                // at 1M accounts ≈ negligible (birthday bound
-                // for 7 hex chars ≈ 2^28 = 268M combinations).
-                let suffix = uuid::Uuid::new_v4()
-                    .to_string()
-                    .replace('-', "")
-                    .chars()
-                    .take(7)
-                    .collect::<String>()
-                    .to_uppercase();
-                format!("{}{}", ACCOUNT_NUMBER_PREFIX, suffix)
-            }
-        };
-
-        // Validate and parse initial_balance.
+        // Validate and parse initial_balance early so we pass a
+        // typed `Decimal` into `NewAccount` — no String round-trip
+        // needed. (#3+#4)
         let balance: Decimal = match input.initial_balance.as_deref() {
             Some(s) => s.parse::<Decimal>().map_err(|_| {
-                AccountError::Validation(format!("initial_balance '{}' is not a valid decimal", s))
+                AccountError::Validation(format!(
+                    "initial_balance '{}' is not a valid decimal",
+                    s
+                ))
             })?,
             None => Decimal::ZERO,
         };
@@ -242,28 +257,79 @@ impl AccountService for GetBalanceService {
             ));
         }
 
-        // ── Persist ──────────────────────────────────────────
-        let new_account = NewAccount {
-            account_number: account_number.clone(),
-            full_name: input.full_name.clone(),
-            email: input.email.clone(),
-            balance_str: balance.to_string(),
-        };
+        // ── Resolve account_number ───────────────────────────
+        match input.account_number {
+            // Caller supplied a number — validate and try once.
+            // A 409 here is the caller's fault (they asked for a
+            // specific number that already exists). (#2)
+            Some(ref num) => {
+                validate_account_number(num)?;
+                let new_account = NewAccount {
+                    account_number: num.clone(),
+                    full_name: input.full_name.clone(),
+                    email: input.email.clone(),
+                    balance,
+                };
+                match self.repo.insert_account(new_account).await {
+                    Ok(created) => Ok(AccountCreated {
+                        account_number: created.account_number,
+                        full_name: created.full_name,
+                        email: created.email,
+                        balance: created.balance.to_string(),
+                        currency: "IDR".to_string(),
+                        status: AccountStatus::Active.as_str().to_owned(),
+                    }),
+                    Err(ref e) if is_unique_violation(e) => {
+                        Err(AccountError::AlreadyExists(format!(
+                            "account_number '{}' is already registered",
+                            num
+                        )))
+                    }
+                    Err(e) => Err(AccountError::Infra(e.to_string())),
+                }
+            }
 
-        match self.repo.insert_account(new_account).await {
-            Ok(created) => Ok(AccountCreated {
-                account_number: created.account_number,
-                full_name: created.full_name,
-                email: created.email,
-                balance: created.balance_str,
-                currency: "IDR".to_string(),
-                status: AccountStatus::Active.as_str().to_owned(),
-            }),
-            Err(ref e) if is_unique_violation(e) => Err(AccountError::AlreadyExists(format!(
-                "account_number '{}' or email is already registered",
-                account_number
-            ))),
-            Err(e) => Err(AccountError::Infra(e.to_string())),
+            // Caller did not supply a number — auto-generate and
+            // retry up to MAX_AUTO_GENERATE_ATTEMPTS times on
+            // collision so the caller never sees a spurious 409.
+            // (#2: ~0.37% collision at 1M accounts, bounded retry
+            // makes the failure probability ~(0.0037)^5 ≈ 7×10⁻¹²)
+            None => {
+                let mut last_err = AccountError::Infra(
+                    "exhausted auto-generate attempts (internal error)".into(),
+                );
+                for _ in 0..MAX_AUTO_GENERATE_ATTEMPTS {
+                    let account_number = generate_account_number();
+                    let new_account = NewAccount {
+                        account_number: account_number.clone(),
+                        full_name: input.full_name.clone(),
+                        email: input.email.clone(),
+                        balance,
+                    };
+                    match self.repo.insert_account(new_account).await {
+                        Ok(created) => {
+                            return Ok(AccountCreated {
+                                account_number: created.account_number,
+                                full_name: created.full_name,
+                                email: created.email,
+                                balance: created.balance.to_string(),
+                                currency: "IDR".to_string(),
+                                status: AccountStatus::Active.as_str().to_owned(),
+                            });
+                        }
+                        Err(ref e) if is_unique_violation(e) => {
+                            // Collision — generate a new number and retry.
+                            last_err = AccountError::Infra(format!(
+                                "auto-generated account_number '{}' collided, retrying",
+                                account_number
+                            ));
+                            continue;
+                        }
+                        Err(e) => return Err(AccountError::Infra(e.to_string())),
+                    }
+                }
+                Err(last_err)
+            }
         }
     }
 }
@@ -312,6 +378,26 @@ mod tests {
     #[test]
     fn validate_full_name_accepts_normal() {
         assert!(validate_full_name("Budi Santoso").is_ok());
+    }
+
+    // #5 fix: chars().count() — non-ASCII names within 150 chars
+    // must be accepted even when their byte length exceeds 150.
+    #[test]
+    fn validate_full_name_accepts_non_ascii_within_char_limit() {
+        // "é" = 2 bytes, 1 char. 100 repetitions = 100 chars, 200
+        // bytes. The old s.len() > 150 would reject this; the fixed
+        // s.chars().count() > 150 accepts it.
+        let name = "é".repeat(100);
+        assert!(validate_full_name(&name).is_ok());
+    }
+
+    #[test]
+    fn validate_full_name_rejects_over_char_limit() {
+        let name = "a".repeat(151);
+        assert!(matches!(
+            validate_full_name(&name),
+            Err(AccountError::Validation(_))
+        ));
     }
 
     #[test]
