@@ -46,3 +46,6 @@ docs/superpowers/
 
 # ─── Scratch / throwaway ──────────────────────────────────
 .tmp-*
+
+# ─── Cloud deploy (local-only, not committed) ─────────────
+deploy/cloud/

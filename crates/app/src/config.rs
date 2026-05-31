@@ -432,7 +432,7 @@ impl Config {
         // shard 2 to index 1, which re-hashes every key under
         // `shard_for = hash % NUM_SHARDS` — a deeply corrupting bug.
         ensure!(
-            !(shard2_write_set && !shard1_write_set),
+            !shard2_write_set || shard1_write_set,
             "DATABASE_SHARD2_* cannot be set while DATABASE_SHARD1_* is unset \
              (shard topology must be contiguous: 0, 0+1, or 0+1+2)"
         );

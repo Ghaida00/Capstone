@@ -94,6 +94,84 @@ pub fn spawn_redis_intake(
     handles
 }
 
+/// Sampling cadence for the intake-backlog gauge. Two cheap `LLEN`
+/// per shard, so a tight tick keeps the drift signal responsive
+/// without meaningful Redis load.
+const DEPTH_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Per-tick ceiling for the two `LLEN` probes. A Redis connection
+/// wedged half-open across a master failover makes `llen` hang
+/// rather than return an error, and a hang is neither the `Ok` nor
+/// the `Err` arm below — so without this bound the gauge would
+/// freeze at its last value indefinitely. Timing the await out lets
+/// the tick fall through to the skip arm and re-acquire a healthy
+/// connection next iteration, so the gauge resumes tracking the real
+/// depth — and self-corrects to 0 — once the pool recovers. Set
+/// generously above the sub-millisecond happy path so a momentarily
+/// slow Redis is not mistaken for a wedge.
+const DEPTH_SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Spawns a single background task that samples the *live* intake
+/// backlog — `LLEN(pending) + LLEN(inflight)` per shard — and
+/// publishes it as the `transactions_intake_pending` gauge.
+///
+/// Unlike the lifetime counter delta (`created_total -
+/// processed_total`), this is a CURRENT-STATE gauge: it reflects the
+/// actual unprocessed queue depth, so it self-corrects to ~0 when
+/// the workers catch up and is immune to counter resets / missed
+/// scrapes during failover. Each `LLEN` pair is bounded by
+/// `DEPTH_SAMPLE_TIMEOUT` so a connection wedged across a master
+/// failover skips the tick instead of freezing the gauge. Every
+/// replica runs this and reports the same shared-list depth, so the
+/// dashboard must aggregate with `max by (shard)` across replicas
+/// before summing shards — never a bare `sum`, which would multiply
+/// by the replica count.
+pub fn spawn_intake_depth_sampler(
+    shards: ShardRouter,
+    cache: RedisCache,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        tracing::info!("redis-intake depth sampler starting");
+        while !cancel.is_cancelled() {
+            for shard_idx in 0..shards.num_shards() {
+                let pending = pending_key(shard_idx);
+                let inflight = inflight_key(shard_idx);
+                let sampled = tokio::time::timeout(DEPTH_SAMPLE_TIMEOUT, async {
+                    (cache.llen(&pending).await, cache.llen(&inflight).await)
+                })
+                .await;
+                match sampled {
+                    Ok((Ok(p), Ok(i))) => {
+                        metrics::gauge!(
+                            "transactions_intake_pending",
+                            "shard" => shard_idx.to_string()
+                        )
+                        .set((p + i) as f64);
+                    }
+                    Ok(_) => {
+                        tracing::debug!(
+                            shard = shard_idx,
+                            "intake depth sample failed; skipping this tick"
+                        );
+                    }
+                    Err(_elapsed) => {
+                        tracing::debug!(
+                            shard = shard_idx,
+                            "intake depth sample timed out; skipping this tick"
+                        );
+                    }
+                }
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(DEPTH_SAMPLE_INTERVAL) => {}
+            }
+        }
+        tracing::info!("redis-intake depth sampler exiting");
+    })
+}
+
 async fn run_shard_worker(
     shard_idx: usize,
     shards: ShardRouter,

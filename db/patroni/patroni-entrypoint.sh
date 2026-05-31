@@ -47,6 +47,10 @@
 #                           Default: 0.
 #   PG_COMMIT_SIBLINGS      commit_delay concurrency floor.
 #                           Default: 5.
+#   PG_WAL_COMPRESSION      Compress WAL full-page images so the
+#                           log writes fewer bytes — trades CPU
+#                           for disk write throughput.
+#                           Default: off.
 #
 # The template at /etc/patroni/patroni.yml.tmpl is rendered
 # once per container start via `envsubst` and written to
@@ -81,8 +85,13 @@ set -eu
 : "${PG_SYNCHRONOUS_COMMIT:=remote_write}"
 : "${PG_COMMIT_DELAY:=0}"
 : "${PG_COMMIT_SIBLINGS:=5}"
+: "${PG_WAL_COMPRESSION:=off}"
 : "${PG_MAX_CONNECTIONS:=120}"
 : "${PG_SHARED_BUFFERS:=64MB}"
+: "${PG_MAX_WAL_SIZE:=2GB}"
+: "${PG_MIN_WAL_SIZE:=512MB}"
+: "${PG_CHECKPOINT_TIMEOUT:=15min}"
+: "${PG_CHECKPOINT_COMPLETION_TARGET:=0.9}"
 
 # Fail fast on a typo'd posture — otherwise Postgres rejects
 # the GUC with a less obvious error several layers down.
@@ -91,6 +100,18 @@ case "$PG_SYNCHRONOUS_COMMIT" in
     *)
         echo "[patroni-entrypoint] FATAL: PG_SYNCHRONOUS_COMMIT='$PG_SYNCHRONOUS_COMMIT'" \
              "must be one of: on off local remote_write remote_apply" >&2
+        exit 1
+        ;;
+esac
+
+# Fail fast on a bad WAL-compression method. lz4/zstd need a
+# server built with that support — the bookworm postgres image
+# this stage builds on has both.
+case "$PG_WAL_COMPRESSION" in
+    on|off|pglz|lz4|zstd) ;;
+    *)
+        echo "[patroni-entrypoint] FATAL: PG_WAL_COMPRESSION='$PG_WAL_COMPRESSION'" \
+             "must be one of: on off pglz lz4 zstd" >&2
         exit 1
         ;;
 esac
@@ -124,11 +145,35 @@ case "$PG_SHARED_BUFFERS" in
         ;;
 esac
 
+# Sanity-check the WAL size ceilings use the PG size form
+# (positive integer + kB/MB/GB), same failure mode as
+# shared_buffers if mistyped. checkpoint_timeout /
+# checkpoint_completion_target are passed through — PG rejects a
+# bad value loudly at startup.
+case "$PG_MAX_WAL_SIZE" in
+    *[0-9]kB|*[0-9]MB|*[0-9]GB) ;;
+    *)
+        echo "[patroni-entrypoint] FATAL: PG_MAX_WAL_SIZE='$PG_MAX_WAL_SIZE'" \
+             "must be of the form '<N><unit>' where unit is kB, MB, or GB (e.g. 4GB)" >&2
+        exit 1
+        ;;
+esac
+case "$PG_MIN_WAL_SIZE" in
+    *[0-9]kB|*[0-9]MB|*[0-9]GB) ;;
+    *)
+        echo "[patroni-entrypoint] FATAL: PG_MIN_WAL_SIZE='$PG_MIN_WAL_SIZE'" \
+             "must be of the form '<N><unit>' where unit is kB, MB, or GB (e.g. 512MB)" >&2
+        exit 1
+        ;;
+esac
+
 export PGDATA PATRONI_SCOPE PATRONI_NAME PATRONI_HOSTNAME ETCD_HOSTS \
        POSTGRES_SUPERUSER_PASSWORD POSTGRES_USER POSTGRES_PASSWORD \
        POSTGRES_DB REPL_PASSWORD \
        PG_SYNCHRONOUS_COMMIT PG_COMMIT_DELAY PG_COMMIT_SIBLINGS \
-       PG_MAX_CONNECTIONS PG_SHARED_BUFFERS
+       PG_WAL_COMPRESSION PG_MAX_CONNECTIONS PG_SHARED_BUFFERS \
+       PG_MAX_WAL_SIZE PG_MIN_WAL_SIZE PG_CHECKPOINT_TIMEOUT \
+       PG_CHECKPOINT_COMPLETION_TARGET
 
 # ------------------------------------------------------------
 # 1. Render the Patroni config from the template.
@@ -154,8 +199,13 @@ envsubst '
     ${PG_SYNCHRONOUS_COMMIT}
     ${PG_COMMIT_DELAY}
     ${PG_COMMIT_SIBLINGS}
+    ${PG_WAL_COMPRESSION}
     ${PG_MAX_CONNECTIONS}
     ${PG_SHARED_BUFFERS}
+    ${PG_MAX_WAL_SIZE}
+    ${PG_MIN_WAL_SIZE}
+    ${PG_CHECKPOINT_TIMEOUT}
+    ${PG_CHECKPOINT_COMPLETION_TARGET}
 ' < /etc/patroni/patroni.yml.tmpl > "$RENDERED"
 
 # ------------------------------------------------------------

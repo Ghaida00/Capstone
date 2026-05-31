@@ -18,7 +18,7 @@ pub use cleanup::spawn_idempotency_cleanup;
 pub use consumer::start_consumer;
 pub use cross_shard_processor::spawn_cross_shard_processor;
 pub use publish_outbox::spawn_publish_outbox;
-pub use redis_intake::spawn_redis_intake;
+pub use redis_intake::{spawn_intake_depth_sampler, spawn_redis_intake};
 
 use std::sync::Arc;
 

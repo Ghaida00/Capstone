@@ -146,7 +146,7 @@ impl App {
         // publishes to the broker. With backend=Pg the lists stay
         // empty and the worker would just block on BRPOPLPUSH for
         // its full timeout, so skip the spawn entirely.
-        let redis_intake_handles = match self.config.idempotency_backend {
+        let mut redis_intake_handles = match self.config.idempotency_backend {
             crate::config::IdempotencyBackend::Pg => Vec::new(),
             crate::config::IdempotencyBackend::Redis
             | crate::config::IdempotencyBackend::Hybrid => transactions::spawn_redis_intake(
@@ -158,6 +158,16 @@ impl App {
                 self.config.redis_intake_batch_size,
             ),
         };
+        // Self-correcting intake-backlog gauge (transactions_intake_pending).
+        // Only meaningful when the intake lists are in use — i.e. the same
+        // Redis/Hybrid backends that spawned the workers above.
+        if !redis_intake_handles.is_empty() {
+            redis_intake_handles.push(transactions::spawn_intake_depth_sampler(
+                self.state.shard_router.clone(),
+                self.state.cache.clone(),
+                self.cancel.child_token(),
+            ));
+        }
 
         // Pre-warm the write pipeline before binding the listener.
         // The first publish on a fresh producer pool exercises the

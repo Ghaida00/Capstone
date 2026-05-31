@@ -291,6 +291,11 @@ pub fn init_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
         "idempotency_redis_intake_published_total",
         "Outbox payloads successfully published by the intake worker"
     );
+    metrics::describe_gauge!(
+        "transactions_intake_pending",
+        "Live intake backlog (pending + inflight reservation keys) per shard — \
+         self-correcting drift signal; aggregate max by (shard) across replicas"
+    );
 
     // Outbox-publisher worker counters.
     metrics::describe_counter!(
