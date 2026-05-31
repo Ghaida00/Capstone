@@ -57,9 +57,12 @@ impl AccountRepository for SqlxAccountRepository {
         let router = &self.shards;
 
         // Reads are idempotent — retry transient connection
-        // errors over the read-replica pool. R-7: routes through
-        // the ShardRouter's DB breaker so a known-down DB fails
-        // fast instead of consuming the retry budget.
+        // errors over the read-replica pool. Matches the
+        // semantics of the legacy handler in
+        // src/api/handlers::get_balance. R-7: routes through the
+        // ShardRouter's DB breaker so a known-down DB fails fast
+        // (`AppError::DependencyDown { name: "db" }` -> 503 +
+        // Retry-After) instead of consuming the retry budget.
         let row: Option<UsersRow> = retry_transient_with_breaker(
             router.db_breaker(),
             || {
@@ -107,6 +110,10 @@ impl AccountRepository for SqlxAccountRepository {
         // queries will target.
         let shard = self.shards.shard_for_account(&account.account_number);
         let pool = self.shards.writer(shard);
+
+        // `account.balance` is already a validated `Decimal` —
+        // no String parse/unwrap needed. (#3+#4: dropped the
+        // balance_str round-trip and silent-zero fallback.)
 
         let row = sqlx::query_as::<_, InsertedRow>(
             r#"
