@@ -3,31 +3,25 @@ import { check, sleep, group } from "k6";
 import { Rate, Counter, Trend } from "k6/metrics";
 import { buildHandleSummary } from "./lib/summary.js";
 
-// ─── Load test: 1M/hour, accept-only baseline + sampled e2e ──
-// Sibling to load-test-1m.js. Same arrival shape (~278 rps for
-// 13 min sustained), same payload mix, same replay rate. Adds a
-// sample-based end-to-end measurement: 5% of fresh accepted
-// transactions are also polled to terminal status, and the
-// per-request wall-clock from "request issued" to
-// "completed/failed" is recorded into `transaction_e2e_ms`.
+// ─── Soak test: 1M/hour for hours, accept baseline + sampled e2e ──
+// Sibling to soak-test-1m.js and load-test-1m-sample-e2e.js. Same
+// arrival shape (278 rps ≈ 1M/hour) held for SOAK_HOURS, same
+// payload mix, same replay rate. Adds the same sample-based end-to-
+// end measurement: 5% of fresh accepted transactions are polled to
+// terminal status and the per-request wall-clock from "request
+// issued" to "completed/failed" is recorded into `transaction_e2e_ms`.
 //
-// Why sampling and not full e2e (the now-removed load-test-e2e.js):
+// Why sampling and not full e2e: full e2e at 278 rps adds
+// ~1400-2800 status polls/sec, which over a multi-hour soak both
+// blows past the nginx per-IP rate limit (NGINX_PER_IP_RATE=2000)
+// and turns the run into a poll-storm test. 5% sampling adds only
+// ~14 polls/sec; total client traffic stays ~620 rps.
 //
-//   - Full e2e at 278 rps added ~1400-2800 status polls/sec.
-//     That blew through the production-safe nginx per-IP rate
-//     limit (NGINX_PER_IP_RATE=2000 in .env) and dominated total
-//     read load on /status. The "what's our e2e under load?"
-//     question got polluted with "...with the system also under
-//     a self-inflicted poll storm".
-//   - 5% sampling adds only ~14 polls/sec — total client traffic
-//     stays at ~620 rps, comfortably under the per-IP ceiling.
-//   - 5% × 217k iters over 13 min ≈ 10,850 samples. Plenty for
-//     stable p50/p95/p99 without saturating the system from one
-//     k6 host.
-//
-// The accept-side SLOs are identical to load-test-1m so this
-// script also serves as a stricter superset: regressions on
-// accept latency AND end-to-end completion are both caught.
+// What the soak adds over the 13-minute e2e run: it answers "does
+// end-to-end completion latency DRIFT over hours?" — a consumer
+// that slowly falls behind, an outbox that grows unbounded, or a
+// batch flush that degrades shows up as a rising `transaction_e2e_ms`
+// p99 and a climbing timeout rate, neither visible in 13 minutes.
 
 const transactionCreated = new Counter("transactions_created");
 const transactionRead = new Counter("transactions_read");
@@ -41,6 +35,12 @@ const idempotencyReplayAttempts = new Counter("idempotency_replay_attempts");
 const transactionE2eMs = new Trend("transaction_e2e_ms", true);
 const transactionsE2eCompleted = new Counter("transactions_e2e_completed");
 const transactionsE2eTimeout = new Counter("transactions_e2e_timeout");
+// Timeout as a RATE (timeouts / e2e samples). Duration-independent,
+// unlike a fixed count: over an 8h soak the sample count is ~100×
+// the 13-minute run's, so a `count<N` gate would be meaningless.
+// This gates the *fraction* of sampled txns that never reach a
+// terminal state inside E2E_POLL_TIMEOUT_MS.
+const transactionsE2eTimeoutRate = new Rate("transactions_e2e_timeout_rate");
 
 // ─── Configuration ─────────────────────────────────────────
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";
@@ -48,10 +48,22 @@ const NUM_ACCOUNTS = 100000;
 const BALANCE_POLL_POOL_SIZE = 100;
 
 // 5% of fresh accepts → e2e poll. Override via env var if needed:
-//   k6 run -e E2E_SAMPLE_RATE=0.10 k6/load-test-1m-sample-e2e.js
+//   k6 run -e E2E_SAMPLE_RATE=0.10 k6/soak-test-1m-sample-e2e.js
 const E2E_SAMPLE_RATE = parseFloat(__ENV.E2E_SAMPLE_RATE || "0.05");
 const E2E_POLL_TIMEOUT_MS = 10000;
 const E2E_POLL_INTERVAL_MS = 100;
+
+// SOAK_HOURS sets the sustained hold (default 8h). Override:
+//   k6 run -e SOAK_HOURS=4 k6/soak-test-1m-sample-e2e.js
+// Non-positive / non-numeric input falls back to 8h.
+const SOAK_HOURS = (() => {
+  const h = parseFloat(__ENV.SOAK_HOURS || "8");
+  return isFinite(h) && h > 0 ? h : 8;
+})();
+const WARMUP_SEC = 120; // 2m ramp 50 → 278 rps
+const COOLDOWN_SEC = 120; // 2m ramp 278 → 0
+const SOAK_SEC = Math.round(SOAK_HOURS * 3600);
+const TOTAL_SEC = WARMUP_SEC + SOAK_SEC + COOLDOWN_SEC;
 
 function randomAccount() {
   const i = Math.floor(Math.random() * NUM_ACCOUNTS) + 1;
@@ -97,30 +109,29 @@ export const options = {
   insecureSkipTLSVerify: false,
 
   scenarios: {
-    sustained_1m_per_hour: {
-      // Identical to load-test-1m.js. 5% e2e sampling adds only
-      // ~14 polls/sec, so no VU pool bump needed (each sampled VU
-      // spends ~1 extra second in pollStatus → ~14 concurrent
-      // VUs additional × 300 preAllocated is plenty).
+    soak_1m_per_hour: {
+      // Identical arrival shape to soak-test-1m.js. 5% e2e sampling
+      // adds only ~14 polls/sec, so no VU pool bump needed (each
+      // sampled VU spends up to ~1s extra in pollStatus).
       executor: "ramping-arrival-rate",
       startRate: 50,
       timeUnit: "1s",
       preAllocatedVUs: 300,
       maxVUs: 1500,
       stages: [
-        { duration: "1m",  target: 278 },
-        { duration: "13m", target: 278 },
-        { duration: "55s", target: 0 },
+        { duration: `${WARMUP_SEC}s`, target: 278 },
+        { duration: `${SOAK_SEC}s`, target: 278 },
+        { duration: `${COOLDOWN_SEC}s`, target: 0 },
       ],
       exec: "txWorkload",
       gracefulStop: "30s",
-      tags: { scenario: "sustained_1m_per_hour" },
+      tags: { scenario: "soak_1m_per_hour" },
     },
 
     balance_poll: {
       executor: "constant-vus",
       vus: 5,
-      duration: "14m50s",
+      duration: `${TOTAL_SEC - 10}s`,
       startTime: "10s",
       exec: "balancePollWorkload",
       tags: { scenario: "balance_poll" },
@@ -128,11 +139,11 @@ export const options = {
   },
 
   thresholds: {
-    // Same accept-side SLOs as load-test-1m. The aborting gate is
+    // Same accept-side SLOs as soak-test-1m. The aborting gate is
     // scoped to the transaction scenario so a balance-poll blip
     // can't abort the money-path run; the balance-poll gate reports
     // a breach in the summary but does NOT abort.
-    "http_req_failed{scenario:sustained_1m_per_hour}": [
+    "http_req_failed{scenario:soak_1m_per_hour}": [
       { threshold: "rate<0.05", abortOnFail: true, delayAbortEval: "2m" },
     ],
     "http_req_failed{scenario:balance_poll}": ["rate<0.05"],
@@ -145,22 +156,23 @@ export const options = {
     "http_req_duration{name:POST /api/v2/transactions}": ["p(50)<10", "p(95)<50", "p(99)<150"],
     "http_req_duration{name:GET /api/v2/transactions}": ["p(95)<50"],
 
-    // End-to-end SLOs. Bound by consumer batch fill + flush
-    // cadence (~200 txn batches at 278 rps fill every ~0.7 s).
-    // A fresh transaction averages ~0.35 s queue wait + ~0.1 s
-    // DB write + ~0.05 s accept ≈ 0.5–1 s typical, up to ~1.5 s
-    // worst. p99<5000 ms allows headroom for batch-timeout
-    // flushes during load lulls.
+    // End-to-end SLOs. Bound by consumer batch fill + flush cadence
+    // (~200 txn batches at 278 rps fill every ~0.7 s). A fresh
+    // transaction averages ~0.5–1 s typical, up to ~1.5 s worst.
+    // p99<5000 ms allows headroom for batch-timeout flushes during
+    // load lulls. Over a soak, the value of these is trend stability:
+    // a creeping p99 means the consumer is falling behind.
     "transaction_e2e_ms": [
       "p(50)<1500",
       "p(95)<3000",
       "p(99)<5000",
     ],
-    // Stuck transactions: anything beyond E2E_POLL_TIMEOUT_MS
-    // (10 s) is genuinely wedged. 5% × 217k iters = ~10,850
-    // samples; 0.5% timeout = ~55. If this trips, the consumer
-    // or outbox is wedged, not just slow.
-    "transactions_e2e_timeout": ["count<55"],
+    // Stuck transactions as a fraction of e2e samples. Anything
+    // beyond E2E_POLL_TIMEOUT_MS (10 s) is genuinely wedged. A
+    // duration-independent rate (vs. the load test's fixed count)
+    // because the soak's sample count scales with SOAK_HOURS. If
+    // this trips, the consumer or outbox is wedged, not just slow.
+    "transactions_e2e_timeout_rate": ["rate<0.005"],
   },
 };
 
@@ -226,7 +238,8 @@ function waitForCompletion(refId, params, timeoutMs, pollMs) {
 // ─── Setup ─────────────────────────────────────────────────
 export function setup() {
   console.log(`🎯 Target: ${BASE_URL}`);
-  console.log(`📊 Running: sustained 1M/hour + ${(E2E_SAMPLE_RATE * 100).toFixed(1)}% e2e sample + balance poll`);
+  console.log(`📊 Running: ${SOAK_HOURS}h soak @ 1M/hour + ${(E2E_SAMPLE_RATE * 100).toFixed(1)}% e2e sample + balance poll`);
+  console.log(`⏱️  Total wall-clock: ~${(TOTAL_SEC / 3600).toFixed(2)}h (incl. 2m warmup + 2m cooldown)`);
   console.log(`👥 Using ${NUM_ACCOUNTS} pre-seeded accounts (ACC_0000001 – ACC_0100000)\n`);
 
   const health = http.get(`${BASE_URL}/health`);
@@ -248,14 +261,14 @@ export function setup() {
   console.log(`✅ Accounts verified (ACC_0000001 exists)`);
 
   console.log(`\n🔍 End-to-end smoke test (create + wait for consumer)...`);
-  const setupRefId = `setup-sampled-${__ENV.HOSTNAME || "host"}-${Date.now()}`;
+  const setupRefId = `setup-soak-sampled-${__ENV.HOSTNAME || "host"}-${Date.now()}`;
   const testPayload = JSON.stringify({
     from_account: "ACC_0000001",
     to_account: "ACC_0000002",
     amount: "1.00",
     currency: "IDR",
     reference_id: setupRefId,
-    description: "k6 sampled-e2e setup diagnostic test",
+    description: "k6 soak sampled-e2e setup diagnostic test",
   });
 
   const createRes = http.post(`${BASE_URL}/api/v2/transactions`, testPayload, {
@@ -310,7 +323,7 @@ export function txWorkload() {
         amount,
         currency: "IDR",
         reference_id: referenceId,
-        description: `k6 sampled-e2e load test`,
+        description: `k6 soak sampled-e2e test`,
       };
     }
 
@@ -371,10 +384,12 @@ export function txWorkload() {
       if (finalStatus === "completed" || finalStatus === "failed") {
         transactionE2eMs.add(Date.now() - txStartTime);
         transactionsE2eCompleted.add(1);
+        transactionsE2eTimeoutRate.add(false);
       } else {
         // Timeout — don't pollute the Trend with a fixed-ceiling
-        // value; count separately so the threshold catches drift.
+        // value; count it and feed the rate gate so drift is caught.
         transactionsE2eTimeout.add(1);
+        transactionsE2eTimeoutRate.add(true);
       }
     });
   }
@@ -432,12 +447,14 @@ export function balancePollWorkload() {
 
 // ─── Teardown ──────────────────────────────────────────────
 export function teardown() {
-  console.log(`\n📈 Load test complete!`);
+  const expectedIters = Math.round(278 * SOAK_SEC);
+  console.log(`\n📈 Soak test complete!`);
   console.log(`   Check Grafana dashboard: http://localhost:3001`);
   console.log(`   E2E sample Trend: 'transaction_e2e_ms' in k6 summary`);
-  console.log(`   Sample size: ~${Math.round(217000 * E2E_SAMPLE_RATE)} of ~217k iters`);
+  console.log(`   Sample size: ~${Math.round(expectedIters * E2E_SAMPLE_RATE)} of ~${expectedIters} iters`);
+  console.log(`   Watch for DRIFT: a rising e2e p99 over the run means the consumer is falling behind.`);
 }
 
 // Writes <run>.summary.json + .txt to k6/output/ on every run and
 // re-emits the report to stdout. See k6/lib/summary.js.
-export const handleSummary = buildHandleSummary("load-test-1m-sample-e2e");
+export const handleSummary = buildHandleSummary("soak-test-1m-sample-e2e");

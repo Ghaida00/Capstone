@@ -1,6 +1,7 @@
 import http from "k6/http";
 import { check, sleep, group } from "k6";
 import { Rate, Counter } from "k6/metrics";
+import { buildHandleSummary } from "./lib/summary.js";
 
 // ─── Custom Metrics ────────────────────────────────────────
 // Per-endpoint latency lives on the built-in `http_req_duration`
@@ -78,9 +79,10 @@ export const options = {
     git_sha: __ENV.GIT_SHA || "dev",
   },
 
-  // Don't reuse TCP connections across iterations — this is the
-  // k6 default but stated explicitly here for reproducibility
-  // across k6 versions and against external readers.
+  // Reuse TCP connections across iterations (keep-alive). This is
+  // the k6 default — stated explicitly for reproducibility across
+  // k6 versions and to avoid ephemeral-port / TIME_WAIT exhaustion
+  // at 278 rps against loopback.
   noConnectionReuse: false,
   insecureSkipTLSVerify: false,
 
@@ -134,11 +136,18 @@ export const options = {
     // once the gate has tripped. `delayAbortEval: "2m"` rides
     // through the warmup window (cold pools, cache misses) where
     // a 1-minute moving rate can spike harmlessly.
-    http_req_failed: [
+    //
+    // Scoped to the transaction scenario so a balance-poll blip
+    // can't abort the money-path run. The balance-poll gate below
+    // reports a breach in the summary but does NOT abort.
+    "http_req_failed{scenario:sustained_1m_per_hour}": [
       { threshold: "rate<0.05", abortOnFail: true, delayAbortEval: "2m" },
     ],
+    "http_req_failed{scenario:balance_poll}": ["rate<0.05"],
     http_req_duration: ["p(95)<500", "p(99)<1500"],
-    error_rate: ["rate<0.05"],
+    // `error_rate` is still collected (tagged per `endpoint`) for
+    // Grafana slicing; no global threshold here — it would only
+    // duplicate the `http_req_failed` gates above.
 
     // Per-endpoint targets in ms. Floors set by loopback HTTP
     // round-trip (~1ms) + handler work, not by server CPU. Sub-ms
@@ -325,18 +334,18 @@ export function txWorkload() {
     const isAccepted = res.status >= 200 && res.status < 300;
 
     check(res, {
-      "create status 2xx": () => isAccepted,
-      "create has reference_id": () => {
-        if (!isAccepted) return false;
+      "create status 2xx": (r) => r.status >= 200 && r.status < 300,
+      "create has reference_id": (r) => {
+        if (r.status < 200 || r.status >= 300) return false;
         try {
-          const body = JSON.parse(res.body);
+          const body = JSON.parse(r.body);
           return !!(body.data && body.data.reference_id);
         } catch (e) {
           return false;
         }
       },
-      "not rate limited": () => res.status !== 429,
-      "not overloaded": () => res.status !== 503,
+      "not rate limited": (r) => r.status !== 429,
+      "not overloaded": (r) => r.status !== 503,
     });
 
     errorRate.add(!isAccepted, { endpoint: "POST /api/v2/transactions" });
@@ -372,11 +381,11 @@ export function txWorkload() {
     const ok = res.status === 200;
 
     check(res, {
-      "list status 200": () => ok,
-      "list returns array": () => {
-        if (!ok) return false;
+      "list status 200": (r) => r.status === 200,
+      "list returns array": (r) => {
+        if (r.status !== 200) return false;
         try {
-          const body = JSON.parse(res.body);
+          const body = JSON.parse(r.body);
           return body.success && Array.isArray(body.data);
         } catch (e) {
           return false;
@@ -406,7 +415,7 @@ export function balancePollWorkload() {
     tags: { name: "GET /api/v2/accounts/:id/balance" },
   });
   check(res, {
-    "balance status 200": () => res.status === 200,
+    "balance status 200": (r) => r.status === 200,
   });
   const balanceFailed = res.status !== 200;
   errorRate.add(balanceFailed, { endpoint: "GET /api/v2/accounts/:id/balance" });
@@ -422,3 +431,7 @@ export function teardown() {
   console.log(`   Check Grafana dashboard: http://localhost:3001`);
   console.log(`   Dashboard: Peakload Capstone — Performance Dashboard`);
 }
+
+// Writes <run>.summary.json + .txt to k6/output/ on every run and
+// re-emits the report to stdout. See k6/lib/summary.js.
+export const handleSummary = buildHandleSummary("load-test-1m");
