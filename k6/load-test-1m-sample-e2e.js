@@ -1,7 +1,6 @@
 import http from "k6/http";
 import { check, sleep, group } from "k6";
 import { Rate, Counter, Trend } from "k6/metrics";
-import { buildHandleSummary } from "./lib/summary.js";
 
 // ─── Load test: 1M/hour, accept-only baseline + sampled e2e ──
 // Sibling to load-test-1m.js. Same arrival shape (~278 rps for
@@ -437,7 +436,3 @@ export function teardown() {
   console.log(`   E2E sample Trend: 'transaction_e2e_ms' in k6 summary`);
   console.log(`   Sample size: ~${Math.round(217000 * E2E_SAMPLE_RATE)} of ~217k iters`);
 }
-
-// Writes <run>.summary.json + .txt to k6/output/ on every run and
-// re-emits the report to stdout. See k6/lib/summary.js.
-export const handleSummary = buildHandleSummary("load-test-1m-sample-e2e");

@@ -1,7 +1,6 @@
 import http from "k6/http";
 import { check, sleep, group } from "k6";
 import { Rate, Counter, Trend } from "k6/metrics";
-import { buildHandleSummary } from "./lib/summary.js";
 
 // ─── Soak test: 1M/hour for hours, accept baseline + sampled e2e ──
 // Sibling to soak-test-1m.js and load-test-1m-sample-e2e.js. Same
@@ -454,7 +453,3 @@ export function teardown() {
   console.log(`   Sample size: ~${Math.round(expectedIters * E2E_SAMPLE_RATE)} of ~${expectedIters} iters`);
   console.log(`   Watch for DRIFT: a rising e2e p99 over the run means the consumer is falling behind.`);
 }
-
-// Writes <run>.summary.json + .txt to k6/output/ on every run and
-// re-emits the report to stdout. See k6/lib/summary.js.
-export const handleSummary = buildHandleSummary("soak-test-1m-sample-e2e");

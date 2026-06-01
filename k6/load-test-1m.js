@@ -1,7 +1,6 @@
 import http from "k6/http";
 import { check, sleep, group } from "k6";
 import { Rate, Counter } from "k6/metrics";
-import { buildHandleSummary } from "./lib/summary.js";
 
 // ─── Custom Metrics ────────────────────────────────────────
 // Per-endpoint latency lives on the built-in `http_req_duration`
@@ -431,7 +430,3 @@ export function teardown() {
   console.log(`   Check Grafana dashboard: http://localhost:3001`);
   console.log(`   Dashboard: Peakload Capstone — Performance Dashboard`);
 }
-
-// Writes <run>.summary.json + .txt to k6/output/ on every run and
-// re-emits the report to stdout. See k6/lib/summary.js.
-export const handleSummary = buildHandleSummary("load-test-1m");

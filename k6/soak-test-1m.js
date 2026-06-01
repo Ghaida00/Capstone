@@ -1,7 +1,6 @@
 import http from "k6/http";
 import { check, sleep, group } from "k6";
 import { Rate, Counter } from "k6/metrics";
-import { buildHandleSummary } from "./lib/summary.js";
 
 // ─── Soak test: 1M/hour sustained for hours ────────────────
 // Sibling to load-test-1m.js. Same arrival shape (278 rps ≈
@@ -446,7 +445,3 @@ export function teardown() {
   console.log(`   Dashboard: Peakload Capstone — Performance Dashboard`);
   console.log(`   Watch the trend panels: a clean soak is FLAT, not just green.`);
 }
-
-// Writes <run>.summary.json + .txt to k6/output/ on every run and
-// re-emits the report to stdout. See k6/lib/summary.js.
-export const handleSummary = buildHandleSummary("soak-test-1m");

@@ -36,9 +36,10 @@ coverage/
 logs/
 
 # ─── k6 output ──────────────────────────────────────────────
-# Ignore generated summaries but keep the directory itself — k6's
-# handleSummary does not create missing output dirs, so the write
-# target must exist on a fresh checkout (see k6/lib/summary.js).
+# Destination for `k6 run --summary-export=k6/output/<name>.json`.
+# Ignore the generated summaries but keep the directory itself so it
+# exists on a fresh checkout (k6 does not create a missing
+# --summary-export directory).
 k6/output/*
 !k6/output/.gitkeep
 *.json.gz
