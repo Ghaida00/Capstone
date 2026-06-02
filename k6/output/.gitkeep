@@ -1,0 +1,3 @@
+# Keeps k6/output/ in the repo so handleSummary always has a write
+# target. k6 does not create missing output directories. Generated
+# summary files in here are gitignored.

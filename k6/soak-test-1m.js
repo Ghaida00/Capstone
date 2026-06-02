@@ -2,11 +2,22 @@ import http from "k6/http";
 import { check, sleep, group } from "k6";
 import { Rate, Counter } from "k6/metrics";
 
+// ─── Soak test: 1M/hour sustained for hours ────────────────
+// Sibling to load-test-1m.js. Same arrival shape (278 rps ≈
+// 1M/hour), same payload mix, same replay rate. The only change
+// is the sustained hold is stretched from 13 minutes to hours so
+// the run reaches slow failure modes a short load test never does:
+// heap / connection-pool leaks, Redis or RabbitMQ memory growth,
+// WAL / disk fill, file-descriptor exhaustion, and p99 drift as
+// caches fragment under steady churn.
+//
+// The accept-side SLOs are identical to load-test-1m, so a soak
+// that stays green is a strong statement: the system holds its
+// latency budget for the full window, not just the first 15 min.
+
 // ─── Custom Metrics ────────────────────────────────────────
 // Per-endpoint latency lives on the built-in `http_req_duration`
-// metric, sliced by `tags.name`. A separate `transaction_latency`
-// Trend mixed POST and GET into one distribution, making its p95
-// meaningless — dropped in favour of the per-endpoint thresholds.
+// metric, sliced by `tags.name`.
 const transactionCreated = new Counter("transactions_created");
 const transactionRead = new Counter("transactions_read");
 const errorRate = new Rate("error_rate");
@@ -22,6 +33,19 @@ const NUM_ACCOUNTS = 100000;
 // (BALANCE_CACHE_TTL_SECS in crates/accounts/src/application/mod.rs)
 // so steady-state polls hit warm.
 const BALANCE_POLL_POOL_SIZE = 100;
+
+// SOAK_HOURS sets the sustained hold (default 8h). Override:
+//   k6 run -e SOAK_HOURS=4 k6/soak-test-1m.js
+// Non-positive / non-numeric input falls back to 8h.
+const SOAK_HOURS = (() => {
+  const h = parseFloat(__ENV.SOAK_HOURS || "8");
+  return isFinite(h) && h > 0 ? h : 8;
+})();
+const WARMUP_SEC = 120; // 2m ramp 50 → 278 rps
+const COOLDOWN_SEC = 120; // 2m ramp 278 → 0
+const SOAK_SEC = Math.round(SOAK_HOURS * 3600);
+// Whole-run wall-clock; the balance poll spans the full envelope.
+const TOTAL_SEC = WARMUP_SEC + SOAK_SEC + COOLDOWN_SEC;
 
 // Random account from the 100k pool. Generated on-the-fly so we never
 // allocate a 100k array per VU.
@@ -63,9 +87,7 @@ function pickReplayRequest() {
 export const options = {
   // Default summary stats include only avg/min/med/max/p(90)/p(95).
   // Add p(99) + p(99.9) explicitly so the per-run stdout shows the
-  // tail percentiles the thresholds gate on (otherwise you must
-  // reach for Grafana even to see whether the p(99)<150 threshold
-  // was tight or loose).
+  // tail percentiles the thresholds gate on.
   summaryTrendStats: ["avg", "min", "med", "max", "p(90)", "p(95)", "p(99)", "p(99.9)", "count"],
 
   // Global tags get attached to every sample so Grafana/k6 Cloud
@@ -81,48 +103,49 @@ export const options = {
   // Reuse TCP connections across iterations (keep-alive). This is
   // the k6 default — stated explicitly for reproducibility across
   // k6 versions and to avoid ephemeral-port / TIME_WAIT exhaustion
-  // at 278 rps against loopback.
+  // at 278 rps against loopback. Over a multi-hour soak this also
+  // keeps the test from masquerading as a connection-churn test.
   noConnectionReuse: false,
   insecureSkipTLSVerify: false,
 
   scenarios: {
-    sustained_1m_per_hour: {
-      // Ramping arrival rate: a 1-minute warmup avoids the cold-
+    soak_1m_per_hour: {
+      // Ramping arrival rate: a 2-minute warmup avoids the cold-
       // pool / cold-cache thundering herd that briefly spikes p99
-      // at t=0 with constant-arrival-rate. The 1-minute cooldown
-      // exposes whether p99 recovers cleanly after load stops —
-      // a leak / queue-buildup bug shows up here as p99 staying
-      // high after the load drops to zero.
+      // at t=0. The 2-minute cooldown exposes whether p99 recovers
+      // cleanly after load stops — a leak / queue-buildup bug shows
+      // up here as p99 staying high after the load drops to zero,
+      // and over a soak it's the recovery curve that tells you
+      // whether the backlog was bounded.
       //
-      // Note: the progress bar may show a non-zero rate (~3 iter/s)
-      // at t=14:59.x because target=0 is reached at the END of the
-      // last stage, not before. That is a k6 progress-display
-      // quirk for ramping-arrival-rate, not a real "scenario did
-      // not complete" condition — `iterations` counts all
-      // dispatched, all complete, no orphans.
+      // Note: the progress bar may show a non-zero rate at the very
+      // end because target=0 is reached at the END of the last
+      // stage, not before. That is a k6 progress-display quirk for
+      // ramping-arrival-rate, not a real "scenario did not
+      // complete" condition.
       executor: "ramping-arrival-rate",
       startRate: 50,
       timeUnit: "1s",
       preAllocatedVUs: 300,
       maxVUs: 1500,
       stages: [
-        { duration: "1m",  target: 278 },   // warmup: 50 → 278 rps
-        { duration: "13m", target: 278 },   // sustained at 1M/hour
-        { duration: "55s",  target: 0 },     // cooldown: 278 → 0
+        { duration: `${WARMUP_SEC}s`, target: 278 }, // warmup: 50 → 278 rps
+        { duration: `${SOAK_SEC}s`, target: 278 }, // soak hold at 1M/hour
+        { duration: `${COOLDOWN_SEC}s`, target: 0 }, // cooldown: 278 → 0
       ],
       exec: "txWorkload",
       gracefulStop: "30s",
-      tags: { scenario: "sustained_1m_per_hour" },
+      tags: { scenario: "soak_1m_per_hour" },
     },
 
-    // 5 VUs polling GET /balance. Starts after a 10s warmup so
-    // cold pool / replica-health-probe blips at t=0 don't poison
-    // the check-rate threshold. Runs 14m50s to stay inside the
-    // 15m envelope.
+    // 5 VUs polling GET /balance for the whole envelope. Starts
+    // after a 10s warmup so cold pool / replica-health-probe blips
+    // at t=0 don't poison the check-rate threshold. Ends ~10s before
+    // the tx scenario so it stays inside the run.
     balance_poll: {
       executor: "constant-vus",
       vus: 5,
-      duration: "14m50s",
+      duration: `${TOTAL_SEC - 10}s`,
       startTime: "10s",
       exec: "balancePollWorkload",
       tags: { scenario: "balance_poll" },
@@ -131,15 +154,16 @@ export const options = {
 
   thresholds: {
     // `abortOnFail` kills the run if the error rate breaches the
-    // SLO — no point burning 15 minutes against a wedged server
-    // once the gate has tripped. `delayAbortEval: "2m"` rides
-    // through the warmup window (cold pools, cache misses) where
-    // a 1-minute moving rate can spike harmlessly.
+    // SLO — no point burning hours against a wedged server once the
+    // gate has tripped. Over a multi-hour soak a brief blip rarely
+    // pushes the *cumulative* rate past 5%, so this aborts on a real
+    // sustained meltdown, not on a transient. `delayAbortEval: "2m"`
+    // rides through the warmup window (cold pools, cache misses).
     //
     // Scoped to the transaction scenario so a balance-poll blip
     // can't abort the money-path run. The balance-poll gate below
     // reports a breach in the summary but does NOT abort.
-    "http_req_failed{scenario:sustained_1m_per_hour}": [
+    "http_req_failed{scenario:soak_1m_per_hour}": [
       { threshold: "rate<0.05", abortOnFail: true, delayAbortEval: "2m" },
     ],
     "http_req_failed{scenario:balance_poll}": ["rate<0.05"],
@@ -148,9 +172,9 @@ export const options = {
     // Grafana slicing; no global threshold here — it would only
     // duplicate the `http_req_failed` gates above.
 
-    // Per-endpoint targets in ms. Floors set by loopback HTTP
-    // round-trip (~1ms) + handler work, not by server CPU. Sub-ms
-    // p(50) is unachievable here regardless of optimization.
+    // Per-endpoint targets in ms. Identical to load-test-1m: the
+    // whole point of a soak is to prove these hold for hours, not
+    // just for the first 15 minutes.
     "http_req_duration{name:GET /api/v2/accounts/:id/balance}": ["p(50)<3", "p(95)<10"],
     "http_req_duration{name:POST /api/v2/transactions}": ["p(50)<10", "p(95)<50", "p(99)<150"],
     "http_req_duration{name:GET /api/v2/transactions}": ["p(95)<50"],
@@ -160,8 +184,8 @@ export const options = {
 // ─── Helpers ───────────────────────────────────────────────
 
 // Per-VU error log budget. Logging is silently dropped above
-// 200 VU (spike / late-stress) to avoid drowning the k6 stdout
-// in 10k+ lines per run.
+// 200 VU (late-stress) to avoid drowning the k6 stdout in 10k+
+// lines per run.
 const MAX_LOGGED_ERRORS = 5;
 const LOG_VU_CEILING = 200;
 let loggedErrors = 0;
@@ -183,12 +207,7 @@ function logFailure(context, res) {
 
 // Poll /api/v2/transactions/status/{ref} until the consumer marks
 // the row completed/failed. Used by setup to verify end-to-end works
-// before the load scenarios start.
-//
-// Server-side fix means the endpoint returns 200 + `status: "pending"`
-// during the brief accept→flush window (instead of the previous 404).
-// No `responseCallback` workaround needed — every setup poll is now
-// a true 200, so k6's default failure classification is correct.
+// before the soak starts.
 const SETUP_POLL_PARAMS = {
   tags: { name: "GET /api/v2/transactions/status/:ref (setup poll)" },
 };
@@ -218,11 +237,11 @@ function waitForCompletion(refId, timeoutMs = 5000, pollMs = 200) {
 
 // ─── Setup: Verify connectivity & end-to-end pipeline ──────
 // Any unrecoverable problem here throws — k6 aborts before
-// scenarios fire, so we don't burn 15 minutes of iterations
-// against a wedged pipeline.
+// scenarios fire, so we don't burn hours against a wedged pipeline.
 export function setup() {
   console.log(`🎯 Target: ${BASE_URL}`);
-  console.log(`📊 Running: sustained 1M/hour + balance poll`);
+  console.log(`📊 Running: ${SOAK_HOURS}h soak @ 1M/hour + balance poll`);
+  console.log(`⏱️  Total wall-clock: ~${(TOTAL_SEC / 3600).toFixed(2)}h (incl. 2m warmup + 2m cooldown)`);
   console.log(`👥 Using ${NUM_ACCOUNTS} pre-seeded accounts (ACC_0000001 – ACC_0100000)\n`);
 
   // 1. Health check
@@ -247,16 +266,16 @@ export function setup() {
 
   // 3. End-to-end smoke test: create + poll status until consumer
   // marks the row processed. Confirms the entire path (HTTP → queue
-  // → consumer → DB) is alive before the load scenarios fire.
+  // → consumer → DB) is alive before committing hours of load.
   console.log(`\n🔍 End-to-end smoke test (create + wait for consumer)...`);
-  const setupRefId = `setup-${__ENV.HOSTNAME || "host"}-${Date.now()}`;
+  const setupRefId = `setup-soak-${__ENV.HOSTNAME || "host"}-${Date.now()}`;
   const testPayload = JSON.stringify({
     from_account: "ACC_0000001",
     to_account: "ACC_0000002",
     amount: "1.00",
     currency: "IDR",
     reference_id: setupRefId,
-    description: "k6 setup diagnostic test",
+    description: "k6 soak setup diagnostic test",
   });
 
   const createRes = http.post(`${BASE_URL}/api/v2/transactions`, testPayload, {
@@ -273,11 +292,9 @@ export function setup() {
 
   // 30 s is sized to absorb residual drain from a previous run —
   // the cross-shard processor + idempotency publisher can keep
-  // backends busy for ~1–3 minutes after a 15-minute load finishes.
-  // A back-to-back run started during that window queues this
-  // setup tx behind that backlog; 30 s gives the consumer one full
-  // tick of headroom over the usual cold-start ~5 s. Past 30 s the
-  // pipeline is genuinely wedged and aborting is the right move.
+  // backends busy for ~1–3 minutes after a long load finishes.
+  // Past 30 s the pipeline is genuinely wedged and aborting before
+  // the soak is the right move.
   const finalStatus = waitForCompletion(setupRefId, 30000, 250);
   if (finalStatus === null) {
     throw new Error(
@@ -319,7 +336,7 @@ export function txWorkload() {
         amount,
         currency: "IDR",
         reference_id: referenceId,
-        description: `k6 load test`,
+        description: `k6 soak test`,
       };
     }
 
@@ -351,11 +368,8 @@ export function txWorkload() {
 
     if (isAccepted) {
       // Counter mirrors the server's `transactions_created_total`,
-      // which is incremented once per accepted POST inside the HTTP
-      // handler — including the replay branch. So the two rates
-      // should match 1:1 (no queue→consumer lag). If you want a
-      // counter that mirrors `transactions_processed_total`
-      // instead, exclude replays here.
+      // incremented once per accepted POST inside the HTTP handler
+      // (including the replay branch).
       transactionCreated.add(1);
       if (!isReplay) {
         rememberRequest(payloadObj);
@@ -426,7 +440,8 @@ export function balancePollWorkload() {
 
 // ─── Teardown: Print summary ───────────────────────────────
 export function teardown() {
-  console.log(`\n📈 Load test complete!`);
+  console.log(`\n📈 Soak test complete!`);
   console.log(`   Check Grafana dashboard: http://localhost:3001`);
   console.log(`   Dashboard: Peakload Capstone — Performance Dashboard`);
+  console.log(`   Watch the trend panels: a clean soak is FLAT, not just green.`);
 }

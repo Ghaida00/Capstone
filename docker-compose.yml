@@ -601,6 +601,74 @@ services:
     deploy: *pgbouncer-deploy
 
   # ============================================================
+  # READ POOLERS — profile-gated `readpool` toggle (Option B)
+  # ============================================================
+  # Active only when `readpool` is in COMPOSE_PROFILES. Each
+  # multiplexes the app's reads onto its shard's replica (via the
+  # pg-haproxy /replica frontend), capping replica backends at
+  # PGBOUNCER_READ_DEFAULT_POOL_SIZE regardless of DB_READ_POOL_SIZE.
+  # To use: enable the profile AND repoint DATABASE_SHARDn_READ_URLS
+  # at these poolers (see .env §3.1). Default (no profile) = reads go
+  # straight to pg-haproxy:/replica (Tier 1), no pooler. In a
+  # topology smaller than a pooler's shard the extra pooler is a
+  # harmless idle ~4 MB (its /replica backend is simply absent).
+  # ============================================================
+  pgbouncer-read-shard0:
+    <<: *pgbouncer-common
+    container_name: peakload-pgbouncer-read-shard0
+    profiles: ["readpool"]
+    environment:
+      <<: *pgbouncer-env
+      # Backend → HAProxy :5010 → whichever node is replica.
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-haproxy:5010/${POSTGRES_DB}
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_READ_DEFAULT_POOL_SIZE:-30}
+    depends_on:
+      pg-haproxy:
+        condition: service_healthy
+    healthcheck: *pgbouncer-healthcheck
+    deploy:
+      resources:
+        limits:
+          memory: ${PGBOUNCER_READ_MEMORY_LIMIT:-32M}
+          cpus: "${PGBOUNCER_CPU_LIMIT:-0.1}"
+
+  pgbouncer-read-shard1:
+    <<: *pgbouncer-common
+    container_name: peakload-pgbouncer-read-shard1
+    profiles: ["readpool"]
+    environment:
+      <<: *pgbouncer-env
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-haproxy:5011/${POSTGRES_DB}
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_READ_DEFAULT_POOL_SIZE:-30}
+    depends_on:
+      pg-haproxy:
+        condition: service_healthy
+    healthcheck: *pgbouncer-healthcheck
+    deploy:
+      resources:
+        limits:
+          memory: ${PGBOUNCER_READ_MEMORY_LIMIT:-32M}
+          cpus: "${PGBOUNCER_CPU_LIMIT:-0.1}"
+
+  pgbouncer-read-shard2:
+    <<: *pgbouncer-common
+    container_name: peakload-pgbouncer-read-shard2
+    profiles: ["readpool"]
+    environment:
+      <<: *pgbouncer-env
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pg-haproxy:5012/${POSTGRES_DB}
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_READ_DEFAULT_POOL_SIZE:-30}
+    depends_on:
+      pg-haproxy:
+        condition: service_healthy
+    healthcheck: *pgbouncer-healthcheck
+    deploy:
+      resources:
+        limits:
+          memory: ${PGBOUNCER_READ_MEMORY_LIMIT:-32M}
+          cpus: "${PGBOUNCER_CPU_LIMIT:-0.1}"
+
+  # ============================================================
   # SHARD 1 — two Patroni-managed nodes (scope peakload-shard1)
   # ============================================================
   # SHARD 1 — profile-gated. The 3 services below activate only

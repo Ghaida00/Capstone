@@ -14,12 +14,13 @@ For module shape see [ADR-0003](../../docs/adr/0003-port-adapter-shape.md).
 
 - `AccountService` trait
   - `get_balance(id: &AccountId) -> Result<Balance, AccountError>`
-- DTOs: `AccountId`, `AccountStatus`, `Balance`
-- Errors: `AccountError` (`NotFound` / `Validation` / `Infra`)
+  - `create_account(input: CreateAccountInput) -> Result<AccountCreated, AccountError>`
+- DTOs: `AccountId`, `AccountStatus`, `Balance`, `CreateAccountInput`,
+  `AccountCreated`
+- Errors: `AccountError` (`NotFound` / `Validation` / `AlreadyExists` / `Infra`)
 - Type alias: `DynAccountService = Arc<dyn AccountService>`
 
-Planned: `create_account`, `credit`, `debit`, `set_status`, plus
-`CreateAccount` / `AccountUpdate` DTOs.
+Planned: `credit`, `debit`, `set_status`, plus an `AccountUpdate` DTO.
 
 ## Ports consumed
 

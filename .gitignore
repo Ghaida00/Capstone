@@ -36,7 +36,12 @@ coverage/
 logs/
 
 # ─── k6 output ──────────────────────────────────────────────
-k6/output/
+# Destination for `k6 run --summary-export=k6/output/<name>.json`.
+# Ignore the generated summaries but keep the directory itself so it
+# exists on a fresh checkout (k6 does not create a missing
+# --summary-export directory).
+k6/output/*
+!k6/output/.gitkeep
 *.json.gz
 
 # ─── Docs ─────────────────────────────────────────────────

@@ -88,6 +88,10 @@ export const options = {
     git_sha: __ENV.GIT_SHA || "dev",
   },
 
+  // Reuse TCP connections across iterations (keep-alive). This is
+  // the k6 default — stated explicitly for reproducibility across
+  // k6 versions and to avoid ephemeral-port / TIME_WAIT exhaustion
+  // at 278 rps against loopback.
   noConnectionReuse: false,
   insecureSkipTLSVerify: false,
 
@@ -123,12 +127,18 @@ export const options = {
   },
 
   thresholds: {
-    // Same accept-side SLOs as load-test-1m.
-    http_req_failed: [
+    // Same accept-side SLOs as load-test-1m. The aborting gate is
+    // scoped to the transaction scenario so a balance-poll blip
+    // can't abort the money-path run; the balance-poll gate reports
+    // a breach in the summary but does NOT abort.
+    "http_req_failed{scenario:sustained_1m_per_hour}": [
       { threshold: "rate<0.05", abortOnFail: true, delayAbortEval: "2m" },
     ],
+    "http_req_failed{scenario:balance_poll}": ["rate<0.05"],
     http_req_duration: ["p(95)<500", "p(99)<1500"],
-    error_rate: ["rate<0.05"],
+    // `error_rate` is still collected (tagged per `endpoint`) for
+    // Grafana slicing; no global threshold here — it would only
+    // duplicate the `http_req_failed` gates above.
 
     "http_req_duration{name:GET /api/v2/accounts/:id/balance}": ["p(50)<3", "p(95)<10"],
     "http_req_duration{name:POST /api/v2/transactions}": ["p(50)<10", "p(95)<50", "p(99)<150"],
@@ -316,18 +326,18 @@ export function txWorkload() {
     const isAccepted = res.status >= 200 && res.status < 300;
 
     check(res, {
-      "create status 2xx": () => isAccepted,
-      "create has reference_id": () => {
-        if (!isAccepted) return false;
+      "create status 2xx": (r) => r.status >= 200 && r.status < 300,
+      "create has reference_id": (r) => {
+        if (r.status < 200 || r.status >= 300) return false;
         try {
-          const body = JSON.parse(res.body);
+          const body = JSON.parse(r.body);
           return !!(body.data && body.data.reference_id);
         } catch (e) {
           return false;
         }
       },
-      "not rate limited": () => res.status !== 429,
-      "not overloaded": () => res.status !== 503,
+      "not rate limited": (r) => r.status !== 429,
+      "not overloaded": (r) => r.status !== 503,
     });
 
     errorRate.add(!isAccepted, { endpoint: "POST /api/v2/transactions" });
@@ -380,11 +390,11 @@ export function txWorkload() {
     const ok = res.status === 200;
 
     check(res, {
-      "list status 200": () => ok,
-      "list returns array": () => {
-        if (!ok) return false;
+      "list status 200": (r) => r.status === 200,
+      "list returns array": (r) => {
+        if (r.status !== 200) return false;
         try {
-          const body = JSON.parse(res.body);
+          const body = JSON.parse(r.body);
           return body.success && Array.isArray(body.data);
         } catch (e) {
           return false;
@@ -409,7 +419,7 @@ export function balancePollWorkload() {
     tags: { name: "GET /api/v2/accounts/:id/balance" },
   });
   check(res, {
-    "balance status 200": () => res.status === 200,
+    "balance status 200": (r) => r.status === 200,
   });
   const balanceFailed = res.status !== 200;
   errorRate.add(balanceFailed, { endpoint: "GET /api/v2/accounts/:id/balance" });
