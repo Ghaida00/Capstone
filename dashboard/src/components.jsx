@@ -122,6 +122,12 @@ const useToast = () => React.useContext(ToastContext);
 function fmtTime(d = new Date()) {
   return d.toTimeString().slice(0, 8);
 }
+// Render an ISO timestamp (e.g. created_at from the API) as HH:MM:SS.
+// Falls back to the raw value if it isn't a parseable date.
+function fmtTs(iso) {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? String(iso ?? "—") : d.toTimeString().slice(0, 8);
+}
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 function pad(n, w = 2) { return String(n).padStart(w, "0"); }
 
@@ -333,10 +339,82 @@ function HealthList({ items }) {
   );
 }
 
+/* ===== Recent transactions modal ===== */
+
+// Map a transaction status to one of the existing .log-tag color
+// variants so the badge palette stays consistent with the activity log.
+function txnStatusTag(status) {
+  if (status === "completed") return "ok";
+  if (status === "failed") return "err";
+  return "info"; // pending / anything else
+}
+
+function TransactionsModal({ open, loading, txns, onClose }) {
+  // Close on Escape while open. Bound only while the modal is mounted
+  // so it doesn't swallow keystrokes the rest of the time.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      {/* stopPropagation so clicks inside the panel don't close it */}
+      <div className="modal" onClick={e => e.stopPropagation()} role="dialog" aria-modal="true">
+        <div className="modal-head">
+          <div className="card-title">
+            <Icon name="list" size={14}/>
+            Recent transactions
+          </div>
+          <div className="modal-head-right">
+            <span className="card-sub">{txns.length} records</span>
+            <button type="button" className="modal-close" onClick={onClose} aria-label="Close">×</button>
+          </div>
+        </div>
+        <div className="modal-body">
+          {loading ? (
+            <div className="modal-empty">Loading…</div>
+          ) : txns.length === 0 ? (
+            <div className="modal-empty">No transactions returned.</div>
+          ) : (
+            <table className="txn-table">
+              <thead>
+                <tr>
+                  <th>time</th>
+                  <th>reference</th>
+                  <th>from → to</th>
+                  <th className="ta-r">amount</th>
+                  <th>status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {txns.map(t => (
+                  <tr key={t.id}>
+                    <td className="mono muted">{fmtTs(t.created_at)}</td>
+                    <td className="mono">{t.reference_id || "—"}</td>
+                    <td className="mono">{t.from_account} → {t.to_account}</td>
+                    <td className="mono ta-r">{t.amount} {t.currency}</td>
+                    <td><span className={`log-tag ${txnStatusTag(t.status)}`}>{t.status}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ===== Export to window ===== */
 
 Object.assign(window, {
   Icon, Sparkline, BarHist, Pill, ToastProvider, useToast,
-  fmtTime, clamp, pad,
+  fmtTime, fmtTs, clamp, pad,
   KpiCard, ActionsPanel, ChartsPanel, ActivityLog, HealthList,
+  TransactionsModal,
 });
