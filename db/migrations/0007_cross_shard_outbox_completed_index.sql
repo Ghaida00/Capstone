@@ -1,5 +1,5 @@
 -- ============================================================
--- 0006_cross_shard_outbox_completed_index.sql
+-- 0007_cross_shard_outbox_completed_index.sql
 --
 -- Adds the partial index the cross-shard retention sweep needs.
 --
