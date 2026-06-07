@@ -1,0 +1,44 @@
+-- ============================================================
+-- 0006_cross_shard_outbox_completed_index.sql
+--
+-- Adds the partial index the cross-shard retention sweep needs.
+--
+-- The sweep deletes settled rows via
+--   DELETE FROM cross_shard_outbox
+--   WHERE id IN (SELECT id FROM cross_shard_outbox
+--                WHERE status = 'completed'
+--                  AND completed_at < <cutoff> LIMIT <batch>)
+-- The table's other outbox indexes are partial on `status='pending'`,
+-- so without this the subselect seqscans a table that is mostly
+-- `completed` rows. This index makes it a `completed_at` range scan.
+--
+-- End state after this migration:
+--   * idx_cross_shard_outbox_completed (completed_at) WHERE
+--     status='completed' exists on each shard primary.
+--
+-- It self-bounds: entries exist only for completed-but-not-yet-pruned
+-- rows (~one retention window), because the sweep deletes them straight
+-- back out. `pending`/`failed` rows are excluded, so the hot drain path
+-- and the retained-for-ops `failed` rows carry no index-write cost.
+--
+-- `IF NOT EXISTS` makes the script idempotent — on a cluster where
+-- `init.sql` already provisioned the index this is a no-op and the
+-- `_sqlx_migrations` row is the only side effect. `CONCURRENTLY` is
+-- intentionally NOT used: the migrator runs inside the default
+-- `sqlx::migrate!` transaction wrap, which `CONCURRENTLY` forbids. The
+-- brief lock is acceptable because the build is idempotent and the live
+-- index covers at most one retention window of rows; the migrator's
+-- session raises `lock_timeout`/`statement_timeout` to 60s (see
+-- `migrate_all_shards`), so the build is not cancelled by the WP1b
+-- 500 ms default even on a backlogged table. For a genuinely online
+-- build against a very large table, run the `CREATE INDEX CONCURRENTLY`
+-- form via a separate `psql` script (see runbook).
+--
+-- Applied to every shard primary: the `--migrate` runner iterates
+-- `MIGRATE_SHARD_URLS` (CSV of shard primaries, e.g. pg-haproxy:5000 /
+-- :5001), connecting directly to each — NOT through pgBouncer.
+-- ============================================================
+
+CREATE INDEX IF NOT EXISTS idx_cross_shard_outbox_completed
+    ON cross_shard_outbox (completed_at)
+    WHERE status = 'completed';

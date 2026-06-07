@@ -204,6 +204,16 @@ CREATE INDEX idx_cross_shard_outbox_pending ON cross_shard_outbox (created_at)
 CREATE INDEX idx_cross_shard_outbox_lease ON cross_shard_outbox (lease_until)
     WHERE status = 'pending';
 
+-- The retention sweep deletes `completed` rows past a cutoff. This
+-- partial index turns that subselect into a `completed_at` range scan
+-- instead of a seqscan over a table dominated by completed rows. It
+-- self-bounds: entries exist only for completed-but-not-yet-pruned rows
+-- (~one retention window), since the sweep deletes them straight back
+-- out. `pending` and `failed` rows are excluded, so the hot drain path
+-- and the retained-for-ops `failed` rows carry no index-write cost.
+CREATE INDEX idx_cross_shard_outbox_completed ON cross_shard_outbox (completed_at)
+    WHERE status = 'completed';
+
 CREATE TRIGGER trigger_update_cross_shard_outbox_updated_at
     BEFORE UPDATE ON cross_shard_outbox
     FOR EACH ROW
