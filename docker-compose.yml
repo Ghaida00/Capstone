@@ -105,17 +105,21 @@ x-pg-node-common: &pg-node-common
   logging: *default-logging
   networks:
     - peakload-network
-  # 60s start_period tolerates the first-boot sequence
+  # 120s start_period tolerates the first-boot sequence
   # (initdb on the first primary, pg_basebackup on the
-  # replica). Patroni exits non-zero on config errors, so
-  # the healthcheck plus Docker restart policy is enough to
-  # surface misconfigurations.
+  # replica) even on a cold `down -v` bootstrap of the
+  # larger high-memory profiles, where the serial chain
+  # (etcd → primary → replica → pg-haproxy → app) outruns a
+  # shorter window and a single `up` would otherwise need a
+  # retry. Patroni exits non-zero on config errors, so the
+  # healthcheck plus Docker restart policy still surfaces
+  # misconfigurations.
   healthcheck:
     test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U $$POSTGRES_USER -d $$POSTGRES_DB" ]
     interval: 10s
     timeout: 5s
-    retries: 6
-    start_period: 60s
+    retries: 10
+    start_period: 120s
 
 # Shared env for every Patroni node. Per-node variance
 # (scope, name, hostname) is injected at the service level.
@@ -175,7 +179,7 @@ x-pg-node-deploy: &pg-node-deploy
       # in patroni.yml.tmpl OR raise PG_MAX_CONNECTIONS to consume
       # the headroom — otherwise the extra RAM sits unused.
       memory: ${PG_MEMORY_LIMIT:-512m}
-      cpus: ${PG_CPU_LIMIT:-1.5}
+      cpus: ${PG_CPU_LIMIT:-1.0}
 
 # ============================================================
 # etcd anchors
@@ -831,26 +835,35 @@ services:
       - "5001"
       - "5002"
     depends_on:
+      # service_STARTED, not service_healthy: HAProxy boots as soon as
+      # the PG containers exist and starts routing once Patroni's
+      # /primary probe passes (shard0 servers now use init-addr
+      # last,libc,none in haproxy.cfg, like shards 1/2). This decouples
+      # HAProxy from PG readiness so a slow cold bootstrap can't push
+      # HAProxy past its health window and abort the dependents — the
+      # "fails on the first `up`, works on the second" race. The
+      # schema/migrate steps stay correct because bootstrap-schema's
+      # wait_for_primary loop blocks until a writable primary answers.
       pg-shard0-node-a:
-        condition: service_healthy
+        condition: service_started
       pg-shard0-node-b:
-        condition: service_healthy
+        condition: service_started
       # Shards 1 and 2 are profile-gated. `required: false` means
       # HAProxy boots even when those profiles are inactive — the
       # corresponding backends simply stay DOWN (their health probe
       # has no target), which is harmless because nothing routes
       # to them in single-shard mode.
       pg-shard1-node-a:
-        condition: service_healthy
+        condition: service_started
         required: false
       pg-shard1-node-b:
-        condition: service_healthy
+        condition: service_started
         required: false
       pg-shard2-node-a:
-        condition: service_healthy
+        condition: service_started
         required: false
       pg-shard2-node-b:
-        condition: service_healthy
+        condition: service_started
         required: false
     healthcheck:
       # Stats page on :7000 is served unconditionally once
@@ -861,8 +874,8 @@ services:
       test: [ "CMD-SHELL", "wget -q -O- http://127.0.0.1:7000/ >/dev/null || exit 1" ]
       interval: 5s
       timeout: 3s
-      retries: 5
-      start_period: 10s
+      retries: 10
+      start_period: 60s
     restart: unless-stopped
     logging: *default-logging
     networks:
