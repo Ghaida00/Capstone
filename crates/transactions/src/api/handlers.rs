@@ -285,9 +285,19 @@ pub(crate) async fn get_status(
 
     let view = deps.service.get_status_by_reference(&reference_id).await?;
     let resp: StatusResponseV2 = view.into();
-    // Status transitions in ~100ms once the consumer flushes;
-    // a 5s TTL keeps poll-driven UIs responsive while still
-    // amortising cache hits across burst traffic.
-    let _ = deps.cache.set(&cache_key, &resp, 5).await;
+    // Cache ONLY terminal statuses. 'processing'/'pending' are transient:
+    // a poll that reads the in-flight status can re-populate the cache
+    // just after the commit-time invalidator DELs it, pinning the client
+    // to the stale value for the full TTL. For a cross-shard tx — which
+    // sits in 'processing' for ~1s while the outbox drains — that stale
+    // window dominates the observed end-to-end latency even though the row
+    // is already completed in the DB. Terminal statuses are immutable, so
+    // caching them is safe and still absorbs the bulk of post-completion
+    // lookups; transient polls fall through to an indexed replica read,
+    // which is cheap. Whitelist (not blacklist) so an unrecognised status
+    // defaults to not-cached.
+    if matches!(resp.status.as_str(), "completed" | "failed" | "reversed") {
+        let _ = deps.cache.set(&cache_key, &resp, 5).await;
+    }
     Ok(Json(ApiResponse::success(resp)))
 }
