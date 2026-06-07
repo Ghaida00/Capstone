@@ -430,11 +430,12 @@ async fn process_credit_chunk(
             }
         }
         Err(e) => {
-            // The chunk is atomic, so a failure means nothing in it was
-            // applied. Fall back to the per-row path so each row's attempt
-            // count / terminal-fail / recipient-missing accounting stays
-            // exactly as before; the dedupe PK makes any later re-apply a
-            // no-op.
+            // Each credit autocommits on its own, so rows before the failing
+            // one are already applied; only the failing credit (and any after
+            // it) remain. Fall back to the per-row path so each row's attempt
+            // count / terminal-fail / recipient-missing accounting is handled
+            // individually; the dedupe PK makes re-applying the already-applied
+            // rows a no-op.
             tracing::warn!(shard = sender_shard, rows = chunk_rows.len(), error = %e, "cross-shard credit chunk failed; falling back to per-row");
             for row in chunk_rows {
                 process_one_row(sender_pool, shards, sender_shard, events, row).await;
@@ -573,7 +574,7 @@ async fn process_one_row(
     }
 
     let receiver_pool = shards.writer(receiver_shard);
-    match apply_on_receiver(receiver_pool, sender_shard, row).await {
+    match apply_credit_cte(receiver_pool, sender_shard, row).await {
         Ok(ApplyOutcome::Applied) => {
             metrics::counter!("cross_shard_credit_applied_total").increment(1);
             best_effort(
@@ -627,14 +628,13 @@ struct BatchOutcome {
     redundant: usize,
 }
 
-/// Apply a batch of cross-shard credits to one receiver shard inside a
-/// SINGLE transaction (one commit). Reuses the exact per-row statements
-/// of `apply_on_receiver`, so idempotency (the
-/// `cross_shard_outbox_applied` dedupe PK) and recipient-missing
-/// detection are unchanged — only the commit boundary moved out of the
-/// row loop. The batch commits or rolls back atomically; on rollback the
-/// caller re-runs the group per-row and the dedupe makes any re-apply a
-/// no-op.
+/// Apply a group of cross-shard credits to one receiver shard, each as an
+/// independent single-statement [`apply_credit_cte`] (one atomic statement,
+/// one round-trip per credit — no wrapping transaction). Returns which
+/// credits found their recipient missing/inactive and how many were
+/// redundant (already applied on a prior attempt). A per-credit error
+/// propagates as `Err` so the caller re-runs the group per-row; the dedupe
+/// PK makes any already-applied credit a no-op on the rerun.
 async fn apply_credits_batch(
     pool: &sqlx::PgPool,
     sender_shard: usize,
@@ -642,59 +642,17 @@ async fn apply_credits_batch(
 ) -> Result<BatchOutcome, sqlx::Error> {
     let mut missing = HashSet::new();
     let mut redundant = 0usize;
-    let mut tx = pool.begin().await?;
 
     for row in rows {
-        let deduped = sqlx::query(
-            "INSERT INTO cross_shard_outbox_applied (sender_shard, outbox_id) \
-             VALUES ($1, $2) ON CONFLICT DO NOTHING",
-        )
-        .bind(sender_shard as i32)
-        .bind(row.id)
-        .execute(&mut *tx)
-        .await?;
-        if deduped.rows_affected() == 0 {
-            // Already applied on a prior attempt — credit already landed.
-            redundant += 1;
-            continue;
+        match apply_credit_cte(pool, sender_shard, row).await? {
+            ApplyOutcome::Applied => {}
+            ApplyOutcome::AlreadyApplied => redundant += 1,
+            ApplyOutcome::RecipientMissing => {
+                missing.insert(row.id);
+            }
         }
-
-        let credited = sqlx::query(
-            "UPDATE users SET balance = balance + $1 \
-             WHERE account_number = $2 AND status = 'active'",
-        )
-        .bind(row.amount)
-        .bind(&row.to_account)
-        .execute(&mut *tx)
-        .await?;
-
-        let status = if credited.rows_affected() == 0 {
-            missing.insert(row.id);
-            "failed"
-        } else {
-            "completed"
-        };
-
-        sqlx::query(
-            r#"INSERT INTO transactions
-               (id, from_account, to_account, amount, currency, status,
-                reference_id, description, processed_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-               ON CONFLICT (reference_id, from_account) DO NOTHING"#,
-        )
-        .bind(Uuid::new_v4())
-        .bind(&row.from_account)
-        .bind(&row.to_account)
-        .bind(row.amount)
-        .bind(&row.currency)
-        .bind(status)
-        .bind(&row.reference_id)
-        .bind(&row.description)
-        .execute(&mut *tx)
-        .await?;
     }
 
-    tx.commit().await?;
     Ok(BatchOutcome { missing, redundant })
 }
 
@@ -903,83 +861,6 @@ fn best_effort(op: &'static str, id: Uuid, res: Result<(), sqlx::Error>) {
     }
 }
 
-async fn apply_on_receiver(
-    pool: &sqlx::PgPool,
-    sender_shard: usize,
-    row: &OutboxRow,
-) -> Result<ApplyOutcome, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    // Dedupe row — insert succeeds only on first apply.
-    let inserted = sqlx::query(
-        "INSERT INTO cross_shard_outbox_applied (sender_shard, outbox_id) \
-         VALUES ($1, $2) ON CONFLICT DO NOTHING",
-    )
-    .bind(sender_shard as i32)
-    .bind(row.id)
-    .execute(&mut *tx)
-    .await?;
-    if inserted.rows_affected() == 0 {
-        // Already applied — commit the empty tx and signal idempotent skip.
-        tx.commit().await?;
-        return Ok(ApplyOutcome::AlreadyApplied);
-    }
-
-    let credited = sqlx::query(
-        "UPDATE users SET balance = balance + $1 \
-         WHERE account_number = $2 AND status = 'active'",
-    )
-    .bind(row.amount)
-    .bind(&row.to_account)
-    .execute(&mut *tx)
-    .await?;
-
-    if credited.rows_affected() == 0 {
-        // Recipient missing/inactive on the receiver shard. Record
-        // a receiver-side audit row as 'failed' so the receiver's
-        // history reflects the attempt, commit the dedupe row so
-        // the apply step itself is idempotent, then signal
-        // RecipientMissing so the caller flips refund_required on
-        // the sender-side outbox row.
-        sqlx::query(
-            r#"INSERT INTO transactions
-               (id, from_account, to_account, amount, currency, status,
-                reference_id, description, processed_at)
-               VALUES ($1, $2, $3, $4, $5, 'failed', $6, $7, NOW())
-               ON CONFLICT (reference_id, from_account) DO NOTHING"#,
-        )
-        .bind(Uuid::new_v4())
-        .bind(&row.from_account)
-        .bind(&row.to_account)
-        .bind(row.amount)
-        .bind(&row.currency)
-        .bind(&row.reference_id)
-        .bind(&row.description)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        return Ok(ApplyOutcome::RecipientMissing);
-    }
-
-    sqlx::query(
-        r#"INSERT INTO transactions
-           (id, from_account, to_account, amount, currency, status,
-            reference_id, description, processed_at)
-           VALUES ($1, $2, $3, $4, $5, 'completed', $6, $7, NOW())
-           ON CONFLICT (reference_id, from_account) DO NOTHING"#,
-    )
-    .bind(Uuid::new_v4())
-    .bind(&row.from_account)
-    .bind(&row.to_account)
-    .bind(row.amount)
-    .bind(&row.currency)
-    .bind(&row.reference_id)
-    .bind(&row.description)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(ApplyOutcome::Applied)
-}
-
 /// Atomic compensating refund on the sender shard for a cross-shard
 /// transaction whose recipient turned out to be missing/inactive.
 ///
@@ -1122,4 +1003,269 @@ async fn mark_failed(pool: &sqlx::PgPool, id: Uuid, reason: &str) -> Result<(), 
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Apply one cross-shard credit on the receiver shard as a SINGLE
+/// statement (one round-trip, one implicit transaction). Three
+/// data-modifying CTEs run in dependency order, and the final SELECT
+/// reports two booleans from their `RETURNING` output:
+///   * `dedupe` inserts the `cross_shard_outbox_applied` PK row. A
+///     redelivery hits the PK conflict, inserts nothing, and its empty
+///     `RETURNING` makes `first_apply = false` → `AlreadyApplied` with no
+///     balance touched (the money-safety guarantee).
+///   * `credit` adds to the balance only on first apply and only for an
+///     `active` recipient, so a missing/inactive recipient leaves it
+///     unmatched → `credited = false`.
+///   * `audit` writes the receiver-side `transactions` row only on first
+///     apply — `completed` when credited, else `failed` for the
+///     recipient-missing branch that the caller turns into a refund.
+///
+/// `(first_apply, credited)` collapses to the three `ApplyOutcome`s.
+async fn apply_credit_cte(
+    pool: &sqlx::PgPool,
+    sender_shard: usize,
+    row: &OutboxRow,
+) -> Result<ApplyOutcome, sqlx::Error> {
+    // `dedupe`/`credit`/`audit` are data-modifying CTEs: Postgres runs each
+    // exactly once to completion regardless of whether the final SELECT
+    // reads it, and the cross-references (credit→dedupe, audit→dedupe+credit)
+    // force the order. The final SELECT reports two booleans from the CTEs'
+    // RETURNING output: whether the dedupe row was freshly inserted
+    // (`first_apply`) and whether the balance UPDATE matched (`credited`).
+    let (first_apply, credited): (bool, bool) = sqlx::query_as(
+        r#"
+        WITH dedupe AS (
+            INSERT INTO cross_shard_outbox_applied (sender_shard, outbox_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+            RETURNING 1
+        ),
+        credit AS (
+            UPDATE users
+            SET balance = balance + $3, updated_at = NOW()
+            WHERE account_number = $4
+              AND status = 'active'
+              AND EXISTS (SELECT 1 FROM dedupe)
+            RETURNING 1
+        ),
+        audit AS (
+            INSERT INTO transactions
+                (id, from_account, to_account, amount, currency, status,
+                 reference_id, description, processed_at)
+            SELECT $5, $6, $7, $3, $8,
+                   CASE WHEN EXISTS (SELECT 1 FROM credit) THEN 'completed' ELSE 'failed' END,
+                   $9, $10, NOW()
+            WHERE EXISTS (SELECT 1 FROM dedupe)
+            ON CONFLICT (reference_id, from_account) DO NOTHING
+            RETURNING 1
+        )
+        SELECT EXISTS (SELECT 1 FROM dedupe) AS first_apply,
+               EXISTS (SELECT 1 FROM credit) AS credited
+        "#,
+    )
+    .bind(sender_shard as i32)
+    .bind(row.id)
+    .bind(row.amount)
+    .bind(&row.to_account)
+    .bind(Uuid::new_v4())
+    .bind(&row.from_account)
+    .bind(&row.to_account)
+    .bind(&row.currency)
+    .bind(&row.reference_id)
+    .bind(&row.description)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(if !first_apply {
+        ApplyOutcome::AlreadyApplied
+    } else if credited {
+        ApplyOutcome::Applied
+    } else {
+        ApplyOutcome::RecipientMissing
+    })
+}
+
+#[cfg(test)]
+mod cte_apply_tests {
+    //! Pin the three money-critical outcomes of `apply_credit_cte`
+    //! against a real Postgres so the data-modifying-WITH semantics are
+    //! exercised, not mocked: first-apply credit, redelivery no-op (no
+    //! double credit), and recipient-missing.
+    use super::*;
+    use sqlx::PgPool;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers::ContainerAsync;
+    use testcontainers_modules::postgres::Postgres;
+
+    const SCHEMA_SQL: &str = include_str!("../../../../db/init.sql");
+
+    async fn pg() -> (PgPool, ContainerAsync<Postgres>) {
+        let c = Postgres::default().start().await.unwrap();
+        let port = c.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        let pool = PgPool::connect(&url).await.unwrap();
+        sqlx::raw_sql(SCHEMA_SQL).execute(&pool).await.unwrap();
+        (pool, c)
+    }
+
+    async fn seed_user(pool: &PgPool, account: &str, balance: &str) {
+        sqlx::query(
+            "INSERT INTO users (account_number, full_name, balance, status) \
+             VALUES ($1, $2, $3::numeric, 'active')",
+        )
+        .bind(account)
+        .bind(format!("User {account}"))
+        .bind(balance)
+        .execute(pool)
+        .await
+        .expect("seed user");
+    }
+
+    fn credit_row(to_account: &str) -> OutboxRow {
+        OutboxRow {
+            id: Uuid::new_v4(),
+            from_account: "SENDER".into(),
+            to_account: to_account.into(),
+            to_shard: 1,
+            amount: Decimal::new(50000, 2), // 500.00
+            currency: "IDR".into(),
+            reference_id: format!("ref-{}", Uuid::new_v4()),
+            description: None,
+            attempts: 0,
+            refund_required: false,
+        }
+    }
+
+    async fn balance(pool: &PgPool, account: &str) -> Decimal {
+        sqlx::query_scalar("SELECT balance FROM users WHERE account_number = $1")
+            .bind(account)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn audit_status(pool: &PgPool, reference_id: &str) -> String {
+        sqlx::query_scalar("SELECT status FROM transactions WHERE reference_id = $1")
+            .bind(reference_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn dedupe_count(pool: &PgPool, outbox_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM cross_shard_outbox_applied WHERE outbox_id = $1")
+            .bind(outbox_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_apply_credits_recipient_once() {
+        let (pool, _c) = pg().await;
+        seed_user(&pool, "RECIP", "0.00").await;
+        let row = credit_row("RECIP");
+
+        let outcome = apply_credit_cte(&pool, 0, &row).await.unwrap();
+
+        assert!(
+            matches!(outcome, ApplyOutcome::Applied),
+            "first apply must report Applied"
+        );
+        assert_eq!(
+            balance(&pool, "RECIP").await,
+            Decimal::new(50000, 2),
+            "recipient credited exactly 500.00"
+        );
+        assert_eq!(dedupe_count(&pool, row.id).await, 1, "dedupe row written");
+        assert_eq!(
+            audit_status(&pool, &row.reference_id).await,
+            "completed",
+            "receiver audit row is completed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redelivery_does_not_double_credit() {
+        let (pool, _c) = pg().await;
+        seed_user(&pool, "RECIP", "0.00").await;
+        let row = credit_row("RECIP");
+
+        let first = apply_credit_cte(&pool, 0, &row).await.unwrap();
+        let second = apply_credit_cte(&pool, 0, &row).await.unwrap();
+
+        assert!(matches!(first, ApplyOutcome::Applied));
+        assert!(
+            matches!(second, ApplyOutcome::AlreadyApplied),
+            "redelivery must report AlreadyApplied"
+        );
+        assert_eq!(
+            balance(&pool, "RECIP").await,
+            Decimal::new(50000, 2),
+            "balance stays 500.00 — no double credit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_recipient_reports_missing_and_credits_nothing() {
+        let (pool, _c) = pg().await;
+        // No recipient seeded — the credit must find nothing to update.
+        let row = credit_row("NOSUCH");
+
+        let outcome = apply_credit_cte(&pool, 0, &row).await.unwrap();
+
+        assert!(
+            matches!(outcome, ApplyOutcome::RecipientMissing),
+            "missing recipient must report RecipientMissing"
+        );
+        let phantom: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM users WHERE account_number = 'NOSUCH'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(phantom, 0, "no phantom recipient row created");
+        assert_eq!(
+            dedupe_count(&pool, row.id).await,
+            1,
+            "dedupe row still written so the apply stays idempotent"
+        );
+        assert_eq!(
+            audit_status(&pool, &row.reference_id).await,
+            "failed",
+            "receiver audit records the failed attempt"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_row_credits_exactly_once() {
+        let (pool, _c) = pg().await;
+        seed_user(&pool, "RECIP", "0.00").await;
+        let row = credit_row("RECIP");
+
+        // Both app instances can momentarily hold the same outbox row (a
+        // SKIP-LOCKED lease re-claim race). Apply it from two tasks at once:
+        // the `cross_shard_outbox_applied` PK must serialize them so the
+        // balance lands exactly once.
+        let (a, b) = tokio::join!(
+            apply_credit_cte(&pool, 0, &row),
+            apply_credit_cte(&pool, 0, &row),
+        );
+        let outcomes = [a.unwrap(), b.unwrap()];
+
+        let applied = outcomes
+            .iter()
+            .filter(|o| matches!(o, ApplyOutcome::Applied))
+            .count();
+        let already = outcomes
+            .iter()
+            .filter(|o| matches!(o, ApplyOutcome::AlreadyApplied))
+            .count();
+        assert_eq!(applied, 1, "exactly one apply wins the dedupe race");
+        assert_eq!(already, 1, "the loser reports AlreadyApplied");
+        assert_eq!(
+            balance(&pool, "RECIP").await,
+            Decimal::new(50000, 2),
+            "balance moves exactly once under the race — no double credit"
+        );
+    }
 }
