@@ -528,6 +528,7 @@ async fn prune_in_batches(pool: &sqlx::PgPool, sql: &str, retention_secs: i64) -
             }
             Err(e) => {
                 tracing::warn!(error = %e, "cross-shard retention sweep batch failed");
+                metrics::counter!("cross_shard_prune_errors_total").increment(1);
                 break;
             }
         }
@@ -1018,7 +1019,10 @@ async fn mark_failed(pool: &sqlx::PgPool, id: Uuid, reason: &str) -> Result<(), 
 ///     unmatched → `credited = false`.
 ///   * `audit` writes the receiver-side `transactions` row only on first
 ///     apply — `completed` when credited, else `failed` for the
-///     recipient-missing branch that the caller turns into a refund.
+///     recipient-missing branch that the caller turns into a refund. The
+///     `WHERE EXISTS(dedupe)` guard already limits it to first apply, so
+///     `ON CONFLICT DO NOTHING` only absorbs a torn prior attempt (dedupe
+///     committed but the row already present).
 ///
 /// `(first_apply, credited)` collapses to the three `ApplyOutcome`s.
 async fn apply_credit_cte(

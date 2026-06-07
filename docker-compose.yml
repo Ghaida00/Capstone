@@ -162,7 +162,7 @@ x-pg-node-env: &pg-node-env
   PG_CHECKPOINT_TIMEOUT: ${PG_CHECKPOINT_TIMEOUT:-15min}
   PG_CHECKPOINT_COMPLETION_TARGET: ${PG_CHECKPOINT_COMPLETION_TARGET:-0.9}
 
-# Per-node resource envelope. 1.5 CPU / 512 MB gives the
+# Per-node resource envelope. 1.0 CPU / 512 MB gives the
 # primary headroom for both request-driven INSERT/UPDATE
 # traffic — which contends on `UPDATE … WHERE balance >= …`
 # and the WAL flush — and the streaming-replication walsender.
@@ -471,7 +471,7 @@ services:
       # 2 replicas × 1.0 CPU on an 8-core host. Higher counts
       # oversubscribe the scheduler (every container competes
       # for cores → context-switch storms inflate p95 / p99),
-      # and capping at 2 frees CPU for PG to run at 1.5 per
+      # and capping at 2 frees CPU for PG to run at 1.0 per
       # node (see x-pg-node-deploy).
       #
       # HA tradeoff: a single crash leaves one survivor. Bump
