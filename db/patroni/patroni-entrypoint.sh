@@ -51,6 +51,33 @@
 #                           log writes fewer bytes — trades CPU
 #                           for disk write throughput.
 #                           Default: off.
+#   BACKUP_ENABLED          true|false (default false). When true,
+#                           WAL archiving turns on and every
+#                           completed segment is pushed to the
+#                           pgBackRest repo described by the
+#                           BACKUP_* vars below; base backups are
+#                           then driven externally (host cron →
+#                           scripts/backup-shard.sh). When false
+#                           the node behaves byte-identically to a
+#                           stack without the feature.
+#   BACKUP_REPO_TYPE        s3 (default) or posix.
+#   BACKUP_S3_ENDPOINT/_BUCKET/_REGION/_KEY/_KEY_SECRET
+#                           Object-storage target; all five are
+#                           required when BACKUP_ENABLED=true and
+#                           repo type is s3.
+#   BACKUP_CIPHER_PASS      Optional; when set the repo is
+#                           encrypted at rest (aes-256-cbc).
+#   BACKUP_POSIX_PATH       posix repo path (default
+#                           /var/lib/pgbackrest) — for local
+#                           testing without object storage.
+#   BACKUP_RETENTION_FULL   Full backups retained (default 2);
+#                           expired fulls take their WAL with them.
+#   PG_ARCHIVE_TIMEOUT      Idle-RPO bound, seconds: a non-full
+#                           WAL segment is force-switched and
+#                           archived after this long. Default 300
+#                           when backups are on; forced to 0 when
+#                           off. Keep >= 60 — every switch uploads
+#                           a segment.
 #
 # The template at /etc/patroni/patroni.yml.tmpl is rendered
 # once per container start via `envsubst` and written to
@@ -167,13 +194,118 @@ case "$PG_MIN_WAL_SIZE" in
         ;;
 esac
 
+# ------------------------------------------------------------
+# Backup / WAL-archiving toggle (BACKUP_ENABLED)
+# ------------------------------------------------------------
+# Resolves the BACKUP_* env vars into the PG_ARCHIVE_* values
+# the template renders. Off (the default) means archive_mode=
+# off and no pgbackrest.conf — zero archiver work, identical
+# to a stack without the feature. On means archive_mode=on
+# with pgbackrest archive-push as the archive_command, against
+# a config rendered here.
+#
+# The operational footgun this block guards: archive_mode=on
+# with a misconfigured repo makes every archive attempt fail,
+# and Postgres then RETAINS unarchived WAL until the disk
+# fills. Hence fail-fast on missing s3 settings instead of
+# letting a half-configured node boot.
+# ------------------------------------------------------------
+: "${BACKUP_ENABLED:=false}"
+: "${BACKUP_REPO_TYPE:=s3}"
+: "${BACKUP_POSIX_PATH:=/var/lib/pgbackrest}"
+: "${BACKUP_RETENTION_FULL:=2}"
+: "${BACKUP_CIPHER_PASS:=}"
+
+case "$BACKUP_ENABLED" in
+    true|false) ;;
+    *)
+        echo "[patroni-entrypoint] FATAL: BACKUP_ENABLED='$BACKUP_ENABLED'" \
+             "must be 'true' or 'false'" >&2
+        exit 1
+        ;;
+esac
+
+if [ "$BACKUP_ENABLED" = "true" ]; then
+    : "${PG_ARCHIVE_TIMEOUT:=300}"
+    PG_ARCHIVE_MODE=on
+    PG_ARCHIVE_COMMAND="pgbackrest --stanza=${PATRONI_SCOPE} archive-push %p"
+
+    BACKREST_CONF=/etc/pgbackrest/pgbackrest.conf
+    case "$BACKUP_REPO_TYPE" in
+        s3)
+            : "${BACKUP_S3_ENDPOINT:?BACKUP_S3_ENDPOINT required when BACKUP_ENABLED=true (s3 repo)}"
+            : "${BACKUP_S3_BUCKET:?BACKUP_S3_BUCKET required when BACKUP_ENABLED=true (s3 repo)}"
+            : "${BACKUP_S3_REGION:?BACKUP_S3_REGION required when BACKUP_ENABLED=true (s3 repo)}"
+            : "${BACKUP_S3_KEY:?BACKUP_S3_KEY required when BACKUP_ENABLED=true (s3 repo)}"
+            : "${BACKUP_S3_KEY_SECRET:?BACKUP_S3_KEY_SECRET required when BACKUP_ENABLED=true (s3 repo)}"
+            REPO_LINES="repo1-type=s3
+repo1-s3-endpoint=${BACKUP_S3_ENDPOINT}
+repo1-s3-bucket=${BACKUP_S3_BUCKET}
+repo1-s3-region=${BACKUP_S3_REGION}
+repo1-s3-key=${BACKUP_S3_KEY}
+repo1-s3-key-secret=${BACKUP_S3_KEY_SECRET}
+repo1-s3-uri-style=path
+repo1-path=/peakload"
+            ;;
+        posix)
+            REPO_LINES="repo1-type=posix
+repo1-path=${BACKUP_POSIX_PATH}"
+            ;;
+        *)
+            echo "[patroni-entrypoint] FATAL: BACKUP_REPO_TYPE='$BACKUP_REPO_TYPE'" \
+                 "must be 's3' or 'posix'" >&2
+            exit 1
+            ;;
+    esac
+
+    CIPHER_LINES=""
+    if [ -n "$BACKUP_CIPHER_PASS" ]; then
+        CIPHER_LINES="repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass=${BACKUP_CIPHER_PASS}"
+    fi
+
+    echo "[patroni-entrypoint] BACKUP_ENABLED=true — rendering $BACKREST_CONF (repo: $BACKUP_REPO_TYPE, stanza: $PATRONI_SCOPE)"
+    cat > "$BACKREST_CONF" <<EOF
+# Rendered by patroni-entrypoint.sh on every container start.
+# Do not edit in place — change the BACKUP_* vars in .env and
+# recreate the node.
+[global]
+${REPO_LINES}
+${CIPHER_LINES}
+repo1-retention-full=${BACKUP_RETENTION_FULL}
+compress-type=lz4
+process-max=1
+start-fast=y
+log-level-console=info
+log-level-file=detail
+log-path=/var/log/pgbackrest
+
+[${PATRONI_SCOPE}]
+pg1-path=${PGDATA}
+pg1-socket-path=/var/run/postgresql
+pg1-user=postgres
+EOF
+    chown postgres:postgres "$BACKREST_CONF"
+    chmod 0600 "$BACKREST_CONF"
+else
+    # Forced regardless of any PG_ARCHIVE_TIMEOUT in .env: a
+    # timeout without archiving would switch segments for
+    # nothing. /bin/true (not empty) so the rendered YAML stays
+    # a valid scalar.
+    PG_ARCHIVE_MODE=off
+    PG_ARCHIVE_COMMAND=/bin/true
+    PG_ARCHIVE_TIMEOUT=0
+    rm -f /etc/pgbackrest/pgbackrest.conf
+fi
+
 export PGDATA PATRONI_SCOPE PATRONI_NAME PATRONI_HOSTNAME ETCD_HOSTS \
        POSTGRES_SUPERUSER_PASSWORD POSTGRES_USER POSTGRES_PASSWORD \
        POSTGRES_DB REPL_PASSWORD \
        PG_SYNCHRONOUS_COMMIT PG_COMMIT_DELAY PG_COMMIT_SIBLINGS \
        PG_WAL_COMPRESSION PG_MAX_CONNECTIONS PG_SHARED_BUFFERS \
        PG_MAX_WAL_SIZE PG_MIN_WAL_SIZE PG_CHECKPOINT_TIMEOUT \
-       PG_CHECKPOINT_COMPLETION_TARGET
+       PG_CHECKPOINT_COMPLETION_TARGET \
+       PG_ARCHIVE_MODE PG_ARCHIVE_COMMAND PG_ARCHIVE_TIMEOUT
 
 # ------------------------------------------------------------
 # 1. Render the Patroni config from the template.
@@ -206,6 +338,9 @@ envsubst '
     ${PG_MIN_WAL_SIZE}
     ${PG_CHECKPOINT_TIMEOUT}
     ${PG_CHECKPOINT_COMPLETION_TARGET}
+    ${PG_ARCHIVE_MODE}
+    ${PG_ARCHIVE_COMMAND}
+    ${PG_ARCHIVE_TIMEOUT}
 ' < /etc/patroni/patroni.yml.tmpl > "$RENDERED"
 
 # ------------------------------------------------------------

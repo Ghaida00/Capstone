@@ -16,7 +16,7 @@ list.
 
 | # | Risk | Exposure | Bounded by | Fix trigger |
 |---|------|----------|------------|-------------|
-| 1 | No backup / PITR | Logical corruption or full-shard loss is unrecoverable (RPO ∞) | Patroni replica per shard (node loss only) | Any real money data — fix **first** |
+| 1 | Backup/PITR toggle off by default; restore unrehearsed | Toggle-off deploys: logical corruption / full-shard loss unrecoverable (RPO ∞) | `BACKUP_ENABLED=true` + WAL archiving where enabled; Patroni replica per shard (node loss) | Real money data → enable in cloud + one restore drill |
 | 2 | pg-haproxy is a SPOF | All DB connections cross one proxy container | Container restart policy; healthchecks | Multi-host deploy or HA requirement |
 | 3 | pg-haproxy CPU-cap sensitivity | Under-provisioned `cpus:` limit re-creates ~100 ms CFS tails | Limit raised 0.15→0.5; ~6% periods still throttle on 3-shard D | Adding shards/read load without re-budgeting |
 | 4 | RabbitMQ classic (non-quorum) queues | Broker node loss can drop queued (accepted-not-applied) transactions | Single-node broker anyway; outbox reconciliation runbook for cross-shard rows | Multi-node RabbitMQ or durability SLA |
@@ -26,18 +26,22 @@ list.
 
 ---
 
-## 1. No backup / PITR (the one true production blocker)
+## 1. Backup / PITR: implemented as a toggle, off by default, restore unrehearsed
 
-Full statement in [disaster-recovery.md](disaster-recovery.md) (audit
-item OPS-4). Patroni protects against **node** failure, not **data**
-failure: a runaway `DELETE` or bad migration replicates to the replica
-within milliseconds. There is no WAL archive, so no point-in-time
-recovery target exists.
+Patroni protects against **node** failure, not **data** failure: a
+runaway `DELETE` or bad migration replicates to the replica within
+milliseconds. The answer is the `BACKUP_ENABLED` toggle (pgBackRest
+WAL archiving + cron base backups; see
+[disaster-recovery.md](disaster-recovery.md)) — verified end-to-end
+on a posix repo 2026-06-10 *except the restore path*.
 
-**Accepted because:** the capstone holds synthetic data.
-**Not acceptable for:** anything holding real balances. This is the
-first remediation item for a production deploy, ahead of everything
-else in this register.
+**Residual exposure:** (a) every laptop profile runs toggle-off, so
+the old "RPO ∞" posture still applies there by choice; (b) no
+restore has been rehearsed, so the backup is not yet evidence of
+recoverability; (c) enabled-but-misconfigured archiving retains WAL
+until the disk fills — alert on `pg_stat_archiver.failed_count`.
+**Fix trigger:** before real money data, flip on in cloud, run one
+full restore drill, and record it here.
 
 ## 2. pg-haproxy single point of failure
 

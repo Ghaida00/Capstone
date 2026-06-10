@@ -161,6 +161,22 @@ x-pg-node-env: &pg-node-env
   PG_MIN_WAL_SIZE: ${PG_MIN_WAL_SIZE:-512MB}
   PG_CHECKPOINT_TIMEOUT: ${PG_CHECKPOINT_TIMEOUT:-15min}
   PG_CHECKPOINT_COMPLETION_TARGET: ${PG_CHECKPOINT_COMPLETION_TARGET:-0.9}
+  # Backup / WAL-archiving toggle — resolved by patroni-
+  # entrypoint.sh into archive_mode/archive_command. Default
+  # false = no archiver work, byte-identical to pre-toggle
+  # behavior; the BACKUP_S3_* values are only read (and only
+  # then required) when BACKUP_ENABLED=true. See .env §BACKUP.
+  BACKUP_ENABLED: ${BACKUP_ENABLED:-false}
+  BACKUP_REPO_TYPE: ${BACKUP_REPO_TYPE:-s3}
+  BACKUP_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:-}
+  BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:-}
+  BACKUP_S3_REGION: ${BACKUP_S3_REGION:-}
+  BACKUP_S3_KEY: ${BACKUP_S3_KEY:-}
+  BACKUP_S3_KEY_SECRET: ${BACKUP_S3_KEY_SECRET:-}
+  BACKUP_CIPHER_PASS: ${BACKUP_CIPHER_PASS:-}
+  BACKUP_POSIX_PATH: ${BACKUP_POSIX_PATH:-/var/lib/pgbackrest}
+  BACKUP_RETENTION_FULL: ${BACKUP_RETENTION_FULL:-2}
+  PG_ARCHIVE_TIMEOUT: ${PG_ARCHIVE_TIMEOUT:-300}
 
 # Per-node resource envelope. 1.0 CPU / 512 MB gives the
 # primary headroom for both request-driven INSERT/UPDATE

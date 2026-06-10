@@ -36,11 +36,17 @@
 
 FROM postgres:18.3-bookworm
 
-# Install Patroni + etcd client + envsubst.
+# Install Patroni + etcd client + envsubst + pgBackRest.
 # `--break-system-packages` is required on Debian Bookworm's
 # Python 3.11+ (PEP 668) because we are installing into the
 # system site-packages inside a dedicated container where a
 # venv would only add noise. Safe here; not safe on a host.
+#
+# pgbackrest comes from the PGDG apt repo the base image already
+# carries (2.58+; PG 18 support needs >= 2.56 — the Debian-main
+# 2.45 package does NOT know PG 18). It is dormant unless
+# BACKUP_ENABLED=true renders a config and the archive_command
+# engages — when the toggle is off this costs image bytes only.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -48,6 +54,7 @@ RUN set -eux; \
         python3-pip \
         python3-setuptools \
         gettext-base \
+        pgbackrest \
         ca-certificates; \
     pip3 install --break-system-packages --no-cache-dir \
         "patroni[etcd3]==4.1.0" \
@@ -58,8 +65,18 @@ RUN set -eux; \
 # Patroni needs a writable config dir. The base image's
 # `postgres` user (UID 999) owns /var/lib/postgresql by
 # default, so we nest our Patroni files under that tree.
+# pgBackRest needs its config/log/repo dirs writable by the
+# same user (archive_command runs as postgres). /var/lib/
+# pgbackrest doubles as the default posix repo target for
+# local testing; the s3 repo type never touches it.
 RUN mkdir -p /var/lib/patroni \
- && chown -R postgres:postgres /var/lib/patroni
+             /etc/pgbackrest \
+             /var/lib/pgbackrest \
+             /var/log/pgbackrest \
+ && chown -R postgres:postgres /var/lib/patroni \
+                               /etc/pgbackrest \
+                               /var/lib/pgbackrest \
+                               /var/log/pgbackrest
 
 COPY templates/patroni.yml.tmpl /etc/patroni/patroni.yml.tmpl
 COPY patroni-entrypoint.sh      /opt/patroni-entrypoint.sh
