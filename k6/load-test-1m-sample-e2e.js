@@ -41,6 +41,20 @@ const transactionE2eMs = new Trend("transaction_e2e_ms", true);
 const transactionsE2eCompleted = new Counter("transactions_e2e_completed");
 const transactionsE2eTimeout = new Counter("transactions_e2e_timeout");
 
+// ─── Gate mode (fast profile matrix) ───────────────────────
+// Full run ≈15m sustained; gate run ≈5m total for A/B/C/D matrix.
+//   k6 run -e K6_GATE=1 k6/load-test-1m-sample-e2e.js
+const IS_GATE = ["1", "true", "yes"].includes(
+  String(__ENV.K6_GATE || "").toLowerCase(),
+);
+const SUSTAINED_DURATION = IS_GATE ? "3m" : "13m";
+const RAMP_DOWN_DURATION = IS_GATE ? "30s" : "55s";
+const BALANCE_POLL_DURATION = IS_GATE ? "4m40s" : "14m50s";
+const DELAY_ABORT_EVAL = IS_GATE ? "1m" : "2m";
+// ~5% × iters; gate run ≈50k iters → ~2500 samples → 0.5% ≈ 12
+const E2E_TIMEOUT_MAX = IS_GATE ? 15 : 55;
+const EST_ITER_COUNT = IS_GATE ? 50000 : 217000;
+
 // ─── Configuration ─────────────────────────────────────────
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8080";
 const NUM_ACCOUNTS = 100000;
@@ -107,9 +121,9 @@ export const options = {
       preAllocatedVUs: 300,
       maxVUs: 1500,
       stages: [
-        { duration: "1m",  target: 278 },
-        { duration: "13m", target: 278 },
-        { duration: "55s", target: 0 },
+        { duration: "1m", target: 278 },
+        { duration: SUSTAINED_DURATION, target: 278 },
+        { duration: RAMP_DOWN_DURATION, target: 0 },
       ],
       exec: "txWorkload",
       gracefulStop: "30s",
@@ -119,7 +133,7 @@ export const options = {
     balance_poll: {
       executor: "constant-vus",
       vus: 5,
-      duration: "14m50s",
+      duration: BALANCE_POLL_DURATION,
       startTime: "10s",
       exec: "balancePollWorkload",
       tags: { scenario: "balance_poll" },
@@ -132,7 +146,7 @@ export const options = {
     // can't abort the money-path run; the balance-poll gate reports
     // a breach in the summary but does NOT abort.
     "http_req_failed{scenario:sustained_1m_per_hour}": [
-      { threshold: "rate<0.05", abortOnFail: true, delayAbortEval: "2m" },
+      { threshold: "rate<0.05", abortOnFail: true, delayAbortEval: DELAY_ABORT_EVAL },
     ],
     "http_req_failed{scenario:balance_poll}": ["rate<0.05"],
     http_req_duration: ["p(95)<500", "p(99)<1500"],
@@ -159,7 +173,7 @@ export const options = {
     // (10 s) is genuinely wedged. 5% × 217k iters = ~10,850
     // samples; 0.5% timeout = ~55. If this trips, the consumer
     // or outbox is wedged, not just slow.
-    "transactions_e2e_timeout": ["count<55"],
+    "transactions_e2e_timeout": [`count<${E2E_TIMEOUT_MAX}`],
   },
 };
 
@@ -225,7 +239,9 @@ function waitForCompletion(refId, params, timeoutMs, pollMs) {
 // ─── Setup ─────────────────────────────────────────────────
 export function setup() {
   console.log(`🎯 Target: ${BASE_URL}`);
-  console.log(`📊 Running: sustained 1M/hour + ${(E2E_SAMPLE_RATE * 100).toFixed(1)}% e2e sample + balance poll`);
+  console.log(
+    `📊 Running: ${IS_GATE ? "GATE (~5m)" : "full (~15m)"} sustained 1M/hour + ${(E2E_SAMPLE_RATE * 100).toFixed(1)}% e2e sample + balance poll`,
+  );
   console.log(`👥 Using ${NUM_ACCOUNTS} pre-seeded accounts (ACC_0000001 – ACC_0100000)\n`);
 
   const health = http.get(`${BASE_URL}/health`);
@@ -434,5 +450,7 @@ export function teardown() {
   console.log(`\n📈 Load test complete!`);
   console.log(`   Check Grafana dashboard: http://localhost:3001`);
   console.log(`   E2E sample Trend: 'transaction_e2e_ms' in k6 summary`);
-  console.log(`   Sample size: ~${Math.round(217000 * E2E_SAMPLE_RATE)} of ~217k iters`);
+  console.log(
+    `   Sample size: ~${Math.round(EST_ITER_COUNT * E2E_SAMPLE_RATE)} of ~${Math.round(EST_ITER_COUNT / 1000)}k iters`,
+  );
 }
