@@ -10,9 +10,10 @@
 #     thresholds (p(95)<800 ms under spike). It is designed to
 #     run on a real production-class host with the budget the
 #     compose-comment names ("8 cores + 8 GB minimum"); on a
-#     GitHub-hosted ubuntu-latest runner (7 GB / 2 vCPU) the
-#     spike scenario would deliberately push past the runner's
-#     resource budget and produce noise, not signal.
+#     GitHub-hosted ubuntu-latest runner (4 vCPU / 16 GB for
+#     public repos) the spike scenario would deliberately push
+#     past the runner's resource budget and produce noise, not
+#     signal.
 #   * k6/load-test-1m.js is the steady-state, constant-arrival-
 #     rate suite. Tight thresholds throughout (p(95)<50 ms POST,
 #     p(95)<10 ms balance) at a sustained arrival rate for 15
@@ -42,13 +43,14 @@ name: k6 nightly
 
 on:
   schedule:
-    # 04:00 UTC every day = 11:00 WIB. The project comment-bar
-    # in docker-compose.yml says "8 cores + 8 GB" minimum, which
-    # is at the upper edge of GitHub-hosted ubuntu-latest's
-    # 7 GB / 2 vCPU budget — if the stack OOMs in CI, the fix
-    # is `runs-on: ubuntu-latest-large` or a self-hosted
-    # runner. Documented here so a future workflow editor sees
-    # the trade-off.
+    # 04:00 UTC every day = 11:00 WIB. The 1-shard Profile B
+    # stack's measured demand is ~2.2 CPU avg / ~3.2 peak under
+    # this load, inside GitHub-hosted ubuntu-latest's 4 vCPU /
+    # 16 GB (public-repo tier) but without much headroom — if
+    # the stack OOMs or threshold-flaps in CI, the fix is
+    # `runs-on: ubuntu-latest-large` or a self-hosted runner.
+    # Documented here so a future workflow editor sees the
+    # trade-off.
     - cron: "0 4 * * *"
   workflow_dispatch:
 
@@ -63,6 +65,26 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      # docker-compose.yml has no credentialed defaults (S-6): every
+      # ${VAR:?} interpolation needs a .env or `compose up` dies with
+      # "required variable ... is missing a value". CI uses the
+      # 1-shard Profile B env — the lightest topology whose URLs are
+      # self-consistent without shard1/shard2 containers — with the
+      # CHANGEME placeholder tokens replaced by run-scoped random
+      # secrets. Token-level (not line-level) replacement because the
+      # same placeholders are embedded in DATABASE_*/REDIS_URL/
+      # RABBITMQ_URL connection strings and must stay in sync with
+      # the credential variables. Hex output keeps them URL-safe.
+      # Longest tokens first so `CHANGEME` doesn't clobber the others.
+      - name: Provision .env
+        run: |
+          cp .env.profile-b.example .env
+          sed -i \
+            -e "s/CHANGEME_SUPERUSER/$(openssl rand -hex 24)/g" \
+            -e "s/CHANGEME_REPL/$(openssl rand -hex 24)/g" \
+            -e "s/CHANGEME/$(openssl rand -hex 24)/g" \
+            .env
 
       # Bring up the full peakload-capstone compose stack. The
       # repo's existing healthchecks (OPS-11) gate readiness;

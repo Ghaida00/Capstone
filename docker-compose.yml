@@ -28,14 +28,14 @@ name: peakload
 #  etcd-1/2/3   (× 3)               0.45     192 M      (0.15 × 3, 64 M × 3)
 #  pg-shard0-node-a/b   (× 2)       3.0      1024 M     (1.5 × 2, 512 M × 2)
 #  pg-shard1-node-a/b   (× 2)*      3.0      1024 M     (* profile shard1)
-#  pgbouncer-shard0/1   (× 2)       0.2      64 M       (0.1 × 2, 32 M × 2)
-#  pg-haproxy                       0.15     64 M
+#  pgbouncer-shard0/1   (× 2)       0.6      64 M       (0.3 × 2, 32 M × 2)
+#  pg-haproxy                       0.5      64 M
 #  redis-master                     1.0      384 M
 #  redis-replica                    1.0      384 M
 #  redis-sentinel-1/2/3 (× 3)       0.3      96 M       (0.1 × 3, 32 M × 3)
 #  rabbitmq                         1.0      512 M
 #  ───────────────────────────────  ───────  ────────
-#  CORE TOTAL                       13.10    4768 M (~4.66 GB)
+#  CORE TOTAL                       13.85    4768 M (~4.66 GB)
 #
 #  Observability (opt-in via COMPOSE_PROFILES):
 #  prometheus                       0.5      256 M
@@ -46,13 +46,13 @@ name: peakload
 #  ───────────────────────────────  ───────  ────────
 #  OBSERVABILITY TOTAL              1.8      1408 M (~1.37 GB)
 #
-#  Profile A FULL  (observability ON)   14.90    6176 M (~6.03 GB)
-#  Profile A LEAN  (observability OFF)  13.10    4768 M (~4.66 GB)
+#  Profile A FULL  (observability ON)   15.65    6176 M (~6.03 GB)
+#  Profile A LEAN  (observability OFF)  13.85    4768 M (~4.66 GB)
 #
 # Other profiles (see .env.example §9 for full var lists):
-#  Profile B  1-shard high-memory       ~12.0    ~5.0 GB
-#  Profile C  2-shard high-capacity     ~16.0    ~7.0 GB
-#  Profile D  3-shard maximum           ~20.0    ~9.0 GB
+#  Profile B  1-shard high-memory       ~12.6    ~5.0 GB
+#  Profile C  2-shard high-capacity     ~16.8    ~7.0 GB
+#  Profile D  3-shard maximum           ~21.0    ~9.0 GB
 #
 # Notes:
 # * Limits, not requests — idle usage is well below these.
@@ -105,17 +105,21 @@ x-pg-node-common: &pg-node-common
   logging: *default-logging
   networks:
     - peakload-network
-  # 60s start_period tolerates the first-boot sequence
+  # 120s start_period tolerates the first-boot sequence
   # (initdb on the first primary, pg_basebackup on the
-  # replica). Patroni exits non-zero on config errors, so
-  # the healthcheck plus Docker restart policy is enough to
-  # surface misconfigurations.
+  # replica) even on a cold `down -v` bootstrap of the
+  # larger high-memory profiles, where the serial chain
+  # (etcd → primary → replica → pg-haproxy → app) outruns a
+  # shorter window and a single `up` would otherwise need a
+  # retry. Patroni exits non-zero on config errors, so the
+  # healthcheck plus Docker restart policy still surfaces
+  # misconfigurations.
   healthcheck:
     test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U $$POSTGRES_USER -d $$POSTGRES_DB" ]
     interval: 10s
     timeout: 5s
-    retries: 6
-    start_period: 60s
+    retries: 10
+    start_period: 120s
 
 # Shared env for every Patroni node. Per-node variance
 # (scope, name, hostname) is injected at the service level.
@@ -158,7 +162,7 @@ x-pg-node-env: &pg-node-env
   PG_CHECKPOINT_TIMEOUT: ${PG_CHECKPOINT_TIMEOUT:-15min}
   PG_CHECKPOINT_COMPLETION_TARGET: ${PG_CHECKPOINT_COMPLETION_TARGET:-0.9}
 
-# Per-node resource envelope. 1.5 CPU / 512 MB gives the
+# Per-node resource envelope. 1.0 CPU / 512 MB gives the
 # primary headroom for both request-driven INSERT/UPDATE
 # traffic — which contends on `UPDATE … WHERE balance >= …`
 # and the WAL flush — and the streaming-replication walsender.
@@ -175,7 +179,7 @@ x-pg-node-deploy: &pg-node-deploy
       # in patroni.yml.tmpl OR raise PG_MAX_CONNECTIONS to consume
       # the headroom — otherwise the extra RAM sits unused.
       memory: ${PG_MEMORY_LIMIT:-512m}
-      cpus: ${PG_CPU_LIMIT:-1.5}
+      cpus: ${PG_CPU_LIMIT:-1.0}
 
 # ============================================================
 # etcd anchors
@@ -282,7 +286,7 @@ x-pgbouncer-deploy: &pgbouncer-deploy
 # ============================================================
 x-redis-command: &redis-command >
   redis-server
-    --maxmemory 256mb
+    --maxmemory ${REDIS_MAXMEMORY:-256mb}
     --maxmemory-policy allkeys-lru
     --save ""
     --appendonly yes
@@ -467,7 +471,7 @@ services:
       # 2 replicas × 1.0 CPU on an 8-core host. Higher counts
       # oversubscribe the scheduler (every container competes
       # for cores → context-switch storms inflate p95 / p99),
-      # and capping at 2 frees CPU for PG to run at 1.5 per
+      # and capping at 2 frees CPU for PG to run at 1.0 per
       # node (see x-pg-node-deploy).
       #
       # HA tradeoff: a single crash leaves one survivor. Bump
@@ -630,7 +634,7 @@ services:
       resources:
         limits:
           memory: ${PGBOUNCER_READ_MEMORY_LIMIT:-32M}
-          cpus: "${PGBOUNCER_CPU_LIMIT:-0.1}"
+          cpus: "${PGBOUNCER_CPU_LIMIT:-0.3}"
 
   pgbouncer-read-shard1:
     <<: *pgbouncer-common
@@ -648,7 +652,7 @@ services:
       resources:
         limits:
           memory: ${PGBOUNCER_READ_MEMORY_LIMIT:-32M}
-          cpus: "${PGBOUNCER_CPU_LIMIT:-0.1}"
+          cpus: "${PGBOUNCER_CPU_LIMIT:-0.3}"
 
   pgbouncer-read-shard2:
     <<: *pgbouncer-common
@@ -666,7 +670,7 @@ services:
       resources:
         limits:
           memory: ${PGBOUNCER_READ_MEMORY_LIMIT:-32M}
-          cpus: "${PGBOUNCER_CPU_LIMIT:-0.1}"
+          cpus: "${PGBOUNCER_CPU_LIMIT:-0.3}"
 
   # ============================================================
   # SHARD 1 — two Patroni-managed nodes (scope peakload-shard1)
@@ -831,26 +835,35 @@ services:
       - "5001"
       - "5002"
     depends_on:
+      # service_STARTED, not service_healthy: HAProxy boots as soon as
+      # the PG containers exist and starts routing once Patroni's
+      # /primary probe passes (shard0 servers now use init-addr
+      # last,libc,none in haproxy.cfg, like shards 1/2). This decouples
+      # HAProxy from PG readiness so a slow cold bootstrap can't push
+      # HAProxy past its health window and abort the dependents — the
+      # "fails on the first `up`, works on the second" race. The
+      # schema/migrate steps stay correct because bootstrap-schema's
+      # wait_for_primary loop blocks until a writable primary answers.
       pg-shard0-node-a:
-        condition: service_healthy
+        condition: service_started
       pg-shard0-node-b:
-        condition: service_healthy
+        condition: service_started
       # Shards 1 and 2 are profile-gated. `required: false` means
       # HAProxy boots even when those profiles are inactive — the
       # corresponding backends simply stay DOWN (their health probe
       # has no target), which is harmless because nothing routes
       # to them in single-shard mode.
       pg-shard1-node-a:
-        condition: service_healthy
+        condition: service_started
         required: false
       pg-shard1-node-b:
-        condition: service_healthy
+        condition: service_started
         required: false
       pg-shard2-node-a:
-        condition: service_healthy
+        condition: service_started
         required: false
       pg-shard2-node-b:
-        condition: service_healthy
+        condition: service_started
         required: false
     healthcheck:
       # Stats page on :7000 is served unconditionally once
@@ -861,8 +874,8 @@ services:
       test: [ "CMD-SHELL", "wget -q -O- http://127.0.0.1:7000/ >/dev/null || exit 1" ]
       interval: 5s
       timeout: 3s
-      retries: 5
-      start_period: 10s
+      retries: 10
+      start_period: 60s
     restart: unless-stopped
     logging: *default-logging
     networks:
@@ -871,7 +884,12 @@ services:
       resources:
         limits:
           memory: ${PG_HAPROXY_MEMORY_LIMIT:-64M}
-          cpus: "${PG_HAPROXY_CPU_LIMIT:-0.15}"
+          # Floor 0.5: every Tier-1 read (/replica frontends) and write
+          # round-trip crosses this one proxy — demand is ~0.2 CPU under
+          # a 2-shard gate load. A limit below demand makes Docker CFS
+          # throttle it in 100 ms periods, injecting ~70-100 ms tails
+          # into every connection through it.
+          cpus: "${PG_HAPROXY_CPU_LIMIT:-0.5}"
 
   # ============================================================
   # db-bootstrap-schema — one-shot init.sql applier
@@ -1013,7 +1031,7 @@ services:
     container_name: peakload-redis-replica
     command: >
       redis-server
-        --maxmemory 256mb
+        --maxmemory ${REDIS_MAXMEMORY:-256mb}
         --maxmemory-policy allkeys-lru
         --save ""
         --appendonly yes

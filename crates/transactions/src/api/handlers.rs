@@ -268,6 +268,21 @@ pub(crate) async fn list(
     Ok(Json(ApiResponse::success(resp)))
 }
 
+/// TTL (seconds) for a cached `tx_status` response. Terminal states
+/// (`completed`/`failed`/`reversed`) are immutable, so they cache for 5s.
+/// Transient states cache for a short 1s: long enough to absorb the burst of
+/// polls for one in-flight transaction — capping the reader-pool load those
+/// otherwise-uncached polls add, which on a single-shard profile can pressure
+/// the pool into 5xx — yet short enough that the commit-time invalidator's DEL
+/// plus this 1s ceiling hold the stale window to ~1s. Unknown statuses take
+/// the transient (1s) bucket.
+fn status_cache_ttl(status: &str) -> u64 {
+    match status {
+        "completed" | "failed" | "reversed" => 5,
+        _ => 1,
+    }
+}
+
 pub(crate) async fn get_status(
     State(deps): State<TransactionsDeps>,
     Path(reference_id): Path<String>,
@@ -285,9 +300,42 @@ pub(crate) async fn get_status(
 
     let view = deps.service.get_status_by_reference(&reference_id).await?;
     let resp: StatusResponseV2 = view.into();
-    // Status transitions in ~100ms once the consumer flushes;
-    // a 5s TTL keeps poll-driven UIs responsive while still
-    // amortising cache hits across burst traffic.
-    let _ = deps.cache.set(&cache_key, &resp, 5).await;
+    // Cache every status, but for a status-dependent TTL (see
+    // status_cache_ttl): terminal states for 5s, transient ones for only 1s.
+    // The short transient TTL caps the reader-pool load of repeated in-flight
+    // polls — left uncached, those concentrate on a single-shard profile and
+    // can pressure the pool into 5xx — while the commit-time invalidator's DEL
+    // plus the 1s ceiling keep the stale window to ~1s.
+    let _ = deps
+        .cache
+        .set(&cache_key, &resp, status_cache_ttl(resp.status.as_str()))
+        .await;
     Ok(Json(ApiResponse::success(resp)))
+}
+
+#[cfg(test)]
+mod status_cache_ttl_tests {
+    use super::status_cache_ttl;
+
+    #[test]
+    fn terminal_statuses_cache_5s() {
+        for s in ["completed", "failed", "reversed"] {
+            assert_eq!(
+                status_cache_ttl(s),
+                5,
+                "terminal status {s} should cache 5s"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_and_unknown_statuses_cache_1s() {
+        for s in ["processing", "pending", "weird"] {
+            assert_eq!(
+                status_cache_ttl(s),
+                1,
+                "transient/unknown status {s} should cache 1s"
+            );
+        }
+    }
 }

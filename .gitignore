@@ -49,8 +49,17 @@ docs/audit/
 docs/codemap/
 docs/superpowers/
 
+# ─── Diagnostics — keep tooling, ignore captured results ──
+# Scripts and analysis docs are tracked; per-run artifacts
+# (matrix logs, latency samples, stats CSVs) stay local.
+diag/*
+!diag/*.ps1
+!diag/*.sh
+!diag/*.md
+
 # ─── Scratch / throwaway ──────────────────────────────────
 .tmp-*
+.env.bak
 
 # ─── Cloud deploy (local-only, not committed) ─────────────
 deploy/cloud/

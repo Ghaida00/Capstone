@@ -100,6 +100,9 @@ function App() {
   const [healthStatus, setHealthStatus] = useState('healthy');
   const [sending, setSending] = useState(false);
   const [bursting, setBursting] = useState(false);
+  const [recentTxns, setRecentTxns] = useState([]);
+  const [txnsOpen, setTxnsOpen] = useState(false);
+  const [txnsLoading, setTxnsLoading] = useState(false);
 
   const tickRef = useRef(0);
   const prevHealthRef = useRef(null);
@@ -368,17 +371,26 @@ function App() {
 
   const onListRecent = useCallback(async () => {
     const t0 = Date.now();
+    // Open the modal immediately so the audience sees the panel react
+    // to the click; it shows a loading state until the rows arrive.
+    setTxnsOpen(true);
+    setTxnsLoading(true);
     try {
       const res = await PL.listRecent(deps, 10);
       const ms = Date.now() - t0;
-      const count = (res.data || []).length;
+      const records = res.data || [];
+      setRecentTxns(records);
       addLog({
         tag: 'info',
-        msg: <>GET /transactions?limit=10 <span className="accent">200</span> {ms}ms · <span className="num">{count}</span> records</>,
+        msg: <>GET /transactions?limit=10 <span className="accent">200</span> {ms}ms · <span className="num">{records.length}</span> records</>,
       });
-      toast(`Listed ${count} recent`, { detail: `${ms}ms` });
+      toast(`Listed ${records.length} recent`, { detail: `${ms}ms` });
     } catch (e) {
+      setRecentTxns([]);
       addLog({ tag: 'warn', msg: <>List failed: {String(e.message)}</> });
+      toast('List failed', { detail: String(e.message).slice(0, 60) });
+    } finally {
+      setTxnsLoading(false);
     }
   }, [addLog, toast]);
 
@@ -497,6 +509,13 @@ function App() {
           </div>
         </div>
       </div>
+
+      <TransactionsModal
+        open={txnsOpen}
+        loading={txnsLoading}
+        txns={recentTxns}
+        onClose={() => setTxnsOpen(false)}
+      />
     </div>
   );
 }

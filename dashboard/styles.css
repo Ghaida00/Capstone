@@ -725,6 +725,94 @@ input { font-family: inherit; }
   to   { opacity: 1; transform: none; }
 }
 
+/* Recent transactions modal */
+.log-tag.err { background: var(--red-bg); color: #8C2F27; border-color: var(--red-line); }
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(24, 24, 26, 0.32);
+  backdrop-filter: blur(2px);
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  z-index: 300;
+  animation: modalFade 140ms ease-out;
+}
+@keyframes modalFade { from { opacity: 0; } to { opacity: 1; } }
+
+.modal {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-pop);
+  width: min(760px, 100%);
+  max-height: min(80vh, 640px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-head {
+  padding: 14px 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+}
+.modal-head-right { display: flex; align-items: center; gap: 12px; }
+
+.modal-close {
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--ink-3);
+  width: 24px; height: 24px;
+  border-radius: 6px;
+  font-size: 16px; line-height: 1;
+  cursor: pointer;
+  display: grid; place-items: center;
+}
+.modal-close:hover { background: var(--surface-sunk); color: var(--ink); }
+
+.modal-body {
+  padding: 8px 18px 18px;
+  overflow-y: auto;
+}
+
+.modal-empty {
+  padding: 32px;
+  text-align: center;
+  color: var(--ink-3);
+  font-size: 13px;
+}
+
+.txn-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.txn-table th {
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  text-align: left;
+  font-weight: 600;
+  color: var(--ink-3);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line-strong);
+}
+.txn-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.txn-table tbody tr:hover { background: var(--surface-2); }
+.txn-table .ta-r { text-align: right; }
+
 /* Scrollbar polish */
 .log::-webkit-scrollbar { width: 8px; }
 .log::-webkit-scrollbar-track { background: transparent; }

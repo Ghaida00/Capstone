@@ -59,9 +59,15 @@ wait_for_primary() {
     # 200 on /primary (see haproxy.cfg). So once the frontend
     # accepts TCP AND pg_isready returns 0, we are truly talking
     # to a writable primary.
+    #
+    # This loop is the REAL gate for "the primary is ready": pg-haproxy
+    # now starts on `service_started` (not `service_healthy`) of the PG
+    # nodes, so HAProxy — and therefore this job — can come up well
+    # before Patroni has bootstrapped a writable primary. 180s covers a
+    # cold `down -v` bootstrap of the larger high-memory profiles.
     echo "[bootstrap-schema] Waiting for writable primary on ${PG_HAPROXY_HOST}:${port}..."
     attempts=0
-    max_attempts=60
+    max_attempts=180
     until pg_isready -h "$PG_HAPROXY_HOST" -p "$port" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q; do
         attempts=$((attempts + 1))
         if [ "$attempts" -ge "$max_attempts" ]; then
