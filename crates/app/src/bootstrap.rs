@@ -686,23 +686,32 @@ pub fn build_router(
 
 /// Apply the standard request-protection stack to a router.
 ///
-/// Order matters: `.layer` wraps outside-in, so the call sequence below
-/// produces this request flow at runtime. The metrics layer is placed
-/// outermost so it observes the FINAL response status — including
-/// 429/503 short-circuits emitted by rate-limit / circuit-breaker /
-/// backpressure inside the protection stack.
+/// Order matters: with sequential `Router::layer` calls the LAST
+/// `.layer()` is the OUTERMOST at runtime (last-added runs first),
+/// so the call sequence below produces this request flow:
 ///
 /// ```text
-///   request → metrics → backpressure → circuit_breaker → rate_limit → auth → handler
+///   request → backpressure → circuit_breaker → rate_limit → auth
+///           → degradation → metrics → handler
 /// ```
+///
+/// Metrics is therefore the INNERMOST layer: requests shed by the
+/// outer layers (backpressure/breaker 503s, rate-limit 429s, auth
+/// 401s, degradation 503s) never reach `http_requests_total` or the
+/// duration histogram. Shed traffic is observed through the dedicated
+/// signals instead: `rate_limited_total`, `backpressure_shed_total`,
+/// `circuit_breaker_state`, `degradation_mode`.
+///
+/// Cross-layer consequence: a degradation-gate 503 propagates back
+/// out THROUGH the circuit-breaker layer, which classifies it as a
+/// failure — sustained write traffic during a read-only window can
+/// trip the breaker and shed reads on the same module router.
 ///
 /// Applied to every `/api/v2/{accounts,transactions,notifications}/*`
 /// sub-router so they all share identical 401/429/503 semantics.
-/// (Originally also applied to the legacy `/api/v1/*` routes; those
-/// were removed in the Step-B v1 cull.) Generic over the router
-/// state so each module's `router()` — which already applied its
-/// own deps state and returns `Router<()>` — composes cleanly under
-/// `nest_service`.
+/// Generic over the router state so each module's `router()` — which
+/// already applied its own deps state and returns `Router<()>` —
+/// composes cleanly under `nest_service`.
 fn apply_protection_stack<S>(
     router: Router<S>,
     auth_state: crate::middleware::auth::AuthState,
@@ -718,10 +727,12 @@ where
         .layer(axum_middleware::from_fn(
             crate::middleware::metrics::metrics_middleware,
         ))
-        // R-9: write-path degradation gate. Placed just inside the
-        // metrics layer so a degraded-mode 503 is still RED-counted,
-        // but outside auth/rate-limit/breaker so a read-only window
-        // sheds writes before they consume any of those budgets.
+        // R-9: write-path degradation gate. Added second, so at
+        // runtime it sits just OUTSIDE metrics (degraded 503s are
+        // not RED-counted; observe via the degradation_mode gauge)
+        // and INSIDE auth/rate-limit/breaker — degraded writes still
+        // consume those budgets, and their 503s feed the breaker's
+        // failure counter on the way out.
         .layer(axum_middleware::from_fn_with_state(
             degradation,
             crate::degradation::degradation_middleware,
