@@ -28,14 +28,14 @@ name: peakload
 #  etcd-1/2/3   (× 3)               0.45     192 M      (0.15 × 3, 64 M × 3)
 #  pg-shard0-node-a/b   (× 2)       3.0      1024 M     (1.5 × 2, 512 M × 2)
 #  pg-shard1-node-a/b   (× 2)*      3.0      1024 M     (* profile shard1)
-#  pgbouncer-shard0/1   (× 2)       0.2      64 M       (0.1 × 2, 32 M × 2)
-#  pg-haproxy                       0.15     64 M
+#  pgbouncer-shard0/1   (× 2)       0.6      64 M       (0.3 × 2, 32 M × 2)
+#  pg-haproxy                       0.5      64 M
 #  redis-master                     1.0      384 M
 #  redis-replica                    1.0      384 M
 #  redis-sentinel-1/2/3 (× 3)       0.3      96 M       (0.1 × 3, 32 M × 3)
 #  rabbitmq                         1.0      512 M
 #  ───────────────────────────────  ───────  ────────
-#  CORE TOTAL                       13.10    4768 M (~4.66 GB)
+#  CORE TOTAL                       13.85    4768 M (~4.66 GB)
 #
 #  Observability (opt-in via COMPOSE_PROFILES):
 #  prometheus                       0.5      256 M
@@ -46,13 +46,13 @@ name: peakload
 #  ───────────────────────────────  ───────  ────────
 #  OBSERVABILITY TOTAL              1.8      1408 M (~1.37 GB)
 #
-#  Profile A FULL  (observability ON)   14.90    6176 M (~6.03 GB)
-#  Profile A LEAN  (observability OFF)  13.10    4768 M (~4.66 GB)
+#  Profile A FULL  (observability ON)   15.65    6176 M (~6.03 GB)
+#  Profile A LEAN  (observability OFF)  13.85    4768 M (~4.66 GB)
 #
 # Other profiles (see .env.example §9 for full var lists):
-#  Profile B  1-shard high-memory       ~12.0    ~5.0 GB
-#  Profile C  2-shard high-capacity     ~16.0    ~7.0 GB
-#  Profile D  3-shard maximum           ~20.0    ~9.0 GB
+#  Profile B  1-shard high-memory       ~12.6    ~5.0 GB
+#  Profile C  2-shard high-capacity     ~16.8    ~7.0 GB
+#  Profile D  3-shard maximum           ~21.0    ~9.0 GB
 #
 # Notes:
 # * Limits, not requests — idle usage is well below these.
@@ -634,7 +634,7 @@ services:
       resources:
         limits:
           memory: ${PGBOUNCER_READ_MEMORY_LIMIT:-32M}
-          cpus: "${PGBOUNCER_CPU_LIMIT:-0.1}"
+          cpus: "${PGBOUNCER_CPU_LIMIT:-0.3}"
 
   pgbouncer-read-shard1:
     <<: *pgbouncer-common
@@ -652,7 +652,7 @@ services:
       resources:
         limits:
           memory: ${PGBOUNCER_READ_MEMORY_LIMIT:-32M}
-          cpus: "${PGBOUNCER_CPU_LIMIT:-0.1}"
+          cpus: "${PGBOUNCER_CPU_LIMIT:-0.3}"
 
   pgbouncer-read-shard2:
     <<: *pgbouncer-common
@@ -670,7 +670,7 @@ services:
       resources:
         limits:
           memory: ${PGBOUNCER_READ_MEMORY_LIMIT:-32M}
-          cpus: "${PGBOUNCER_CPU_LIMIT:-0.1}"
+          cpus: "${PGBOUNCER_CPU_LIMIT:-0.3}"
 
   # ============================================================
   # SHARD 1 — two Patroni-managed nodes (scope peakload-shard1)
@@ -884,7 +884,12 @@ services:
       resources:
         limits:
           memory: ${PG_HAPROXY_MEMORY_LIMIT:-64M}
-          cpus: "${PG_HAPROXY_CPU_LIMIT:-0.15}"
+          # Floor 0.5: every Tier-1 read (/replica frontends) and write
+          # round-trip crosses this one proxy — demand is ~0.2 CPU under
+          # a 2-shard gate load. A limit below demand makes Docker CFS
+          # throttle it in 100 ms periods, injecting ~70-100 ms tails
+          # into every connection through it.
+          cpus: "${PG_HAPROXY_CPU_LIMIT:-0.5}"
 
   # ============================================================
   # db-bootstrap-schema — one-shot init.sql applier
