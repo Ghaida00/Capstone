@@ -90,28 +90,43 @@ Output: `diag/matrix-<timestamp>/summary.csv` + log per profil.
 
 ## Checklist production-ready / plug-and-play
 
-Centang sebelum pameran (profil demo = B):
+Dicentang **2026-06-10** dari T2 full matrix `diag/matrix-20260610-101440`
+(commit 4f948cb, CPU limit baru `PG_HAPROXY_CPU_LIMIT=0.5` /
+`PGBOUNCER_CPU_LIMIT=0.3`, laptop 16-core/16 GB):
 
 ### Modular deploy
-- [ ] `cp .env.profile-<X>.example .env` + ganti password — stack naik tanpa edit compose
-- [ ] `docker compose up -d --wait` — semua healthy tanpa retry manual
-- [ ] `k6/setup-probe.js` — POST + consumer e2e OK
+- [x] `cp .env.profile-<X>.example .env` + ganti password — stack naik tanpa edit compose (4 profil, cold boot via orchestrator)
+- [x] `docker compose up -d --wait` — semua healthy tanpa retry manual (`health=OK` di summary.csv keempat sel)
+- [x] `k6/setup-probe.js` — POST + consumer e2e OK (setiap sel matrix)
 
 ### SLO gate (T1 gate atau T2 full)
-- [ ] `http_req_failed{scenario:sustained_1m_per_hour}` < 5%
-- [ ] `transaction_e2e_ms` p95 < 3s, p99 < 5s
-- [ ] `transactions_e2e_timeout` di bawah batas script
-- [ ] POST p99 < 150ms, balance p95 < 10ms (Profile B)
+- [x] `http_req_failed{scenario:sustained_1m_per_hour}` < 5% — A/B/C 0.00%, D 0.008%
+- [x] `transaction_e2e_ms` p95 < 3s, p99 < 5s — p95 1.62–2.33s, p99 2.57–4.28s
+- [x] `transactions_e2e_timeout` di bawah batas script — A=3, B=0, C=2, D=0 (batas full: 55)
+- [x] POST p99 < 150ms, balance p95 < 10ms — semua profil; balance p95 2.69–5.38ms
 
 ### Edge & pipeline
-- [ ] nginx: **0** baris `no live upstreams` selama k6
-- [ ] RabbitMQ `transactions.process` → 0 setelah load
-- [ ] `transactions_intake_pending` turun ke ~0 setelah load (Grafana `:3001`)
+- [x] nginx: **0** baris `no live upstreams` selama k6 (`nginx_upstream_errors=0` keempat sel)
+- [x] RabbitMQ `transactions.process` → 0 setelah load (e2e sampel terminal semua; intake pending max=1)
+- [x] `transactions_intake_pending` turun ke ~0 setelah load — snapshot Prometheus per sel: max 1
 
-### Regresi silang profil (T1 matrix)
-- [ ] Profile B: 0% http error (baseline demo)
-- [ ] Profile A/C: throughput ~260 tx/s, error < 5%
-- [ ] Profile D: lulus gate jika RAM host ≥ 12 GB; jika tidak, dokumentasikan “lab only”
+### Regresi silang profil (T1 matrix + T2 full)
+- [x] Profile B: 0% http error (baseline demo) — balance p95 2.69ms, e2e p99 3.40s
+- [x] Profile A/C: throughput ~260 tx/s, error 0% — ~234 rb tx per sel @260/s
+- [x] Profile D: **lulus full cert** di host 16 GB (e2e p99 3.98s gate / 4.28s full, 0 timeout) — label “lab only” tidak diperlukan lagi
+
+### Hasil sertifikasi T2 full (matrix-20260610-101440, 15 menit/sel)
+
+| Profil | tx dibuat | balance p95 | e2e p50 / p95 / p99 | e2e timeout | error |
+|--------|-----------|-------------|----------------------|-------------|-------|
+| A (2-shard) | 234.262 @260/s | 2,71 ms | 1,12 s / 2,33 s / 3,66 s | 3 | 0 |
+| B (1-shard) | 234.324 @260/s | 2,69 ms | 1,01 s / 1,62 s / 3,40 s | 0 | 0 |
+| C (2-shard hi-mem) | 234.324 @260/s | 5,38 ms | 1,04 s / 1,95 s / 2,57 s | 2 | 0 |
+| D (3-shard) | 234.195 @260/s | 3,75 ms | 1,22 s / 2,24 s / 4,28 s | 0 | 41 (0,008%) |
+
+Catatan D: 41 error = satu burst ~1,5 detik (stall level host / memory
+pressure Docker Desktop) yang dilepas bersih oleh pool-acquire timeout 1 s —
+tanpa kaskade, nginx 0 upstream error. Lihat risk register untuk detail.
 
 ---
 
@@ -121,7 +136,8 @@ Centang sebelum pameran (profil demo = B):
 |--------|-------------|-------|
 | k6 5% fail, create 94% | nginx 502 | `docker logs peakload-nginx \| findstr upstream` |
 | e2e p95 > 3s, timeout sedikit | intake/consumer backlog | `transactions_intake_pending`, queue RabbitMQ |
-| C/D e2e lambat, B OK | fsync disk shared (laptop) | `diag/sample-stats.sh`, B-vs-C doc |
+| Tail latency menumpuk di ~100 ms (atau kelipatannya) | CFS throttling — `cpus:` limit < demand kontainer | `nr_throttled` di `/sys/fs/cgroup/cpu.stat` kontainer; probe direct-vs-proxy `diag/read-tail-probe.sh` |
+| Burst 500 ~1 detik serentak lintas kontainer | host pause (memory pressure Docker Desktop) | log app "pool timed out" + Patroni conn-reset di detik yang sama |
 | Port 8080 bind error | Windows excluded range | `netsh … excludedportrange` |
 
 ---
