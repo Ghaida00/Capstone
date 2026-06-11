@@ -1,0 +1,67 @@
+<!doctype html><html lang="id"><head><meta charset="utf-8">
+<title>Peakload — IcePanel-style Explorer</title><style>
+:root{ --bg:#16181d; --chrome:#1e2128; --chrome2:#262a33; --txt:#e8eaf0; --mut:#9aa3b2;
+  --canvas:#f4f5f7; --card:#ffffff; --line:#8b93a3; --accent:#3d7eff;
+  --c-client:#5b6472; --c-edge:#4f7cc0; --c-app:#6470d6; --c-redis:#c96666;
+  --c-mq:#cf8a1d; --c-pg:#3f8f5f; --c-obs:#8a5fd6; --c-infra:#7a8294;
+  --p-req:#3d7eff; --p-ok:#2fbf71; --p-err:#ff5d5d; --p-async:#f0a832; }
+*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);
+  font:14px/1.45 "Segoe UI",system-ui,sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+.topbar{height:52px;background:var(--chrome);display:flex;align-items:center;gap:10px;padding:0 14px;
+  border-bottom:1px solid #000}
+.btn{background:var(--chrome2);border:1px solid #343945;color:var(--txt);border-radius:8px;
+  padding:5px 12px;cursor:pointer;font-size:13px} .btn:hover{border-color:var(--accent)}
+.viewer{flex:1;display:flex;min-height:0;padding:14px;gap:14px}
+.canvas-card{flex:1;position:relative;background:var(--canvas);border-radius:14px;overflow:hidden;
+  box-shadow:0 8px 40px rgba(0,0,0,.5)}
+#stage{position:absolute;left:0;top:0;transform-origin:0 0}
+#wires{position:absolute;left:0;top:0;overflow:visible}
+#fx{position:absolute;inset:0;pointer-events:none}
+.flowbar{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);max-width:680px;display:none}
+</style></head><body>
+<header class="topbar">
+  <strong>Peakload</strong><span style="color:var(--mut)">IcePanel-style explorer</span>
+  <button class="btn" id="btnHome" title="Home">⌂</button>
+  <button class="btn" id="btnBack">←</button><button class="btn" id="btnFwd">→</button>
+  <span id="crumb" style="color:var(--mut)">Diagrams › Context</span>
+  <span style="flex:1"></span>
+  <select class="btn" id="flowSel"><option value="">Flows…</option></select>
+  <button class="btn" id="btnPlay">▶</button><button class="btn" id="btnStepB">◀ step</button>
+  <button class="btn" id="btnStepF">step ▶</button>
+  <label class="btn" style="display:flex;gap:6px;align-items:center">live
+    <input type="checkbox" id="liveTgl"><input type="range" id="liveRate" min="1" max="40" value="8" style="width:90px"></label>
+</header>
+<div class="viewer">
+  <div class="canvas-card" id="card">
+    <div id="stage"><svg id="wires"></svg><div id="nodes"></div></div>
+    <canvas id="fx"></canvas>
+    <div class="flowbar" id="flowbar"></div>
+  </div>
+  <aside id="inspector" style="display:none;width:300px"></aside>
+</div>
+<script>
+"use strict";
+/* ═══ CAMERA ═══ */
+const cam = (() => {
+  let x=0, y=0, scale=1; const stage=document.getElementById("stage");
+  const apply=()=>{ stage.style.transform=`translate(${x}px,${y}px) scale(${scale})`; };
+  const card=document.getElementById("card");
+  let drag=null;
+  card.addEventListener("mousedown",e=>{ if(e.target.closest(".node"))return; drag={mx:e.clientX,my:e.clientY,x,y}; });
+  window.addEventListener("mousemove",e=>{ if(!drag)return; x=drag.x+e.clientX-drag.mx; y=drag.y+e.clientY-drag.my; apply(); });
+  window.addEventListener("mouseup",()=>drag=null);
+  card.addEventListener("wheel",e=>{ e.preventDefault();
+    const r=card.getBoundingClientRect(), px=e.clientX-r.left, py=e.clientY-r.top;
+    const k=Math.exp(-e.deltaY*0.0012), ns=Math.min(2.5,Math.max(0.15,scale*k));
+    x=px-(px-x)*(ns/scale); y=py-(py-y)*(ns/scale); scale=ns; apply(); },{passive:false});
+  return {
+    get:()=>({x,y,scale}),
+    set:(nx,ny,ns)=>{x=nx;y=ny;scale=ns;apply();},
+    fit:(w,h)=>{ const r=card.getBoundingClientRect();
+      const s=Math.min((r.width-80)/w,(r.height-80)/h,1.4);
+      x=(r.width-w*s)/2; y=(r.height-h*s)/2; scale=s; apply(); },
+    toScreen:(wx,wy)=>({x:wx*scale+x, y:wy*scale+y}),
+  };
+})();
+window.icepanel = { cam };
+</script></body></html>
