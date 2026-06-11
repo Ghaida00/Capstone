@@ -5,7 +5,11 @@ you what the system is, how the pieces fit, and where to look for
 deeper detail. For *why* a given choice was made, follow the link to
 the relevant [Architecture Decision Record](adr/). For a clickable
 step-by-step trace of each runtime flow, open
-[`docs/codemap/codemap.html`](codemap/codemap.html) in a browser.
+[`docs/codemap/codemap.html`](codemap/codemap.html) in a browser; for
+an interactive diagram of the whole system (topology, protection
+stack, write/read paths, HA, observability — every component clickable
+with verified facts and code refs), open
+[`docs/architecture/architecture.html`](architecture/architecture.html).
 
 > **Audience:** anyone joining the project. Read top to bottom once;
 > refer back to specific sections later.
@@ -423,6 +427,7 @@ diag/                                   regression-hunt tooling (profile matrix)
 deploy/                                 deployment assets
 docs/
 ├── architecture.md                     ← this file
+├── architecture/architecture.html     interactive architecture showpiece
 ├── architecture/system-overview.mmd    reusable whole-system Mermaid
 ├── architecture/module-template/       copy-this skeleton for new modules
 ├── codemap/codemap.html                interactive per-flow code map
@@ -439,6 +444,7 @@ docs/
 
 | Question                                              | Read                                                 |
 |-------------------------------------------------------|------------------------------------------------------|
+| What does the whole system look like, interactively?  | [`docs/architecture/architecture.html`](architecture/architecture.html) |
 | How does *this request flow* work, line by line?      | [`docs/codemap/codemap.html`](codemap/codemap.html)  |
 | What does *this module* do?                           | The crate's `README.md` (one-page card)              |
 | Why is *this thing* the way it is?                    | [`docs/adr/`](adr/)                                  |
@@ -447,4 +453,3 @@ docs/
 | How do I run the stack?                               | Root [`README.md`](../README.md)                     |
 | How does failover actually work?                      | [ADR-0005](adr/0005-patroni-over-pg-auto-failover.md) + [ADR-0006](adr/0006-haproxy-primary-routing.md) |
 | Something is on fire                                  | [`docs/runbooks/`](runbooks/)                        |
-```
