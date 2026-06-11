@@ -492,7 +492,9 @@ const diagrams = {
     edges: [
       { from: "user",     to: "nginx",   label: ":8080" },
       { from: "nginx",    to: "app",     label: "proxy · X-Real-IP" },
-      { from: "app",      to: "redism",  fromSide: "left", label: "cache + SETNX" },
+      // app→redism: drop below jobs (bottom=278) at x=450, then go left to redism, avoiding jobs
+      { from: "app",      to: "redism",  fromSide: "bottom", toSide: "top",
+        via: [{x: 450, y: 320}, {x: 190, y: 320}],                        label: "cache + SETNX" },
       { from: "redism",   to: "redisr",  kind: "dashed", label: "async repl" },
       { from: "sentinels",to: "redism",  kind: "dashed", fromSide: "left", toSide: "left", label: "monitor / promote" },
       { from: "app",      to: "pgb",     label: "writes" },
@@ -500,11 +502,15 @@ const diagrams = {
       { from: "app",      to: "haproxy", kind: "dashed", fromSide: "right", toSide: "right", label: "reads :5010/:5011" },
       { from: "haproxy",  to: "shard0" },
       { from: "haproxy",  to: "shard1" },
-      { from: "etcd",     to: "shard0",  kind: "dashed", label: "leader lease" },
+      // etcd→shard0: route below shard1 (bottom=791) to avoid crossing it
+      { from: "etcd",     to: "shard0",  kind: "dashed", fromSide: "bottom", toSide: "bottom",
+        via: [{x: 550, y: 860}],                                           label: "leader lease" },
       { from: "etcd",     to: "shard1",  kind: "dashed", label: "leader lease" },
       { from: "app",      to: "rabbit",  kind: "dashed", fromSide: "right", toSide: "top", label: "publish / consume (prefetch 200)" },
       { from: "rabbit",   to: "dlq",     kind: "danger", label: "poison via DLX" },
-      { from: "jobs",     to: "haproxy", kind: "dashed", label: "one-shot via primary fe" },
+      // jobs→haproxy: route via x=460 corridor (between jobs.right=400 and pgb.left=560) to avoid pgb
+      { from: "jobs",     to: "haproxy", kind: "dashed", fromSide: "right", toSide: "left",
+        via: [{x: 460, y: 600}],                                           label: "one-shot via primary fe" },
       { from: "obssys",   to: "app",     kind: "obs", fromSide: "left", toSide: "right", label: "scrape /metrics · OTLP" },
     ],
     aliases: { "*": "app" },
@@ -536,17 +542,21 @@ const diagrams = {
       // ── left lane (shed responses) ──────────────────────────────────────
       shed:     { x: 100,  y: 495,  w: 240 },
       // ── right lane (async workers) ─ x=1060, corridor right of x=1340 ──
+      // Order follows the data flow chain: intake→pubout→consumer→bus→cacheinv→notifd→xshard
+      // Adjacent ordering eliminates consumer→bus and bus→cacheinv crossings.
       intake:   { x: 1060, y: 250,  w: 280 },
-      pubout:   { x: 1060, y: 370,  w: 280 },
-      consumer: { x: 1060, y: 490,  w: 280 },
-      xshard:   { x: 1060, y: 610,  w: 280 },
-      bus:      { x: 1060, y: 730,  w: 280 },
-      cacheinv: { x: 1060, y: 850,  w: 280 },
-      notifd:   { x: 1060, y: 970,  w: 280 },
-      // ── far-right column (external deps) ─ x=1440, clear of worker lane ─
-      g_rabbit: { x: 1450, y: 370,  w: 240 },
-      g_pg:     { x: 1450, y: 560,  w: 240 },
-      g_redis:  { x: 1450, y: 1050, w: 240 },
+      pubout:   { x: 1060, y: 390,  w: 280 },
+      consumer: { x: 1060, y: 510,  w: 280 },
+      bus:      { x: 1060, y: 630,  w: 280 },
+      cacheinv: { x: 1060, y: 750,  w: 280 },
+      notifd:   { x: 1060, y: 870,  w: 280 },
+      xshard:   { x: 1060, y: 990,  w: 280 },
+      // ── far-right column (external deps) ─ x=1450, clear of worker lane ─
+      // g_rabbit and g_pg sit beside consumer/xshard rows; g_redis above g_rabbit
+      // so the g_redis→intake riser stays in the far-right corridor (x≈1390-1450).
+      g_redis:  { x: 1450, y: 120,  w: 240 },
+      g_rabbit: { x: 1450, y: 430,  w: 240 },
+      g_pg:     { x: 1450, y: 600,  w: 240 },
     },
     edges: [
       { from: "g_nginx",  to: "wrap" },
@@ -562,22 +572,34 @@ const diagrams = {
       { from: "sl1",      to: "shed",   kind: "danger", fromSide: "left", toSide: "top",    label: "503" },
       { from: "sl3",      to: "shed",   kind: "danger", fromSide: "left", toSide: "right",  label: "429" },
       { from: "sl5",      to: "shed",   kind: "danger", fromSide: "left", toSide: "bottom", label: "503 writes" },
-      // idemp → g_redis: right through corridor between center and right lanes, then g_redis → intake up the far-right corridor
-      { from: "idemp",    to: "g_redis",                fromSide: "right", toSide: "left",  label: "SETNX + LPUSH" },
-      { from: "g_redis",  to: "intake",                 fromSide: "top",   toSide: "right", label: "pending list" },
-      // intake/pubout → external deps: rightward hop into far-right column — no worker cards in the way
+      // idemp → g_redis: go right, then down below worker column, then right to x=1395 corridor,
+      // then up to g_redis (which sits above all worker/depot cards at y=120).
+      // via hugs the far-right corridor so no worker card is crossed.
+      { from: "idemp",    to: "g_redis",                fromSide: "right", toSide: "left",
+        via: [{x: 1395, y: 1150}, {x: 1395, y: 150}],                                       label: "SETNX + LPUSH" },
+      // g_redis→intake: g_redis bottom → intake right; both are in far-right / worker area,
+      // short downward+leftward hop that stays above g_rabbit (y=430).
+      { from: "g_redis",  to: "intake",                 fromSide: "bottom", toSide: "right", label: "pending list" },
+      // intake → g_rabbit: direct rightward; intake → g_pg: via waypoint below g_rabbit
       { from: "intake",   to: "g_rabbit",               fromSide: "right", toSide: "left",  label: "publish" },
-      { from: "intake",   to: "g_pg",                   fromSide: "right", toSide: "top",   label: "durable INSERT" },
+      { from: "intake",   to: "g_pg",                   fromSide: "right", toSide: "top",
+        via: [{x: 1395, y: 580}],                                                            label: "durable INSERT" },
       { from: "pubout",   to: "g_rabbit", kind: "dashed", fromSide: "right", toSide: "left" },
       { from: "g_rabbit", to: "consumer",               fromSide: "left",  toSide: "right", label: "deliver ≤200" },
       { from: "consumer", to: "g_pg",                   fromSide: "right", toSide: "left",  label: "apply batch" },
       { from: "consumer", to: "bus" },
       { from: "xshard",   to: "g_pg",                   fromSide: "right", toSide: "left" },
-      { from: "xshard",   to: "bus",     kind: "dashed" },
+      // xshard→bus goes UP past notifd+cacheinv — route through left corridor (x≈940)
+      { from: "xshard",   to: "bus",     kind: "dashed", fromSide: "left", toSide: "left",
+        via: [{x: 940, y: 660}] },
       { from: "bus",      to: "cacheinv" },
-      { from: "bus",      to: "notifd" },
-      // cacheinv → g_redis: rightward through far-right corridor
-      { from: "cacheinv", to: "g_redis", kind: "danger", fromSide: "right", toSide: "top",  label: "DEL" },
+      // bus→notifd skips cacheinv — route through left corridor (x≈940)
+      { from: "bus",      to: "notifd",                 fromSide: "left",  toSide: "left",
+        via: [{x: 940, y: 900}] },
+      // cacheinv → g_redis: go right, past the depot column, then up to g_redis top.
+      // Route via x=1720 (right of depot right edge=1690) to avoid clipping g_pg and g_rabbit.
+      { from: "cacheinv", to: "g_redis", kind: "danger", fromSide: "right", toSide: "right",
+        via: [{x: 1720, y: 780}, {x: 1720, y: 150}],                                        label: "DEL" },
     ],
     aliases: {
       "*":      "router",
@@ -626,8 +648,32 @@ function edgePath(a, b, e) {
   const [x1, y1] = side(a, fs);
   const [x2, y2] = side(b, ts);
   const n = { top:[0,-1], bottom:[0,1], left:[-1,0], right:[1,0] };
-  const d = Math.max(40, Math.hypot(x2 - x1, y2 - y1) * 0.4);
-  return `M${x1},${y1} C${x1+n[fs][0]*d},${y1+n[fs][1]*d} ${x2+n[ts][0]*d},${y2+n[ts][1]*d} ${x2},${y2}`;
+  const tension = Math.max(40, Math.hypot(x2 - x1, y2 - y1) * 0.4);
+
+  // Support optional via waypoints: e.via = [{x,y}, ...].
+  // Each waypoint is a pass-through point; tangents are axis-aligned (horizontal
+  // departure/arrival) so the path hugs corridors cleanly. We build a chain of
+  // cubic Bézier segments: start→via[0]→via[1]→…→end.
+  if (e.via && e.via.length) {
+    const pts = [{x: x1, y: y1, nx: n[fs][0], ny: n[fs][1]},
+                 ...e.via.map(v => ({x: v.x, y: v.y, nx: 0, ny: 0})),
+                 {x: x2, y: y2, nx: n[ts][0], ny: n[ts][1]}];
+    let d = `M${x1},${y1}`;
+    for (let i = 1; i < pts.length; i++) {
+      const p0 = pts[i - 1], p1 = pts[i];
+      const segLen = Math.max(40, Math.hypot(p1.x - p0.x, p1.y - p0.y) * 0.45);
+      // Outgoing tangent from p0
+      const ox = p0.nx !== 0 || p0.ny !== 0 ? p0.nx * segLen : (p1.x - p0.x) * 0.5;
+      const oy = p0.nx !== 0 || p0.ny !== 0 ? p0.ny * segLen : 0;
+      // Incoming tangent into p1
+      const ix = p1.nx !== 0 || p1.ny !== 0 ? p1.nx * segLen : (p0.x - p1.x) * 0.5;
+      const iy = p1.nx !== 0 || p1.ny !== 0 ? p1.ny * segLen : 0;
+      d += ` C${p0.x + ox},${p0.y + oy} ${p1.x + ix},${p1.y + iy} ${p1.x},${p1.y}`;
+    }
+    return d;
+  }
+
+  return `M${x1},${y1} C${x1+n[fs][0]*tension},${y1+n[fs][1]*tension} ${x2+n[ts][0]*tension},${y2+n[ts][1]*tension} ${x2},${y2}`;
 }
 
 function renderDiagram(diagramId) {
