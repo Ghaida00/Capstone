@@ -1,0 +1,64 @@
+{
+  "project": {
+    "title": "Optimasi Skalabilitas Transaksi Perbankan untuk Mengatasi Exploding User Data melalui Peak Load Management dan Read/Write Separation Berbasis Rust",
+    "brand": "Peakload",
+    "teamName": "FullTIm",
+    "topic": "B.4 Exploding User Data Scalabilities",
+    "group": 8,
+    "partner": "Bank X (studi kasus)",
+    "year": 2026,
+    "faculty": "Fakultas Ilmu Komputer, Universitas Brawijaya",
+    "repository": "https://github.com/Ghaida00/Capstone",
+    "wordpressSlug": "optimasi-skalabilitas-transaksi-perbankan-peakload-management-read-write-separation-rust",
+    "wordpressTags": ["capstone"]
+  },
+  "advisor": {
+    "name": "Ir. Lutfi Fanani, S.Kom., M.T., M.Sc.",
+    "shortName": "Lutfi Fanani",
+    "title": "Dosen Pembimbing Capstone",
+    "department": "Departemen Teknik Informatika, FILKOM UB",
+    "email": "lutfifanani@ub.ac.id",
+    "profileUrl": "https://filkom.ub.ac.id/profile/dosen/lutfi.fanani"
+  },
+  "members": [
+    {
+      "name": "Ghaida Nayla",
+      "nim": "235150700111001",
+      "program": "Teknik Informatika",
+      "role": "Technical Lead & System Architect",
+      "contributionPct": 34,
+      "email": ["ghaidanayla@student.ub.ac.id"],
+      "bio": "Menentukan tech stack dan arsitektur sistem. Infrastruktur Docker Compose full-stack dengan 4 profil skala (1–3 shard). Read/write separation via HAProxy /primary & /replica. Database HA Patroni & tuning performa consumer. Membangun demo ops dashboard web secara penuh. Quality assurance.",
+      "quote": ""
+    },
+    {
+      "name": "Lovely Ito Panjaitan",
+      "nim": "235150700111012",
+      "program": "Teknik Informatika",
+      "role": "Backend API Engineer",
+      "contributionPct": 33,
+      "email": ["lovelyito@student.ub.ac.id"],
+      "bio": "Implementasi endpoint API Rust: GET balance dengan Redis caching, GET status shard-aware, POST transactions dengan idempotency, consumer batch debit-credit. POST /api/v2/accounts dengan validasi, auto-generate account number, HTTP 201/409/400.",
+      "quote": ""
+    },
+    {
+      "name": "Verda Aulia Setri",
+      "nim": "235150701111014",
+      "program": "Teknik Informatika",
+      "role": "Observability & Performance Engineer",
+      "contributionPct": 33,
+      "email": ["verdaaulia@student.ub.ac.id"],
+      "bio": "Perancang dan eksekutor k6 load testing simulasi 1 juta txn/jam. Analisis latensi, throughput, cross-shard consistency. Validasi poison message isolation, DLQ, fail-fast validation. Monitoring infrastruktur Docker. Design banner proyek.",
+      "quote": ""
+    }
+  ],
+  "metrics": {
+    "throughputPerHour": "~1 juta transaksi/jam",
+    "httpP95Ms": "4,43",
+    "balanceP95Ms": "4,68",
+    "errorRate": "0,00%",
+    "httpRequestsTotal": 512104,
+    "unitTestsPass": 152,
+    "containersHealthy": 23
+  }
+}

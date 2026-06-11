@@ -10,6 +10,10 @@ an interactive diagram of the whole system (topology, protection
 stack, write/read paths, HA, observability — every component clickable
 with verified facts and code refs), open
 [`docs/architecture/architecture.html`](architecture/architecture.html).
+For an **animated traffic tour** (unified mega map — topology, protection
+stack, write/read paths on one canvas; traffic scenarios with step
+narration and auto-zoom into containers), open
+[`docs/architecture/architecture-tour.html`](architecture/architecture-tour.html).
 
 > **Audience:** anyone joining the project. Read top to bottom once;
 > refer back to specific sections later.
@@ -428,6 +432,7 @@ deploy/                                 deployment assets
 docs/
 ├── architecture.md                     ← this file
 ├── architecture/architecture.html     interactive architecture showpiece
+├── architecture/architecture-tour.html traffic simulation tour (derived copy)
 ├── architecture/system-overview.mmd    reusable whole-system Mermaid
 ├── architecture/module-template/       copy-this skeleton for new modules
 ├── codemap/codemap.html                interactive per-flow code map
@@ -445,6 +450,7 @@ docs/
 | Question                                              | Read                                                 |
 |-------------------------------------------------------|------------------------------------------------------|
 | What does the whole system look like, interactively?  | [`docs/architecture/architecture.html`](architecture/architecture.html) |
+| How does a request flow through the stack (animated)? | [`docs/architecture/architecture-tour.html`](architecture/architecture-tour.html) |
 | How does *this request flow* work, line by line?      | [`docs/codemap/codemap.html`](codemap/codemap.html)  |
 | What does *this module* do?                           | The crate's `README.md` (one-page card)              |
 | Why is *this thing* the way it is?                    | [`docs/adr/`](adr/)                                  |

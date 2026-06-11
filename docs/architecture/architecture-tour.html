@@ -1,0 +1,4412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Peakload Capstone — Architecture Tour</title>
+<style>
+  :root {
+    --bg: #0b0d12;
+    --bg-2: #11141b;
+    --panel: #15191f;
+    --panel-2: #1b1f27;
+    --panel-3: #232830;
+    --border: #262b34;
+    --border-strong: #353c47;
+    --text: #e8edf4;
+    --text-2: #c2cad6;
+    --muted: #8a93a1;
+    --dim: #5d6573;
+    --accent: #6ea8fe;
+    --accent-2: #4f7cc0;
+    --success: #7ee787;
+    --warn: #f0b341;
+    --danger: #ff7b72;
+    --code-bg: #0f1218;
+    --code-text: #d6dde7;
+    --kw: #ff9bd2;
+    --str: #a5e1b8;
+    --fn: #79c0ff;
+    --cmt: #5d6573;
+    --num: #f0b341;
+    --mq: #d2a8ff;
+    --obs: #56d4dd;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 13.5px/1.5 -apple-system, "Segoe UI", "Inter", Roboto, system-ui, sans-serif;
+    display: grid;
+    grid-template-columns: 360px 1fr;
+    grid-template-rows: 56px 1fr;
+    grid-template-areas:
+      "header header"
+      "sidebar canvas";
+    overflow: hidden;
+  }
+
+  /* ────────────────────────────────────────────── header */
+  header {
+    grid-area: header;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, var(--panel) 0%, var(--bg-2) 100%);
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    gap: 14px;
+  }
+  header .logo {
+    width: 28px; height: 28px;
+    border-radius: 7px;
+    background: linear-gradient(135deg, var(--accent), #b888f6);
+    display: grid; place-items: center;
+    font-weight: 800;
+    color: #0b0d12;
+    font-size: 13px;
+  }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: 0.1px; }
+  header h1 small { color: var(--muted); font-weight: 400; margin-left: 8px; font-size: 12px; }
+  header .grow { flex: 1; }
+  header .meta {
+    color: var(--muted);
+    font-size: 11.5px;
+    font-family: ui-monospace, "JetBrains Mono", Consolas, monospace;
+    padding: 5px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-2);
+    cursor: pointer;
+    text-decoration: none;
+  }
+  header .meta:hover { border-color: var(--border-strong); color: var(--text-2); }
+
+  /* ── C4 zoom (IcePanel-style) */
+  .c4-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 10px 14px;
+    margin-bottom: 8px;
+    background: linear-gradient(180deg, rgba(110,168,254,0.08), rgba(110,168,254,0.02));
+    border: 1px solid rgba(110,168,254,0.22);
+    border-radius: 10px;
+  }
+  .c4-level-pills { display: flex; gap: 4px; flex-shrink: 0; }
+  .c4-pill {
+    font: 600 10px ui-monospace, Consolas, monospace;
+    letter-spacing: 0.4px;
+    padding: 4px 8px;
+    border-radius: 5px;
+    border: 1px solid var(--border);
+    background: var(--bg-2);
+    color: var(--dim);
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .c4-pill:hover { border-color: var(--accent); color: var(--text-2); }
+  .c4-pill.active { border-color: var(--accent); background: rgba(110,168,254,0.15); color: var(--accent); }
+  .c4-pill.done { color: var(--muted); }
+  .c4-crumb { flex: 1; min-width: 120px; font-size: 12px; color: var(--text-2); }
+  .c4-crumb a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  .c4-crumb a:hover { text-decoration: underline; }
+  .c4-crumb .sep { color: var(--dim); margin: 0 6px; }
+  .c4-up-btn {
+    font-size: 11px;
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border-strong);
+    background: var(--panel-2);
+    color: var(--text-2);
+    cursor: pointer;
+  }
+  .c4-up-btn:hover:not(:disabled) { border-color: var(--warn); color: var(--warn); }
+  .c4-up-btn:disabled { opacity: 0.4; cursor: default; }
+
+  /* ── IcePanel-style C4 explorer (viewer card) */
+  #canvas.ice-canvas-active {
+    padding: 10px 12px 12px;
+    overflow: hidden;
+    background: var(--bg);
+  }
+  .ice-viewer {
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 68px);
+    min-height: 0;
+    background: #f4f6f9;
+    border: 1px solid #d5dde8;
+    border-radius: 18px;
+    overflow: hidden;
+    box-shadow: 0 18px 40px rgba(0, 0, 0, 0.28), 0 0 0 1px rgba(255, 255, 255, 0.04);
+  }
+  .ice-topbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    padding: 9px 12px;
+    flex-shrink: 0;
+    background: #fff;
+    border-bottom: 1px solid #e3e9f1;
+  }
+  .ice-nav-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 2px;
+    border-radius: 9px;
+    background: #f1f5f9;
+    border: 1px solid #e2e8f0;
+  }
+  .ice-nav-btn {
+    font: 600 11px ui-monospace, Consolas, monospace;
+    padding: 5px 9px;
+    border-radius: 7px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: #475569;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  .ice-nav-btn:hover:not(:disabled) { background: #fff; color: #1e40af; border-color: #cbd5e1; }
+  .ice-nav-btn:disabled { opacity: 0.35; cursor: default; }
+  .ice-crumb {
+    flex: 1;
+    min-width: 160px;
+    font-size: 12px;
+    color: #64748b;
+    padding: 0 4px;
+  }
+  .ice-crumb a { color: #2563eb; cursor: pointer; text-decoration: none; font-weight: 500; }
+  .ice-crumb a:hover { text-decoration: underline; }
+  .ice-crumb .sep { color: #cbd5e1; margin: 0 4px; }
+  .ice-crumb strong { color: #0f172a; font-weight: 600; }
+  .ice-scope-meta {
+    font-size: 11px;
+    color: #64748b;
+    white-space: nowrap;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+  }
+  .ice-scope-meta .lvl {
+    display: inline-block;
+    font: 700 10px ui-monospace, Consolas, monospace;
+    color: #1d4ed8;
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    border-radius: 999px;
+    padding: 1px 7px;
+    margin-right: 6px;
+  }
+  .canvas-viewport.ice-mode {
+    flex: 1;
+    min-height: 0;
+    height: auto;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    background-color: #eef2f7;
+    background-image: radial-gradient(circle, #cbd5e1 0.85px, transparent 0.85px);
+    background-size: 22px 22px;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+  }
+  .canvas-viewport.ice-mode.is-panning { cursor: grabbing; }
+  .canvas-viewport.ice-mode .pan-hint {
+    left: 50%;
+    right: auto;
+    bottom: 12px;
+    transform: translateX(-50%);
+    color: #64748b;
+    background: rgba(255, 255, 255, 0.92);
+    border-color: #d5dde8;
+    box-shadow: 0 4px 14px rgba(15, 23, 42, 0.08);
+    font-size: 10px;
+    padding: 5px 12px;
+  }
+  .ice-footer {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    background: #fff;
+    border-top: 1px solid #e3e9f1;
+  }
+  .ice-footer .chip {
+    font-size: 10px;
+    font-family: ui-monospace, Consolas, monospace;
+    color: #475569;
+    border: 1px solid #e2e8f0;
+    background: #f8fafc;
+    border-radius: 999px;
+    padding: 3px 9px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .ice-footer .dot { width: 7px; height: 7px; border-radius: 999px; display: inline-block; }
+  .ice-diagram {
+    position: relative;
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+    overflow: visible;
+  }
+  .ice-boundary {
+    position: absolute;
+    border: 2px solid #b6c3d4;
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.82);
+    pointer-events: none;
+    z-index: 0;
+    box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05);
+  }
+  .ice-boundary-label {
+    position: absolute;
+    top: -12px;
+    left: 18px;
+    padding: 3px 12px;
+    font: 600 11px ui-monospace, Consolas, monospace;
+    letter-spacing: 0.15px;
+    color: #334155;
+    background: #fff;
+    border: 1px solid #cbd5e1;
+    border-radius: 999px;
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.06);
+  }
+  .ice-boundary-sub {
+    position: absolute;
+    top: 12px;
+    left: 18px;
+    font-size: 10px;
+    color: #64748b;
+  }
+  .ice-stage .plane-label {
+    color: #94a3b8;
+    background: rgba(255, 255, 255, 0.72);
+    padding: 2px 8px;
+    border-radius: 6px;
+    border: 1px solid rgba(203, 213, 225, 0.8);
+  }
+  .ice-stage .node {
+    z-index: 2;
+    background: #fff;
+    border: 1px solid #d7dee8;
+    border-left-width: 4px;
+    border-radius: 12px;
+    padding: 10px 12px 11px;
+    min-height: 58px;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05), 0 8px 20px rgba(15, 23, 42, 0.04);
+  }
+  .ice-stage .node:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.08), 0 14px 28px rgba(15, 23, 42, 0.08);
+    border-color: #93b4e8;
+  }
+  .ice-stage .node .t {
+    color: #0f172a;
+    font-size: 13px;
+    font-weight: 650;
+    line-height: 1.3;
+    font-family: inherit;
+  }
+  .ice-stage .node .t .step {
+    background: #f1f5f9;
+    color: #475569;
+    border-color: #dbe3ee;
+    font-size: 9px;
+  }
+  .ice-stage .node .s {
+    color: #64748b;
+    font-size: 10px;
+    line-height: 1.35;
+    margin-top: 4px;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .ice-stage .node.ghost {
+    background: rgba(255, 255, 255, 0.62);
+    border-style: dashed;
+    opacity: 0.92;
+  }
+  .ice-stage .node.sel {
+    outline: 2px solid #3b82f6;
+    outline-offset: 2px;
+    box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.25), 0 10px 24px rgba(15, 23, 42, 0.08);
+  }
+  .ice-stage .diagram .wires path { stroke-width: 1.8; }
+  .ice-stage .diagram .wires path.flow { stroke: #3b82f6; }
+  .ice-stage .diagram .wires path.dashed { stroke: #94a3b8; opacity: 0.9; }
+  .ice-stage .diagram .wires path.danger { stroke: #ef4444; }
+  .ice-stage .diagram .wires path.obs { stroke: #06b6d4; }
+  .ice-stage .diagram .wires text {
+    fill: #475569;
+    stroke: #eef2f7;
+    stroke-width: 5px;
+    font-size: 10px;
+  }
+  .node.ice-drillable { cursor: pointer; }
+  .ice-drill-btn {
+    position: absolute;
+    right: 8px;
+    top: 8px;
+    width: 26px;
+    height: 26px;
+    border-radius: 999px;
+    border: 1px solid #93c5fd;
+    background: #fff;
+    color: #2563eb;
+    font-size: 16px;
+    font-weight: 700;
+    line-height: 1;
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    z-index: 3;
+    box-shadow: 0 2px 6px rgba(37, 99, 235, 0.15);
+  }
+  .ice-drill-btn:hover { background: #eff6ff; border-color: #3b82f6; }
+  .node.is-system {
+    border-width: 2px;
+    border-color: #60a5fa;
+    min-height: 150px;
+    padding-right: 38px;
+    background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+  }
+
+  .sidebar-section-title {
+    font: 600 10px ui-monospace, Consolas, monospace;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--accent);
+    padding: 8px 12px 4px;
+  }
+  .view-card.c4-card .num { color: var(--warn); }
+  .node.c4-drillable { cursor: zoom-in; position: relative; }
+  .node.c4-drillable::after {
+    content: "⤵ double-click";
+    position: absolute;
+    right: 8px;
+    bottom: 4px;
+    font: 9px ui-monospace, Consolas, monospace;
+    color: var(--accent);
+    opacity: 0.65;
+  }
+  .node.c4-drillable:hover {
+    box-shadow: 0 0 0 1px rgba(110,168,254,0.45), 0 0 20px rgba(110,168,254,0.12);
+  }
+
+  /* ────────────────────────────────────────────── sidebar */
+  aside {
+    grid-area: sidebar;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .search-wrap { padding: 14px; border-bottom: 1px solid var(--border); position: relative; }
+  .search-input {
+    width: 100%;
+    background: var(--bg-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 9px 12px 9px 32px;
+    font: inherit;
+    font-size: 12.5px;
+  }
+  .search-input:focus { outline: none; border-color: var(--accent); }
+  .search-wrap::before {
+    content: "🔍";
+    position: absolute;
+    left: 24px; top: 22px;
+    opacity: 0.4;
+    font-size: 12px;
+  }
+  .view-list { flex: 1; overflow-y: auto; padding: 10px; }
+  .view-list::-webkit-scrollbar { width: 8px; }
+  .view-list::-webkit-scrollbar-track { background: transparent; }
+  .view-list::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+  .view-card {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    padding: 12px 13px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: border-color 0.12s, background 0.12s;
+    user-select: none;
+  }
+  .view-card:hover { border-color: var(--border-strong); background: var(--panel-3); }
+  .view-card.active {
+    border-color: var(--accent);
+    background: var(--panel-3);
+    box-shadow: 0 0 0 1px var(--accent) inset, 0 4px 14px rgba(110,168,254,0.12);
+  }
+  .view-card .head { display: flex; align-items: center; gap: 9px; margin-bottom: 6px; }
+  .view-card .num {
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    color: var(--text-2);
+    font-weight: 700;
+    font-size: 11.5px;
+    width: 22px; height: 22px;
+    border-radius: 5px;
+    display: grid; place-items: center;
+    flex-shrink: 0;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .view-card.active .num { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .view-card .title { font-weight: 600; font-size: 13px; line-height: 1.3; flex: 1; color: var(--text); }
+  .view-card .summary { color: var(--muted); font-size: 12px; line-height: 1.45; }
+  .sidebar-foot {
+    border-top: 1px solid var(--border);
+    padding: 10px 14px;
+    color: var(--dim);
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .sidebar-foot code { color: var(--muted); font-family: ui-monospace, Consolas, monospace; font-size: 10.5px; }
+
+  /* ────────────────────────────────────────────── canvas */
+  #canvas {
+    grid-area: canvas;
+    overflow-y: auto;
+    overflow-x: auto;
+    background:
+      radial-gradient(circle at 1px 1px, rgba(255,255,255,0.018) 1px, transparent 0) 0 0/24px 24px,
+      linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%);
+    padding: 32px 48px 80px;
+  }
+  #canvas::-webkit-scrollbar { width: 10px; height: 10px; }
+  #canvas::-webkit-scrollbar-track { background: transparent; }
+  #canvas::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px; }
+
+  .view-header { max-width: 1000px; margin-bottom: 24px; display: flex; align-items: flex-start; gap: 16px; }
+  .view-header .big-num {
+    width: 48px; height: 48px;
+    background: linear-gradient(135deg, var(--accent), #b888f6);
+    border-radius: 11px;
+    display: grid; place-items: center;
+    font-weight: 800; font-size: 19px;
+    color: #0b0d12;
+    flex-shrink: 0;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .view-header h2 { margin: 0 0 5px; font-size: 19px; font-weight: 650; }
+  .view-header p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; max-width: 760px; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 18px; }
+  .legend .chip {
+    font-size: 10.5px;
+    font-family: ui-monospace, Consolas, monospace;
+    color: var(--text-2);
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    border-radius: 5px;
+    padding: 2.5px 8px;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .legend .dot { width: 8px; height: 8px; border-radius: 2.5px; display: inline-block; }
+
+  /* ────────────────────────────────────────────── diagram */
+  .diagram {
+    position: relative;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+    overflow: hidden;
+  }
+  .diagram svg.wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .diagram .wires path { fill: none; stroke-width: 1.6; }
+  .diagram .wires path.flow   { stroke: var(--accent-2); }
+  .diagram .wires path.dashed { stroke: var(--dim); stroke-dasharray: 5 4; }
+  .diagram .wires path.danger { stroke: var(--danger); stroke-dasharray: 5 4; opacity: 0.75; }
+  .diagram .wires path.obs    { stroke: var(--obs); stroke-dasharray: 2.5 4; opacity: 0.7; }
+  .diagram .wires text {
+    font: 10px ui-monospace, Consolas, monospace;
+    fill: var(--muted);
+    paint-order: stroke;
+    stroke: #15191f;
+    stroke-width: 3.5px;
+    stroke-linejoin: round;
+  }
+
+  .node {
+    position: absolute;
+    background: var(--panel-2);
+    border: 1px solid var(--border-strong);
+    border-left-width: 3px;
+    border-radius: 9px;
+    padding: 8px 11px 9px;
+    cursor: pointer;
+    transition: transform 0.1s, box-shadow 0.1s, border-color 0.1s;
+    user-select: none;
+  }
+  .node:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,0,0,0.45); border-color: var(--accent); }
+  .node.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset, 0 6px 18px rgba(110,168,254,0.18); }
+  .node .t { font-weight: 650; font-size: 12.5px; line-height: 1.25; display: flex; align-items: center; gap: 7px; }
+  .node .t .step {
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 10px; font-weight: 700;
+    background: var(--bg-2); color: var(--text-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.5px 5px;
+    flex-shrink: 0;
+  }
+  .node .s { color: var(--muted); font-size: 10.8px; line-height: 1.4; margin-top: 3px; font-family: ui-monospace, Consolas, monospace; }
+  .node.ghost { border-style: dashed; opacity: 0.85; background: transparent; }
+
+  .node.p-client { border-left-color: var(--muted); }
+  .node.p-edge   { border-left-color: var(--warn); }
+  .node.p-app    { border-left-color: var(--accent); }
+  .node.p-pg     { border-left-color: var(--success); }
+  .node.p-redis  { border-left-color: var(--danger); }
+  .node.p-mq     { border-left-color: var(--mq); }
+  .node.p-obs    { border-left-color: var(--obs); }
+  .node.p-infra  { border-left-color: var(--dim); }
+
+  .plane-label {
+    position: absolute;
+    font: 600 10px ui-monospace, Consolas, monospace;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    color: var(--dim);
+    pointer-events: none;
+  }
+
+  /* ────────────────────────────────────────────── inspector */
+  #inspector {
+    position: fixed;
+    top: 56px; right: 0; bottom: 0;
+    width: 400px;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    box-shadow: -14px 0 34px rgba(0,0,0,0.45);
+    transform: translateX(105%);
+    transition: transform 0.16s ease-out;
+    display: flex;
+    flex-direction: column;
+    z-index: 50;
+  }
+  #inspector.open { transform: translateX(0); }
+  #inspector .insp-head {
+    padding: 16px 18px 12px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: flex-start; gap: 10px;
+  }
+  #inspector .insp-head h3 { margin: 0; font-size: 14.5px; font-weight: 650; flex: 1; line-height: 1.3; }
+  #inspector .plane-chip {
+    font: 600 9.5px ui-monospace, Consolas, monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    border-radius: 4px;
+    padding: 2px 7px;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  #inspector .close {
+    background: none; border: 1px solid var(--border);
+    color: var(--muted);
+    width: 24px; height: 24px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px; line-height: 1;
+    flex-shrink: 0;
+  }
+  #inspector .close:hover { color: var(--text); border-color: var(--border-strong); }
+  #inspector .insp-body { flex: 1; overflow-y: auto; padding: 14px 18px 24px; }
+  #inspector .insp-body::-webkit-scrollbar { width: 8px; }
+  #inspector .insp-body::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+  .insp-sec { margin-bottom: 18px; }
+  .insp-sec h4 {
+    margin: 0 0 8px;
+    font: 600 10.5px ui-monospace, Consolas, monospace;
+    letter-spacing: 1.1px;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+  .insp-sec ul { margin: 0; padding: 0 0 0 16px; }
+  .insp-sec ul li { color: var(--text-2); font-size: 12.3px; line-height: 1.55; margin-bottom: 6px; }
+  .insp-sec ul li code, .sidebar-foot strong {
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 11px;
+    background: var(--code-bg);
+    color: var(--code-text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.5px 5px;
+  }
+  a.file-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 11px;
+    color: var(--accent);
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 9px;
+    text-decoration: none;
+    margin: 0 6px 6px 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+  a.file-tag:hover { border-color: var(--accent); background: var(--panel-3); }
+  a.file-tag .ln { color: var(--num); }
+  a.doc-link {
+    display: block;
+    color: var(--text-2);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 7px 11px;
+    font-size: 12px;
+    text-decoration: none;
+    margin-bottom: 6px;
+    line-height: 1.4;
+  }
+  a.doc-link:hover { border-color: var(--accent); color: var(--text); }
+  a.doc-link .kind { color: var(--dim); font: 600 9.5px ui-monospace, Consolas, monospace; text-transform: uppercase; letter-spacing: 0.6px; margin-right: 7px; }
+  .insp-foot { color: var(--dim); font-size: 10.5px; border-top: 1px solid var(--border); padding-top: 10px; }
+
+  /* ────────────────────────────────────────────── traffic tour */
+  .sim-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .sim-bar select, .sim-bar button, .sim-bar input[type="range"] {
+    font: inherit;
+    font-size: 11.5px;
+  }
+  .sim-bar select {
+    background: var(--bg-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 8px;
+    max-width: 220px;
+  }
+  .sim-bar button {
+    background: var(--panel-2);
+    color: var(--text-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 10px;
+    cursor: pointer;
+  }
+  .sim-bar button.primary {
+    background: var(--accent);
+    color: var(--bg);
+    border-color: var(--accent);
+    font-weight: 600;
+  }
+  .sim-bar button:hover { border-color: var(--border-strong); color: var(--text); }
+  .sim-bar button.primary:hover { filter: brightness(1.05); }
+  .sim-bar button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .sim-progress {
+    font: 10.5px ui-monospace, Consolas, monospace;
+    color: var(--muted);
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-2);
+    max-width: 340px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .view-list.sim-running .view-card:not(.sim-active):not(.active) { opacity: 0.45; }
+  .view-card.sim-active { border-color: var(--success); box-shadow: 0 0 0 1px var(--success) inset; }
+  .diagram svg.traffic-layer {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 2;
+  }
+  .diagram .wires { z-index: 1; }
+  .diagram .node { z-index: 3; }
+  .particle-head { filter: url(#particle-glow); }
+  .particle-tail {
+    fill: none;
+    stroke-width: 3;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    opacity: 0.55;
+  }
+  .node.traffic-active {
+    animation: trafficPulse 0.45s ease-out;
+    box-shadow: 0 0 0 2px var(--accent), 0 0 18px rgba(110,168,254,0.35);
+  }
+  .node.traffic-passed { box-shadow: inset 0 0 0 1px rgba(126,231,135,0.25); }
+  @keyframes trafficPulse {
+    0% { transform: scale(1); }
+    40% { transform: scale(1.02); }
+    100% { transform: scale(1); }
+  }
+  .traffic-overlay {
+    position: absolute;
+    z-index: 4;
+    max-width: 260px;
+    background: rgba(11,13,18,0.92);
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font: 11px ui-monospace, Consolas, monospace;
+    color: var(--str);
+    pointer-events: none;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .particle-tail { display: none; }
+    .node.traffic-active { animation: none; }
+    .canvas-stage { transition: none !important; }
+  }
+
+  /* ── unified mega canvas + camera */
+  #canvas.mega-canvas-active {
+    padding: 10px 12px 12px;
+    overflow: hidden;
+    background: var(--bg);
+  }
+  #canvas.mega-canvas-active .sim-narration {
+    margin-bottom: 8px;
+    border-radius: 12px;
+    border-color: #334155;
+    background: linear-gradient(180deg, #1b2230 0%, #15191f 100%);
+  }
+  .mega-viewer {
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 68px);
+    min-height: 0;
+    background: #f4f6f9;
+    border: 1px solid #d5dde8;
+    border-radius: 18px;
+    overflow: hidden;
+    box-shadow: 0 18px 40px rgba(0, 0, 0, 0.28), 0 0 0 1px rgba(255, 255, 255, 0.04);
+  }
+  .mega-topbar {
+    border-bottom: 1px solid #e3e9f1;
+  }
+  .mega-topbar .mega-title {
+    font-size: 12px;
+    font-weight: 650;
+    color: #0f172a;
+    white-space: nowrap;
+  }
+  .mega-region-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-left: 8px;
+  }
+  .mega-region-pill {
+    font: 600 10px ui-monospace, Consolas, monospace;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid #dbe3ee;
+    background: #fff;
+    color: #475569;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s, box-shadow 0.15s;
+  }
+  .mega-region-pill:hover {
+    border-color: #93c5fd;
+    color: #1d4ed8;
+    background: #eff6ff;
+  }
+  .mega-region-pill.active {
+    color: #fff;
+    border-color: transparent;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.12);
+  }
+  .canvas-viewport {
+    position: relative;
+    width: 100%;
+    max-width: 100%;
+    height: calc(100vh - 120px);
+    min-height: 520px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--bg-2);
+  }
+  .mega-viewer .canvas-viewport.mega-mode {
+    flex: 1;
+    min-height: 0;
+    height: auto;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    background-color: #eef2f7;
+    background-image: radial-gradient(circle, #cbd5e1 0.85px, transparent 0.85px);
+    background-size: 22px 22px;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+  }
+  .canvas-viewport.mega-mode { cursor: grab; touch-action: none; user-select: none; }
+  .canvas-viewport.mega-mode.is-panning { cursor: grabbing; }
+  .mega-viewer .canvas-viewport.mega-mode .pan-hint {
+    left: 50%;
+    right: auto;
+    bottom: 12px;
+    transform: translateX(-50%);
+    color: #64748b;
+    background: rgba(255, 255, 255, 0.92);
+    border-color: #d5dde8;
+    box-shadow: 0 4px 14px rgba(15, 23, 42, 0.08);
+    font-size: 10px;
+    padding: 5px 12px;
+  }
+  .mega-stage .plane-label {
+    color: #94a3b8;
+    background: rgba(255, 255, 255, 0.72);
+    padding: 2px 8px;
+    border-radius: 6px;
+    border: 1px solid rgba(203, 213, 225, 0.8);
+  }
+  .mega-stage .node {
+    z-index: 3;
+    background: #fff;
+    border: 1px solid #d7dee8;
+    border-left-width: 4px;
+    border-radius: 12px;
+    padding: 10px 12px 11px;
+    min-height: 54px;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05), 0 8px 20px rgba(15, 23, 42, 0.04);
+  }
+  .mega-stage .node:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.08), 0 14px 28px rgba(15, 23, 42, 0.08);
+    border-color: #93b4e8;
+  }
+  .mega-stage .node .t { color: #0f172a; font-size: 13px; font-weight: 650; line-height: 1.3; }
+  .mega-stage .node .t .step { background: #f1f5f9; color: #475569; border-color: #dbe3ee; font-size: 9px; }
+  .mega-stage .node .s {
+    color: #64748b;
+    font-size: 10px;
+    line-height: 1.35;
+    margin-top: 4px;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .mega-stage .node.ghost { background: rgba(255, 255, 255, 0.62); border-style: dashed; opacity: 0.92; }
+  .mega-stage .node.sel { outline: 2px solid #3b82f6; outline-offset: 2px; }
+  .mega-stage .diagram .wires path { stroke-width: 1.8; }
+  .mega-stage .diagram .wires path.flow { stroke: #3b82f6; }
+  .mega-stage .diagram .wires path.dashed { stroke: #94a3b8; opacity: 0.9; }
+  .mega-stage .diagram .wires text { fill: #475569; stroke: #eef2f7; stroke-width: 5px; font-size: 10px; }
+  .region-frame {
+    position: absolute;
+    border: 2px solid #b6c3d4;
+    border-radius: 18px;
+    pointer-events: none;
+    z-index: 0;
+    background: rgba(255, 255, 255, 0.72);
+    box-shadow: 0 6px 20px rgba(15, 23, 42, 0.05);
+    transition: border-color 0.4s, box-shadow 0.4s, background 0.4s;
+  }
+  .region-frame[data-region="overview"] { border-color: #93c5fd; background: rgba(239, 246, 255, 0.82); }
+  .region-frame[data-region="stack"] { border-color: #c4b5fd; background: rgba(245, 243, 255, 0.82); }
+  .region-frame[data-region="write"] { border-color: #86efac; background: rgba(240, 253, 244, 0.82); }
+  .region-frame[data-region="read"] { border-color: #5eead4; background: rgba(240, 253, 250, 0.82); }
+  .region-frame.region-active {
+    border-width: 2px;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.18), 0 10px 28px rgba(15, 23, 42, 0.08);
+  }
+  .region-frame.region-active[data-region="overview"] { box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.22), 0 10px 28px rgba(59, 130, 246, 0.1); }
+  .region-frame.region-active[data-region="stack"] { box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.22), 0 10px 28px rgba(139, 92, 246, 0.1); }
+  .region-frame.region-active[data-region="write"] { box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.22), 0 10px 28px rgba(34, 197, 94, 0.1); }
+  .region-frame.region-active[data-region="read"] { box-shadow: 0 0 0 3px rgba(20, 184, 166, 0.22), 0 10px 28px rgba(20, 184, 166, 0.1); }
+  .region-frame .region-label {
+    position: absolute;
+    top: -12px;
+    left: 16px;
+    font: 600 11px ui-monospace, Consolas, monospace;
+    letter-spacing: 0.15px;
+    color: #334155;
+    text-transform: none;
+    padding: 3px 12px;
+    border-radius: 999px;
+    background: #fff;
+    border: 1px solid #cbd5e1;
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.06);
+  }
+  .region-frame.region-active .region-label { color: #0f172a; font-weight: 700; }
+  .region-frame.region-dive {
+    border-color: #f59e0b;
+    box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.28), 0 12px 32px rgba(245, 158, 11, 0.14);
+    animation: regionDive 0.9s ease-out;
+  }
+  @keyframes regionDive {
+    0% { box-shadow: 0 0 0 0 rgba(240,179,65,0.55); }
+    100% { box-shadow: 0 0 0 2px rgba(240,179,65,0.35) inset, 0 0 36px rgba(240,179,65,0.18); }
+  }
+  .node.dive-target {
+    z-index: 12 !important;
+    box-shadow: 0 0 0 3px var(--warn), 0 0 32px rgba(240,179,65,0.45) !important;
+    animation: diveTarget 0.85s ease-out;
+  }
+  .node.nest-parent {
+    box-shadow: 0 0 0 2px rgba(110,168,254,0.55) inset, 0 0 24px rgba(110,168,254,0.2) !important;
+  }
+  .nest-frame {
+    position: absolute;
+    border: 2px dashed rgba(59, 130, 246, 0.45);
+    border-radius: 16px;
+    pointer-events: none;
+    z-index: 1;
+    background: rgba(255, 255, 255, 0.35);
+    transition: border-color 0.5s, box-shadow 0.5s;
+  }
+  .nest-frame.nest-active {
+    border-color: #f59e0b;
+    border-style: solid;
+    background: rgba(255, 251, 235, 0.55);
+    box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.2), 0 8px 24px rgba(245, 158, 11, 0.1);
+  }
+  .nest-frame .nest-label {
+    position: absolute;
+    top: -12px;
+    left: 14px;
+    font: 600 10px ui-monospace, Consolas, monospace;
+    letter-spacing: 0.15px;
+    color: #2563eb;
+    text-transform: none;
+    padding: 2px 10px;
+    border-radius: 999px;
+    background: #fff;
+    border: 1px solid #bfdbfe;
+  }
+  @keyframes diveTarget {
+    0% { transform: scale(1); }
+    35% { transform: scale(1.04); }
+    100% { transform: scale(1); }
+  }
+  .canvas-stage { position: absolute; left: 0; top: 0; will-change: transform; transform-origin: 0 0; }
+  .sim-narration {
+    margin-bottom: 14px;
+    padding: 12px 16px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: linear-gradient(180deg, var(--panel-2) 0%, var(--panel) 100%);
+    max-width: 100%;
+  }
+  .sim-narration.hidden { display: none; }
+  .sim-narration .sim-crumb {
+    font: 600 10px ui-monospace, Consolas, monospace;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 6px;
+  }
+  .sim-narration .sim-caption {
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: var(--text-2);
+  }
+  .sim-narration .sim-caption strong { color: var(--text); }
+  .mega-stage .node.traffic-active {
+    outline: 2px solid #22c55e;
+    outline-offset: 2px;
+    box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.15), 0 12px 28px rgba(15, 23, 42, 0.12);
+  }
+  .mega-stage .node.traffic-passed { box-shadow: inset 0 0 0 1px rgba(34, 197, 94, 0.35); }
+  .diagram.mega-diagram { box-shadow: none; background: transparent; border: none; }
+  .sim-narration .sim-depth {
+    display: inline-block;
+    font: 600 9.5px ui-monospace, Consolas, monospace;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: var(--warn);
+    background: rgba(240,179,65,0.12);
+    border: 1px solid rgba(240,179,65,0.35);
+    border-radius: 4px;
+    padding: 1px 6px;
+    margin-right: 8px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">PC</div>
+  <h1>Peakload Capstone — Architecture Tour<small>unified tour map · traffic simulation · guided auto-tour</small></h1>
+  <div class="grow"></div>
+  <div class="sim-bar">
+    <select id="simScenario" title="Traffic scenario"></select>
+    <button type="button" class="primary" id="simPlay" title="Play simulation">▶ Simulasi</button>
+    <button type="button" id="simBack" disabled title="Langkah sebelumnya (←)">⏮</button>
+    <button type="button" id="simForward" disabled title="Langkah berikutnya (→) — loncat ke langkah mana pun">⏭</button>
+    <button type="button" id="simPause" disabled title="Pause">⏸</button>
+    <button type="button" id="simReset" disabled title="Reset">↺</button>
+    <label class="sim-progress" title="Speed"><span id="simSpeedLbl">0.35×</span>
+      <input id="simSpeed" type="range" min="0.08" max="2" step="0.05" value="0.35" style="width:88px;vertical-align:middle;margin-left:6px">
+    </label>
+    <span class="sim-progress" id="simProgress">Ready</span>
+  </div>
+  <a class="meta" href="architecture.html">diagram ref →</a>
+  <a class="meta" href="../codemap/codemap.html">codemap →</a>
+  <div class="meta" id="rootBtn" title="Click to change the workspace root used for vscode:// links (shared with codemap)">root: …</div>
+</header>
+
+<aside>
+  <div class="search-wrap">
+    <input class="search-input" id="search" type="text" placeholder="Filter regions &amp; components… (Esc closes panel)">
+  </div>
+  <div class="view-list" id="viewList"></div>
+  <div class="sidebar-foot">
+    Click any component → fact panel with <code>vscode://</code> refs &amp; ADR/runbook links.
+    Solid wires = request/data flow, dashed = control/HA/async, dotted teal = telemetry.
+    Use <strong>▶ Simulasi</strong> for animated traffic across overview, protection stack, write &amp; read paths.
+    Region pills / sidebar jump between areas. <strong>⏮ ⏭</strong> step back/forward during simulation.
+  </div>
+</aside>
+
+<div id="canvas"></div>
+
+<div id="inspector">
+  <div class="insp-head">
+    <h3 id="inspTitle"></h3>
+    <span class="plane-chip" id="inspPlane"></span>
+    <button class="close" id="inspClose" title="Esc">✕</button>
+  </div>
+  <div class="insp-body" id="inspBody"></div>
+</div>
+
+<script>
+"use strict";
+
+/* ───────────────────────── workspace root (shared with codemap) */
+const DEFAULT_ROOT = "c:/Users/Ikhsa/Downloads/MINE/Semester 6/Gh/Capstone";
+let WORKSPACE_ROOT = localStorage.getItem("codemapRoot") || DEFAULT_ROOT;
+
+function vscodeUrl(relPath, line) {
+  const root = WORKSPACE_ROOT.replace(/\\/g, "/").replace(/\/$/, "");
+  const abs = root + "/" + relPath.replace(/\\/g, "/");
+  const suffix = line ? (":" + line + ":1") : "";
+  return "vscode://file/" + encodeURI(abs) + suffix;
+}
+
+const PLANES = {
+  client: { label: "client",        color: "var(--muted)"   },
+  edge:   { label: "edge",          color: "var(--warn)"    },
+  app:    { label: "app",           color: "var(--accent)"  },
+  pg:     { label: "postgres",      color: "var(--success)" },
+  redis:  { label: "redis",         color: "var(--danger)"  },
+  mq:     { label: "rabbitmq",      color: "var(--mq)"      },
+  obs:    { label: "observability", color: "var(--obs)"     },
+  infra:  { label: "infra",         color: "var(--dim)"     },
+};
+
+/* ════════════════════════════════════════════════════════════════
+   VIEW + DETAIL DATA — every number below was read from source on
+   2026-06-10 (docker-compose.yml, nginx config, .env.example, and
+   the crates). file:line anchors are clickable proofs.
+   ════════════════════════════════════════════════════════════════ */
+
+const VIEWS = [
+
+/* ── 1 · SYSTEM OVERVIEW ─────────────────────────────────────── */
+{
+  id: "overview", num: "L2", title: "Containers — System Overview",
+  summary: "C4 Level 2 — Deployable containers: nginx edge, axum app ×2, Redis Sentinel, Postgres shards, RabbitMQ, observability. Double-click app to zoom to components.",
+  c4Level: 2,
+  w: 960, h: 880,
+  planes: [
+    { text: "data plane — redis", x: 18,  y: 306 },
+    { text: "data plane — postgres", x: 252, y: 306 },
+    { text: "async plane", x: 18, y: 636 },
+    { text: "observability", x: 18, y: 760 },
+  ],
+  nodes: [
+    { id: "client",  x: 370, y: 16,  w: 220, plane: "client", t: "Client", s: "browser · k6 load test" },
+    { id: "nginx",   x: 330, y: 86,  w: 300, plane: "edge",   t: "nginx (edge)", s: ":8080→80 · per-IP 2000 r/s · global 50k r/s" },
+    { id: "app",     x: 280, y: 176, w: 400, plane: "app",    t: "app ×2 — axum modular monolith", s: "accounts · transactions · notifications · in-proc workers", c4Drill: 3, c4DrillView: "c4-components", c4DrillLabel: "Components" },
+    { id: "redis-m", x: 24,  y: 330, w: 196, plane: "redis",  t: "redis-master", s: "cache + idemp reserve · AOF everysec" },
+    { id: "redis-r", x: 24,  y: 424, w: 196, plane: "redis",  t: "redis-replica", s: "read offload (REDIS_READ_URL)" },
+    { id: "sentinels", x: 24, y: 516, w: 196, plane: "redis", t: "Sentinel ×3", s: "master \"peakload-master\" · quorum promote" },
+    { id: "pgb0",    x: 258, y: 330, w: 190, plane: "pg",     t: "pgbouncer-shard0", s: "txn pooling · max_db_conn 200" },
+    { id: "pgb1",    x: 468, y: 330, w: 190, plane: "pg",     t: "pgbouncer-shard1", s: "profile shard1 — ON by default" },
+    { id: "readpool", x: 678, y: 330, w: 188, plane: "pg",    t: "pgbouncer-read ×3", s: "profile readpool — optional", ghost: true },
+    { id: "haproxy", x: 318, y: 432, w: 290, plane: "pg",     t: "pg-haproxy", s: "primary fe :5000/:5001 · replica fe :5010/:5011" },
+    { id: "etcd",    x: 678, y: 432, w: 188, plane: "infra",  t: "etcd ×3", s: "Patroni DCS · leader lease · quorum" },
+    { id: "shard0",  x: 240, y: 540, w: 190, plane: "pg",     t: "shard0 — Patroni pair", s: "node-a + node-b · streaming repl" },
+    { id: "shard1",  x: 450, y: 540, w: 190, plane: "pg",     t: "shard1 — Patroni pair", s: "profile shard1 — ON by default" },
+    { id: "shard2",  x: 660, y: 540, w: 190, plane: "pg",     t: "shard2 — Patroni pair", s: "profile shard2 — OFF by default", ghost: true },
+    { id: "rabbit",  x: 24,  y: 660, w: 230, plane: "mq",     t: "RabbitMQ", s: "transactions.process · DLX → DLQ" },
+    { id: "jobs",    x: 286, y: 660, w: 280, plane: "infra",  t: "db-bootstrap-schema · db-migrator", s: "one-shot init.sql + sqlx migrate; gate app start" },
+    { id: "obs",     x: 24,  y: 784, w: 560, plane: "obs",    t: "Observability stack", s: "prometheus + grafana (default ON) · otel→jaeger, cadvisor (profiles)" },
+  ],
+  edges: [
+    { from: "client",  to: "nginx",   label: ":8080" },
+    { from: "nginx",   to: "app",     label: "proxy_pass · GET cache 1s" },
+    { from: "app",     to: "redis-m", label: "cache + SETNX", fromSide: "left" },
+    { from: "redis-m", to: "redis-r", kind: "dashed", label: "async repl" },
+    { from: "sentinels", to: "redis-m", kind: "dashed", fromSide: "left", toSide: "left", label: "monitor / promote" },
+    { from: "app",     to: "pgb0",    label: "writes s0" },
+    { from: "app",     to: "pgb1",    label: "writes s1" },
+    { from: "pgb0",    to: "haproxy", label: ":5000" },
+    { from: "pgb1",    to: "haproxy", label: ":5001" },
+    { from: "app",     to: "haproxy", kind: "dashed", fromSide: "right", toSide: "right", label: "reads :5010/:5011" },
+    { from: "haproxy", to: "shard0" },
+    { from: "haproxy", to: "shard1" },
+    { from: "haproxy", to: "shard2",  kind: "dashed" },
+    { from: "etcd",    to: "shard1",  kind: "dashed", label: "leader lease" },
+    { from: "readpool", to: "haproxy", kind: "dashed" },
+    { from: "app",     to: "rabbit",  kind: "dashed", fromSide: "left", toSide: "top", label: "publish / consume (prefetch 200)" },
+    { from: "jobs",    to: "haproxy", kind: "dashed", fromSide: "top", toSide: "bottom", label: "one-shot via primary fe" },
+    { from: "obs",     to: "app",     kind: "obs", fromSide: "right", toSide: "right", label: "scrape /metrics · OTLP" },
+  ],
+},
+
+/* ── 2 · PROTECTION STACK ────────────────────────────────────── */
+{
+  id: "stack", num: 2, title: "Protection Stack",
+  summary: "Six middleware layers between socket and handler. Built in bootstrap.rs with sequential Router::layer calls — the last .layer() added is the outermost at runtime, so requests flow top-to-bottom exactly as drawn.",
+  w: 960, h: 870,
+  nodes: [
+    { id: "req",     x: 330, y: 16,  w: 300, plane: "client", t: "incoming request", s: "from nginx upstream" },
+    { id: "wrap",    x: 290, y: 88,  w: 380, plane: "app",   t: "outer wrappers", s: "CORS → TraceLayer → TimeoutLayer → request_id" },
+    { id: "l1",      x: 290, y: 182, w: 380, plane: "app",   t: "1 · backpressure", s: "semaphore · wait ≤ 50ms (default) → 503", step: "L1" },
+    { id: "l2",      x: 290, y: 276, w: 380, plane: "app",   t: "2 · circuit breaker", s: "CLOSED / OPEN / HALF_OPEN · threshold 50 (default)", step: "L2" },
+    { id: "l3",      x: 290, y: 370, w: 380, plane: "app",   t: "3 · rate limit", s: "64-shard counters · 2000 r/s burst 4000 (default) → 429", step: "L3" },
+    { id: "l4",      x: 290, y: 464, w: 380, plane: "app",   t: "4 · auth (JWT)", s: "HS256-pinned validator · ENABLE_AUTH=false default", step: "L4" },
+    { id: "l5",      x: 290, y: 558, w: 380, plane: "app",   t: "5 · degradation gate", s: "R-9 posture · read_only sheds writes 503", step: "L5" },
+    { id: "l6",      x: 290, y: 652, w: 380, plane: "app",   t: "6 · metrics", s: "http_requests_total — shed traffic excluded by position", step: "L6" },
+    { id: "handler", x: 290, y: 748, w: 380, plane: "app",   t: "module routers + handlers", s: "accounts · transactions · notifications · health" },
+    { id: "shed",    x: 24,  y: 380, w: 210, plane: "edge",  t: "shed responses", s: "503 / 429 / 401 + Retry-After + per-layer counters" },
+    { id: "proof",   x: 716, y: 276, w: 220, plane: "infra", t: "ordering proof", s: "bootstrap.rs — last .layer() = outermost" },
+    { id: "admin",   x: 716, y: 558, w: 220, plane: "infra", t: "admin surface", s: "/api/v2/admin — require_admin_middleware" },
+  ],
+  edges: [
+    { from: "req",  to: "wrap" },
+    { from: "wrap", to: "l1" },
+    { from: "l1",   to: "l2" },
+    { from: "l2",   to: "l3" },
+    { from: "l3",   to: "l4" },
+    { from: "l4",   to: "l5" },
+    { from: "l5",   to: "l6" },
+    { from: "l6",   to: "handler" },
+    { from: "l1", to: "shed", kind: "danger", fromSide: "left", toSide: "top", label: "503" },
+    { from: "l3", to: "shed", kind: "danger", fromSide: "left", toSide: "right", label: "429" },
+    { from: "l5", to: "shed", kind: "danger", fromSide: "left", toSide: "bottom", label: "503 writes" },
+    { from: "proof", to: "l2", kind: "dashed", toSide: "right" },
+    { from: "admin", to: "handler", kind: "dashed", toSide: "right" },
+  ],
+},
+
+/* ── 3 · WRITE PATH ──────────────────────────────────────────── */
+{
+  id: "write", num: 3, title: "Write Path — POST → 202 → settled",
+  summary: "Synchronous half: validate, reserve idempotency in Redis (hybrid backend), return 202. Asynchronous half: intake worker lands the row + publishes, consumer applies batches via one PL/pgSQL call, cross-shard credits ride a transactional outbox.",
+  w: 960, h: 1010,
+  planes: [
+    { text: "sync — request thread", x: 18, y: 20 },
+    { text: "async — workers & queue", x: 18, y: 330 },
+  ],
+  nodes: [
+    { id: "wpost",  x: 24,  y: 44,  w: 220, plane: "client", t: "POST /api/v2/transactions", s: "Idempotency via reference_id", step: "1" },
+    { id: "wval",   x: 284, y: 44,  w: 300, plane: "app",   t: "handler → service.process()", s: "amount · currency · reference_id ASCII ≤100", step: "2" },
+    { id: "wkey",   x: 624, y: 44,  w: 312, plane: "app",   t: "shard + idempotency key + SHA-256", s: "txn:{shard}:{reference_id} · injective (prop-tested)", step: "3" },
+    { id: "wres",   x: 624, y: 150, w: 312, plane: "redis", t: "reserve — IDEMPOTENCY_BACKEND=hybrid", s: "SETNX v1:idemp:{key} TTL 24h + LPUSH pending", step: "4" },
+    { id: "wfall",  x: 284, y: 246, w: 300, plane: "pg",    t: "PG fallback (Redis Err only)", s: "idempotency_keys ON CONFLICT · TTL 24h", ghost: true },
+    { id: "w202",   x: 24,  y: 150, w: 220, plane: "client", t: "202 Accepted", s: "status=pending · poll /status/{ref}", step: "5" },
+    { id: "wintake", x: 624, y: 366, w: 312, plane: "app",  t: "redis-intake worker", s: "RPOPLPUSH pending→inflight · 16-way publish · idle 10ms", step: "6" },
+    { id: "wpub",   x: 284, y: 366, w: 300, plane: "app",   t: "publish-outbox worker (fallback lane)", s: "batch 25 · lease 600s", ghost: true },
+    { id: "wq",     x: 624, y: 470, w: 312, plane: "mq",    t: "RabbitMQ — transactions.process", s: "durable · prefetch = BATCH_SIZE = 200", step: "7" },
+    { id: "wdlq",   x: 284, y: 470, w: 300, plane: "mq",    t: "DLQ (via DLX)", s: "poison: bad JSON · NULL reference_id", ghost: true },
+    { id: "wcons",  x: 624, y: 574, w: 312, plane: "app",   t: "consumer — batch & flush", s: "size-flush 200 · idle-flush 250ms · tick 50ms", step: "8" },
+    { id: "wapply", x: 624, y: 678, w: 312, plane: "pg",    t: "apply_transactions_batch()", s: "bulk claim CTE + per-row debit/credit loop", step: "9" },
+    { id: "wsame",  x: 624, y: 782, w: 312, plane: "pg",    t: "same-shard → completed", s: "debit + credit in one txn · ACK", step: "10" },
+    { id: "wxs",    x: 284, y: 678, w: 300, plane: "pg",    t: "cross-shard → outbox row", s: "processor: poll 250ms · batch 100 · lease 60s", step: "10b" },
+    { id: "wxsp",   x: 284, y: 782, w: 300, plane: "pg",    t: "cross-shard processor", s: "credit ON CONFLICT · retry ≤10 → refund (R-8)" },
+    { id: "wbus",   x: 624, y: 886, w: 312, plane: "app",   t: "event bus — transactions.committed", s: "tokio::broadcast · capacity 8192", step: "11" },
+    { id: "winval", x: 284, y: 886, w: 300, plane: "redis", t: "cache invalidator", s: "DEL txn:{id} · tx_status:{ref} · txn_list:*" },
+    { id: "wnotif", x: 24,  y: 886, w: 220, plane: "app",   t: "notifications", s: "dedupe 4096 · ring 512 · recent ≤200" },
+    { id: "wclean", x: 24,  y: 678, w: 220, plane: "infra", t: "cleanup sweeper", s: "every 30s · published-grace 300s", ghost: true },
+  ],
+  edges: [
+    { from: "wpost",  to: "wval" },
+    { from: "wval",   to: "wkey" },
+    { from: "wkey",   to: "wres" },
+    { from: "wres",   to: "wfall", kind: "danger", fromSide: "left", toSide: "right", label: "Redis Err" },
+    { from: "wres",   to: "w202", kind: "flow", fromSide: "left", toSide: "right", label: "reserved / replay" },
+    { from: "wres",   to: "wintake", label: "pending list" },
+    { from: "wfall",  to: "wpub", kind: "dashed" },
+    { from: "wintake", to: "wq",  label: "INSERT + publish" },
+    { from: "wpub",   to: "wq",   kind: "dashed", toSide: "left" },
+    { from: "wq",     to: "wcons", label: "deliver ≤200 unacked" },
+    { from: "wcons",  to: "wdlq", kind: "danger", fromSide: "left", toSide: "bottom", label: "NACK poison" },
+    { from: "wcons",  to: "wapply", label: "1 call / shard-batch" },
+    { from: "wapply", to: "wsame" },
+    { from: "wapply", to: "wxs",  kind: "dashed", fromSide: "left", toSide: "right", label: "receiver on other shard" },
+    { from: "wxs",    to: "wxsp" },
+    { from: "wsame",  to: "wbus" },
+    { from: "wxsp",   to: "wbus", kind: "dashed", toSide: "left", label: "after credit" },
+    { from: "wbus",   to: "winval", fromSide: "left", toSide: "right" },
+    { from: "winval", to: "wnotif", fromSide: "left", toSide: "right", label: "same bus" },
+    { from: "wclean", to: "wxs", kind: "dashed", fromSide: "right", toSide: "left" },
+  ],
+},
+
+/* ── 4 · READ PATH ───────────────────────────────────────────── */
+{
+  id: "read", num: 4, title: "Read Path — tiered cache & cross-shard pagination",
+  summary: "Three GET families. Balance rides a three-tier cache (moka → Redis → replica DB). Lists use cursor-only pagination with 5s bucket sharing and a limit+1 tail-probe merge. Status caching is TTL-split by state and invalidated on commit.",
+  w: 960, h: 700,
+  planes: [
+    { text: "GET balance", x: 18, y: 20 },
+    { text: "GET list", x: 348, y: 20 },
+    { text: "GET status / by id", x: 678, y: 20 },
+  ],
+  nodes: [
+    { id: "rb1", x: 24,  y: 44,  w: 280, plane: "app",   t: "L1 — moka in-process", s: "TTL 1s · ≈50 MB cap · zero TCP on hit" },
+    { id: "rb2", x: 24,  y: 148, w: 280, plane: "redis", t: "L2 — Redis acc:{id}", s: "BALANCE_CACHE_TTL_SECS = 10" },
+    { id: "rb3", x: 24,  y: 252, w: 280, plane: "app",   t: "L3 — repo via read pool", s: "DB_READ_POOL_SIZE = 40 / shard" },
+    { id: "rb4", x: 24,  y: 356, w: 280, plane: "pg",    t: "HAProxy replica fe", s: ":5010 / :5011 → Patroni replica" },
+    { id: "rl1", x: 354, y: 44,  w: 280, plane: "app",   t: "cursor params", s: "offset → 400 · limit ≤ 100 · (before, before_id)" },
+    { id: "rl2", x: 354, y: 148, w: 280, plane: "redis", t: "bucket cache", s: "cursor floored to 5s bucket · key txn_list:…" },
+    { id: "rl3", x: 354, y: 252, w: 280, plane: "pg",    t: "fan-out: limit+1 per shard", s: "tokio::spawn per shard · tail probe" },
+    { id: "rl4", x: 354, y: 356, w: 280, plane: "app",   t: "safe-cursor merge", s: "MAX(probes) → drop rows older · cache 30s" },
+    { id: "rs1", x: 684, y: 44,  w: 252, plane: "redis", t: "tx_status:{ref} cache", s: "terminal 5s · transient 1s" },
+    { id: "rs2", x: 684, y: 148, w: 252, plane: "app",   t: "status resolver", s: "PG row → else idemp reservation → pending" },
+    { id: "rs3", x: 684, y: 252, w: 252, plane: "redis", t: "txn:{id} cache (by id)", s: "TTL 30s · per-shard probe timeout 500ms" },
+    { id: "rs4", x: 684, y: 356, w: 252, plane: "app",   t: "commit-time invalidator", s: "DEL on transactions.committed", ghost: true },
+    { id: "rfb", x: 354, y: 480, w: 280, plane: "pg",    t: "replica outage fallback", s: "reads fall back to primary fe", ghost: true },
+  ],
+  edges: [
+    { from: "rb1", to: "rb2", label: "miss" },
+    { from: "rb2", to: "rb3", label: "miss" },
+    { from: "rb3", to: "rb4" },
+    { from: "rl1", to: "rl2" },
+    { from: "rl2", to: "rl3", label: "miss" },
+    { from: "rl3", to: "rl4" },
+    { from: "rs1", to: "rs2", label: "miss" },
+    { from: "rs2", to: "rs3", kind: "dashed" },
+    { from: "rs4", to: "rs1", kind: "danger", fromSide: "right", toSide: "right", label: "DEL" },
+    { from: "rb4", to: "rfb", kind: "dashed", fromSide: "right", toSide: "left" },
+    { from: "rl4", to: "rfb", kind: "dashed" },
+  ],
+},
+
+/* ── 5 · HA & FAILOVER ───────────────────────────────────────── */
+{
+  id: "ha", num: 5, title: "HA & Failover",
+  summary: "What dies, what takes over, and what the app does while it happens. Patroni + etcd handle Postgres promotion; HAProxy re-routes on REST probes; Sentinel promotes Redis; the app absorbs windows with retries, health probes, and an operator-controlled degradation switch.",
+  w: 960, h: 880,
+  planes: [
+    { text: "postgres failover", x: 18, y: 20 },
+    { text: "redis failover", x: 18, y: 420 },
+    { text: "app-side absorption", x: 508, y: 420 },
+  ],
+  nodes: [
+    { id: "hpair",  x: 24,  y: 44,  w: 300, plane: "pg",   t: "Patroni pair (per shard)", s: "node-a primary ★ · node-b streaming replica" },
+    { id: "hetcd",  x: 364, y: 44,  w: 280, plane: "infra", t: "etcd ×3 — leader lease", s: "quorum lost → primaries demote read-only" },
+    { id: "hwin",   x: 684, y: 44,  w: 252, plane: "infra", t: "promotion window", s: "typically 5–15s, bounded by lease TTL" },
+    { id: "hhap",   x: 24,  y: 168, w: 300, plane: "pg",   t: "HAProxy re-route", s: "Patroni REST probes pick the new primary" },
+    { id: "hboot",  x: 364, y: 168, w: 280, plane: "infra", t: "one-shot gates", s: "bootstrap-schema + migrator gate app start" },
+    { id: "hbackup", x: 684, y: 168, w: 252, plane: "infra", t: "pgBackRest WAL archiving", s: "BACKUP_ENABLED=false by default", ghost: true },
+    { id: "hretry", x: 508, y: 464, w: 428, plane: "app",  t: "write retry budget", s: "6 attempts × 200ms backoff — covers the window" },
+    { id: "hprobe", x: 508, y: 558, w: 428, plane: "app",  t: "per-replica health probes", s: "every 5s · unhealthy replica skipped on reads" },
+    { id: "hdeg",   x: 508, y: 652, w: 428, plane: "app",  t: "degradation switch (R-9)", s: "PUT /api/v2/admin/degradation → read_only, no restart" },
+    { id: "hheal",  x: 508, y: 746, w: 428, plane: "app",  t: "container self-heal", s: "--health-check every 10s · restart unless-stopped · 2 replicas" },
+    { id: "hsent",  x: 24,  y: 464, w: 300, plane: "redis", t: "Sentinel ×3 promote", s: "master \"peakload-master\" · monitor 5s" },
+    { id: "haof",   x: 24,  y: 558, w: 300, plane: "redis", t: "AOF everysec", s: "≤1s loss bound on master crash" },
+    { id: "hidem",  x: 24,  y: 652, w: 300, plane: "redis", t: "hybrid idempotency caveat", s: "SETNX lost in failover ≠ PG fallback — PG ON CONFLICT is the last line" },
+    { id: "hmq",    x: 24,  y: 746, w: 300, plane: "mq",   t: "RabbitMQ durability", s: "durable queue · poison → DLQ, no requeue loops" },
+    { id: "hrun",   x: 364, y: 290, w: 572, plane: "infra", t: "runbooks", s: "patroni-failover-manual · etcd-quorum-loss · redis-sentinel-post-promotion · cross-shard-outbox-reconciliation · rabbitmq-backlog-drain" },
+  ],
+  edges: [
+    { from: "hpair", to: "hhap", label: "primary dies → promote" },
+    { from: "hetcd", to: "hpair", kind: "dashed", toSide: "right", label: "lease" },
+    { from: "hetcd", to: "hwin", kind: "dashed" },
+    { from: "hwin",  to: "hretry", kind: "danger", toSide: "top", label: "absorbed by" },
+    { from: "hhap",  to: "hrun", kind: "dashed", fromSide: "bottom", toSide: "left" },
+    { from: "hsent", to: "haof", kind: "dashed" },
+    { from: "haof",  to: "hidem", kind: "dashed" },
+  ],
+},
+
+/* ── 6 · OBSERVABILITY ───────────────────────────────────────── */
+{
+  id: "obs", num: 6, title: "Observability",
+  summary: "Two exhaust pipes out of the same app: a Prometheus registry served at /metrics (scraped by Prometheus, charted in Grafana) and OTLP spans through otel-collector into Jaeger — with trace context propagated HTTP → AMQP → consumer.",
+  w: 960, h: 720,
+  planes: [
+    { text: "metrics", x: 18, y: 20 },
+    { text: "tracing", x: 18, y: 380 },
+  ],
+  nodes: [
+    { id: "oreg",  x: 24,  y: 44,  w: 300, plane: "app", t: "Prometheus registry", s: "installed at boot · histogram buckets straddle the SLO" },
+    { id: "ozero", x: 24,  y: 148, w: 300, plane: "app", t: "zero-init counters", s: "rates start at 0, not absent — PromQL-safe" },
+    { id: "omet",  x: 364, y: 44,  w: 280, plane: "app", t: "GET /metrics + /health", s: "unlimited at nginx (no rate-limit, no cache)" },
+    { id: "oprom", x: 684, y: 44,  w: 252, plane: "obs", t: "Prometheus", s: "scrapes app replicas · default ON" },
+    { id: "ograf", x: 684, y: 148, w: 252, plane: "obs", t: "Grafana", s: "provisioned dashboards · default ON" },
+    { id: "ocadv", x: 684, y: 252, w: 252, plane: "obs", t: "cAdvisor", s: "container CPU/mem → Prometheus · profile", ghost: true },
+    { id: "osig",  x: 364, y: 168, w: 280, plane: "app", t: "key signal families", s: "RED + shed counters per layer + cache_hits_total{tier} + queue depth (5s sample)" },
+    { id: "oslo",  x: 364, y: 282, w: 280, plane: "infra", t: "SLO targets", s: "99.9% availability · P95 < 500ms" },
+    { id: "orid",  x: 24,  y: 404, w: 300, plane: "app", t: "request_id middleware", s: "UUID echoed in responses + logs" },
+    { id: "otrl",  x: 24,  y: 498, w: 300, plane: "app", t: "TraceLayer — http.request span", s: "method · uri · status on every request" },
+    { id: "oprop", x: 24,  y: 592, w: 300, plane: "app", t: "context propagation", s: "traceparent rides AMQP headers → consumer joins trace" },
+    { id: "ootel", x: 364, y: 498, w: 280, plane: "obs", t: "otel-collector", s: "OTLP gRPC sink · profile, optional dep", ghost: true },
+    { id: "ojae",  x: 684, y: 498, w: 252, plane: "obs", t: "Jaeger", s: "trace UI · profile", ghost: true },
+  ],
+  edges: [
+    { from: "oreg",  to: "ozero", kind: "dashed" },
+    { from: "oreg",  to: "omet" },
+    { from: "omet",  to: "oprom", label: "scrape" },
+    { from: "oprom", to: "ograf" },
+    { from: "ocadv", to: "oprom", kind: "obs", toSide: "right" },
+    { from: "osig",  to: "omet", kind: "dashed", toSide: "bottom" },
+    { from: "orid",  to: "otrl", kind: "dashed" },
+    { from: "otrl",  to: "oprop", kind: "dashed" },
+    { from: "otrl",  to: "ootel", kind: "obs", label: "OTLP" },
+    { from: "ootel", to: "ojae",  kind: "obs" },
+  ],
+},
+
+];
+
+/* ════════════════════════════════════════════════════════════════
+   UNIFIED MEGA VIEW + NARRATION
+   ════════════════════════════════════════════════════════════════ */
+
+function prefixHops(hops, prefix) {
+  return hops.map((h) => {
+    const o = Object.assign({}, h);
+    o.from = prefix + h.from;
+    o.to = prefix + h.to;
+    return o;
+  });
+}
+
+function offsetViewSlice(view, prefix, ox, oy) {
+  return {
+    nodes: view.nodes.map((n) => ({ ...n, id: prefix + n.id, x: n.x + ox, y: n.y + oy })),
+    edges: view.edges.map((e) => ({ ...e, from: prefix + e.from, to: prefix + e.to })),
+    planes: (view.planes || []).map((p) => ({ ...p, x: p.x + ox, y: p.y + oy })),
+  };
+}
+
+function buildMegaView() {
+  const ov = VIEWS.find((v) => v.id === "overview");
+  const st = VIEWS.find((v) => v.id === "stack");
+  const wr = VIEWS.find((v) => v.id === "write");
+  const rd = VIEWS.find((v) => v.id === "read");
+  const OX = 64, OY = 56;
+  const STACK_Y = OY + ov.h + 64;
+  const WRITE_Y = STACK_Y + st.h + 64;
+  const READ_X = OX + ov.w + 72;
+  const READ_Y = STACK_Y;
+
+  const sOv = offsetViewSlice(ov, "ov-", OX, OY);
+  const sSt = offsetViewSlice(st, "st-", OX, STACK_Y);
+  const sWr = offsetViewSlice(wr, "wr-", OX, WRITE_Y);
+  const sRd = offsetViewSlice(rd, "rd-", READ_X, READ_Y);
+
+  const bridgeEdges = [
+    { from: "ov-app", to: "st-req", virtual: true, label: "masuk ke app" },
+    { from: "st-handler", to: "wr-wpost", virtual: true, label: "POST handler" },
+    { from: "ov-app", to: "rd-rb1", virtual: true, label: "GET read", kind: "dashed" },
+  ];
+
+  const regions = {
+    overview: { x: OX, y: OY, w: ov.w, h: ov.h, shortLabel: "Overview", color: "#3b82f6", label: "System topology — edge, app, data planes" },
+    stack: { x: OX, y: STACK_Y, w: st.w, h: st.h, shortLabel: "Protection stack", color: "#8b5cf6", label: "Middleware L1–L6 inside app ×2" },
+    write: { x: OX, y: WRITE_Y, w: wr.w, h: wr.h, shortLabel: "Write path", color: "#22c55e", label: "POST → 202 → async settlement" },
+    read: { x: READ_X, y: READ_Y, w: rd.w, h: rd.h, shortLabel: "Read path", color: "#14b8a6", label: "Tiered cache L1 → L2 → L3" },
+  };
+
+  function nestUnion(parentNode, childRegion, pad) {
+    pad = pad || 18;
+    const cr = regions[childRegion];
+    let px, py, pw, ph;
+    if (parentNode.indexOf("ov-") === 0) {
+      const n = ov.nodes.find((nd) => nd.id === parentNode.slice(3));
+      px = OX + n.x; py = OY + n.y; pw = n.w; ph = 88;
+    } else if (parentNode.indexOf("st-") === 0) {
+      const n = st.nodes.find((nd) => nd.id === parentNode.slice(3));
+      px = OX + n.x; py = STACK_Y + n.y; pw = n.w; ph = 88;
+    } else {
+      px = cr.x; py = cr.y; pw = 100; ph = 60;
+    }
+    const x = Math.min(px, cr.x) - pad;
+    const y = Math.min(py, cr.y) - pad;
+    const w = Math.max(px + pw, cr.x + cr.w) - x + pad;
+    const h = Math.max(py + ph, cr.y + cr.h) - y + pad;
+    return { x, y, w, h };
+  }
+
+  const nestContainers = {
+    app: Object.assign({ label: "app ×2 — isi: protection stack" }, nestUnion("ov-app", "stack", 20)),
+    writePipe: Object.assign({ label: "handler → write pipeline" }, nestUnion("st-handler", "write", 20)),
+    readPipe: Object.assign({ label: "app → read cache tiers" }, nestUnion("ov-app", "read", 20)),
+  };
+
+  return {
+    id: "mega",
+    num: "∞",
+    title: "Unified Tour Map",
+    summary: "Semua layer dalam satu canvas. Simulasi auto-zoom hanya saat masuk container (app→stack, handler→write).",
+    w: READ_X + rd.w + 64,
+    h: WRITE_Y + wr.h + 56,
+    mega: true,
+    regions,
+    nestContainers,
+    nodes: sOv.nodes.concat(sSt.nodes, sWr.nodes, sRd.nodes),
+    edges: sOv.edges.concat(sSt.edges, sWr.edges, sRd.edges, bridgeEdges),
+    planes: sOv.planes.concat(sSt.planes, sWr.planes, sRd.planes),
+  };
+}
+
+const MEGA_VIEW = buildMegaView();
+VIEWS.push(MEGA_VIEW);
+
+function findBrowseNode(nodeId) {
+  return MEGA_VIEW.nodes.find((n) => n.id === nodeId) || null;
+}
+
+function iceFooterHtml() {
+  let chips = "";
+  for (const k in PLANES) {
+    chips += '<span class="chip"><span class="dot" style="background:' + PLANES[k].color + '"></span>' + PLANES[k].label + "</span>";
+  }
+  return chips;
+}
+
+
+const STEP_NARRATION = {
+  "ov-client": { title: "Client", text: "Permintaan HTTP keluar dari browser atau k6 load test menuju nginx :8080." },
+  "ov-nginx": { title: "nginx (edge)", text: "Permintaan diterima nginx. Rate-limit per-IP & global dicek sebelum diteruskan ke app." },
+  "ov-app": { title: "app ×2", text: "nginx mem-proxy ke replika axum. Request masuk ke protection stack — zoom ke blok di bawah." },
+  "st-req": { title: "Incoming request", text: "Di dalam app: request dari upstream nginx siap melewati middleware." },
+  "st-wrap": { title: "Outer wrappers", text: "CORS, trace span, timeout, dan request_id ditambahkan di sini." },
+  "st-l1": { title: "L1 · Backpressure", text: "Semaphore membatasi request concurrent. Antrian > 50 ms → 503 + Retry-After." },
+  "st-l2": { title: "L2 · Circuit breaker", text: "Jika error burst, breaker OPEN — request ditolak sementara (503)." },
+  "st-l3": { title: "L3 · Rate limit", text: "Counter 64-shard per route. Burst melebihi limit → 429 Too Many Requests." },
+  "st-l4": { title: "L4 · Auth (JWT)", text: "Token HS256 divalidasi (default OFF di dev). Gagal → 401." },
+  "st-l5": { title: "L5 · Degradation gate", text: "Mode read_only: write ditolak 503 tanpa restart (R-9 posture)." },
+  "st-l6": { title: "L6 · Metrics", text: "Latency & http_requests_total direkam. Traffic yang di-shed di L1–L5 tidak dihitung sukses." },
+  "st-handler": { title: "Handlers", text: "Router module (accounts / transactions / notifications) menerima request valid." },
+  "st-shed": { title: "Shed response", text: "Request ditolak di layer protection — 503/429/401 + counter per layer." },
+  "wr-wpost": { title: "POST /transactions", text: "Handler transaksi menerima body + reference_id untuk idempotency." },
+  "wr-wval": { title: "Validasi", text: "service.process() cek amount, currency, reference_id sebelum lanjut." },
+  "wr-wkey": { title: "Shard + key", text: "Shard = hash(from_account) mod NUM_SHARDS. Key unik: txn:{shard}:{reference_id}." },
+  "wr-wres": { title: "Reserve (Redis)", text: "SETNX + LPUSH pending list. Sukses → lanjut async; gagal Redis → fallback PG." },
+  "wr-w202": { title: "202 Accepted", text: "Client dapat respons cepat: status pending + URL poll /status/{ref}." },
+  "wr-wintake": { title: "redis-intake worker", text: "Worker mengambil item dari pending list (RPOPLPUSH) untuk diproses." },
+  "wr-wq": { title: "RabbitMQ", text: "Pesan durable ke queue transactions.process — antrian async utama." },
+  "wr-wcons": { title: "Consumer batch", text: "Batch hingga 200 txn atau flush idle 250 ms sebelum apply ke DB." },
+  "wr-wapply": { title: "apply_transactions_batch", text: "Satu panggilan PL/pgSQL: debit/credit per baris dalam batch." },
+  "wr-wsame": { title: "Same-shard settled", text: "Debit & credit dalam shard sama — txn completed, ACK ke RabbitMQ." },
+  "wr-wxs": { title: "Cross-shard outbox", text: "Receiver di shard lain → baris outbox ditulis di txn yang sama dengan debit." },
+  "wr-wxsp": { title: "Cross-shard processor", text: "Poll outbox, credit ke shard penerima, retry/refund jika gagal." },
+  "wr-wbus": { title: "Event bus", text: "Broadcast transactions.committed ke worker in-proc (8192 slot)." },
+  "wr-winval": { title: "Cache invalidator", text: "DEL key Redis stale: txn:{id}, tx_status:{ref}, txn_list:*." },
+  "wr-wnotif": { title: "Notifications", text: "Dispatcher kirim notifikasi user (dedupe + ring buffer)." },
+  "rd-rb1": { title: "L1 · moka", text: "Cache in-process (TTL 1s). Hit → respons tanpa TCP ke Redis/DB." },
+  "rd-rb2": { title: "L2 · Redis", text: "Cache acc:{id} di Redis (TTL 10s). Simulasi ini: miss → lanjut ke L3." },
+  "rd-rb3": { title: "L3 · Read pool", text: "Query saldo via connection pool read ke replica Patroni." },
+  "rd-rb4": { title: "HAProxy replica", text: "Replica frontend :5010/:5011 — baca dari node streaming replica." },
+  "rd-rl1": { title: "Cursor params", text: "GET list: offset ditolak (400). Hanya safe-cursor (before + before_id), limit ≤ 100." },
+  "rd-rl2": { title: "Bucket cache", text: "Cursor di-floor ke bucket 5s → key txn_list:{limit}:{bucket}:{before_id} di Redis." },
+  "rd-rl3": { title: "Fan-out per shard", text: "tokio::spawn per shard, masing-masing fetch limit+1 (tail probe untuk safe cursor)." },
+  "rd-rl4": { title: "Safe-cursor merge", text: "MAX(tail probes) = safe cursor; baris lebih tua di-drop. Hasil di-cache 30s." },
+  "rd-rs1": { title: "tx_status cache", text: "Key tx_status:{ref} — TTL terminal 5s, transient 1s. Poll setelah POST 202." },
+  "rd-rs2": { title: "Status resolver", text: "Urutan: baris PG menang; else idempotency reservation aktif → pending; else 404." },
+  "rd-rs3": { title: "txn:{id} cache", text: "By-id GET (bukan /status): cache TTL 30s; miss probe shard dengan timeout 500ms." },
+  _default: { title: "Langkah", text: "Data melaju ke komponen berikutnya dalam pipeline." },
+};
+
+const SHED_NARRATION = {
+  "write-shed": { title: "Shed · 429 rate limit", text: "L3 counter burst exceeded → 429 Too Many Requests + counter shed_requests_total{layer=\"l3\"}." },
+  "write-shed-backpressure": { title: "Shed · 503 backpressure", text: "L1 semaphore queue > 50 ms → 503 + Retry-After. Client harus backoff." },
+  "write-shed-degradation": { title: "Shed · 503 degradation", text: "L5 read_only aktif → semua write ditolak 503 tanpa restart (R-9 posture)." },
+  "write-shed-auth": { title: "Shed · 401 auth", text: "L4 JWT invalid/missing → 401 Unauthorized (ENABLE_AUTH untuk demo production)." },
+};
+
+const SCENARIO_GROUPS = [
+  { id: "write", label: "Write paths" },
+  { id: "read", label: "Read paths" },
+  { id: "protection", label: "Protection stack" },
+];
+
+function regionKeyFromNode(id) {
+  if (id.indexOf("ov-") === 0) return "overview";
+  if (id.indexOf("st-") === 0) return "stack";
+  if (id.indexOf("wr-") === 0) return "write";
+  if (id.indexOf("rd-") === 0) return "read";
+  return "overview";
+}
+
+const REGION_DEPTH = {
+  overview: "Lapisan 1 · Edge & topology",
+  stack: "Lapisan 2 · Di dalam app (middleware)",
+  write: "Lapisan 3 · Write pipeline",
+  read: "Lapisan 3 · Read cache tiers",
+};
+
+const DIVE_NARRATION = {
+  stack: "Zoom masuk ke app ×2 — request melewati protection stack (L1–L6) sebelum handler.",
+  write: "Zoom masuk ke write path — sync (202) lalu async (Redis → RabbitMQ → Postgres).",
+  read: "Zoom masuk ke read path — cache L1 → L2 → L3 (simulasi miss).",
+};
+
+/** Zoom hanya saat hop masuk ke isi container — bukan setiap node / region. */
+const NEST_CONTAINERS = {
+  app: {
+    id: "app",
+    parentNode: "ov-app",
+    childRegion: "stack",
+    label: "app ×2 — isi: protection stack",
+    diveNarration: "Request masuk app ×2. Di dalamnya ada protection stack (middleware L1–L6), bukan service terpisah.",
+    divePauseMs: 1200,
+  },
+  writePipe: {
+    id: "writePipe",
+    parentNode: "st-handler",
+    childRegion: "write",
+    label: "handler → write pipeline",
+    diveNarration: "Dari handler valid, alur lanjut ke write pipeline (sync 202 + worker async).",
+    divePauseMs: 1100,
+  },
+  readPipe: {
+    id: "readPipe",
+    parentNode: "ov-app",
+    childRegion: "read",
+    label: "app → read cache tiers",
+    diveNarration: "Read request masuk tiered cache (L1 moka → L2 Redis → L3 replica).",
+    divePauseMs: 1100,
+  },
+};
+
+function containerForHop(hop) {
+  if (!hop) return null;
+  for (const key of Object.keys(NEST_CONTAINERS)) {
+    const c = NEST_CONTAINERS[key];
+    if (hop.from !== c.parentNode) continue;
+    const childPrefix = c.childRegion === "stack" ? "st-" : c.childRegion === "write" ? "wr-" : "rd-";
+    if (hop.to.indexOf(childPrefix) === 0) return c;
+  }
+  return null;
+}
+
+function stepTitle(nodeId) {
+  const n = STEP_NARRATION[nodeId];
+  return n ? n.title : nodeId;
+}
+
+/** Linear timeline for ⏮ / ⏭ — satu entry per langkah simulasi. */
+function buildSimTimeline(scenario) {
+  const steps = [{
+    kind: "start",
+    nodeId: "ov-client",
+    label: "Mulai tour",
+    phase: "hops",
+    segmentIdx: 0,
+    mainHopIdx: 0,
+  }];
+  if (!scenario || !scenario.segments) return steps;
+  scenario.segments.forEach((seg, si) => {
+    (seg.hops || []).forEach((hop, hi) => {
+      steps.push({
+        kind: "hop",
+        nodeId: hop.to,
+        fromNode: hop.from,
+        hop: hop,
+        label: stepTitle(hop.to),
+        phase: "hops",
+        segmentIdx: si,
+        mainHopIdx: hi + 1,
+        overlay: hop.overlay || null,
+      });
+    });
+    if (seg.parallel && seg.parallel.length) {
+      steps.push({
+        kind: "parallel-start",
+        nodeId: "wr-wres",
+        label: "Fork · 202 + async workers",
+        phase: "parallel",
+        segmentIdx: si,
+      });
+      seg.parallel.forEach((branch, bi) => {
+        (branch.hops || []).forEach((hop, hi) => {
+          steps.push({
+            kind: "parallel-hop",
+            nodeId: hop.to,
+            fromNode: hop.from,
+            hop: hop,
+            label: stepTitle(hop.to),
+            phase: "parallel",
+            segmentIdx: si,
+            branchIdx: bi,
+            branchHopIdx: hi + 1,
+            branchDelay: branch.delayMs || 0,
+            overlay: hop.overlay || null,
+          });
+        });
+      });
+    }
+    if (seg.tail && seg.tail.length) {
+      steps.push({
+        kind: "tail-start",
+        nodeId: null,
+        label: "Tail · poll status",
+        phase: "tail",
+        segmentIdx: si,
+        tailHopIdx: 0,
+      });
+      seg.tail.forEach((hop, hi) => {
+        steps.push({
+          kind: "tail-hop",
+          nodeId: hop.to,
+          fromNode: hop.from,
+          hop: hop,
+          label: stepTitle(hop.to),
+          phase: "tail",
+          segmentIdx: si,
+          tailHopIdx: hi + 1,
+          overlay: hop.overlay || null,
+        });
+      });
+    }
+  });
+  return steps;
+}
+
+function computeStateAtTimelineStep(timeline, idx, scenario) {
+  const state = {
+    phase: "hops",
+    segmentIdx: 0,
+    mainHopIdx: 0,
+    mainDone: false,
+    parallelHopIdxs: null,
+    tailHopIdx: 0,
+    tailDone: false,
+    activeNodeId: "ov-client",
+    overlay: null,
+    lastContainer: null,
+  };
+  for (let i = 0; i <= idx && i < timeline.length; i++) {
+    const s = timeline[i];
+    state.segmentIdx = s.segmentIdx || 0;
+    if (s.kind === "start") {
+      state.phase = "hops";
+      state.mainHopIdx = 0;
+      state.activeNodeId = s.nodeId;
+      state.overlay = null;
+    } else if (s.kind === "hop") {
+      state.phase = "hops";
+      state.mainHopIdx = s.mainHopIdx;
+      state.activeNodeId = s.nodeId;
+      state.overlay = s.overlay || null;
+      if (s.hop && containerForHop(s.hop)) state.lastContainer = containerForHop(s.hop);
+    } else if (s.kind === "parallel-start") {
+      state.phase = "parallel";
+      state.mainDone = true;
+      state.mainHopIdx = (scenario.segments[s.segmentIdx].hops || []).length;
+      state.parallelHopIdxs = scenario.segments[s.segmentIdx].parallel.map(() => 0);
+      state.activeNodeId = s.nodeId || state.activeNodeId;
+    } else if (s.kind === "parallel-hop") {
+      state.phase = "parallel";
+      const seg = scenario.segments[s.segmentIdx];
+      if (!state.parallelHopIdxs) {
+        state.parallelHopIdxs = seg.parallel.map(() => 0);
+      }
+      state.parallelHopIdxs[s.branchIdx] = s.branchHopIdx;
+      state.activeNodeId = s.nodeId;
+      state.overlay = s.overlay || null;
+    } else if (s.kind === "tail-start") {
+      state.phase = "tail";
+      state.tailHopIdx = 0;
+      state.activeNodeId = state.activeNodeId || "wr-w202";
+    } else if (s.kind === "tail-hop") {
+      state.phase = "tail";
+      state.tailHopIdx = s.tailHopIdx;
+      state.activeNodeId = s.nodeId;
+      state.overlay = s.overlay || null;
+    }
+  }
+  const seg = scenario.segments[state.segmentIdx];
+  if (state.phase === "hops") {
+    state.mainDone = state.mainHopIdx >= (seg.hops || []).length;
+  }
+  if (state.phase === "tail" && seg.tail) {
+    state.tailDone = state.tailHopIdx >= seg.tail.length;
+  }
+  return state;
+}
+
+function showNarration(nodeId, extra) {
+  const box = $("#simNarration");
+  if (!box) return;
+  let n = STEP_NARRATION[nodeId] || STEP_NARRATION._default;
+  if (nodeId === "st-shed" && trafficEngine.scenario && SHED_NARRATION[trafficEngine.scenario.id]) {
+    n = SHED_NARRATION[trafficEngine.scenario.id];
+  }
+  const rk = regionKeyFromNode(nodeId);
+  const regionLabel = (activeView.regions && activeView.regions[rk]) ? activeView.regions[rk].label : rk;
+  const depth = REGION_DEPTH[rk] || "";
+  const crumb = $("#simCrumb");
+  const cap = $("#simCaption");
+  const hint = $("#simHint");
+  if (crumb) crumb.textContent = regionLabel;
+  if (cap) {
+    const dive = extra ? '<br><span style="color:var(--warn)">' + extra + "</span>" : "";
+    cap.innerHTML = (depth ? '<span class="sim-depth">' + depth + "</span>" : "") +
+      "<strong>" + n.title + "</strong> — " + n.text + dive;
+  }
+  if (hint && trafficEngine.playing) {
+    hint.textContent = "Zoom otomatis hanya saat masuk container (mis. app ×2 → protection stack di dalamnya). Node biasa tidak di-zoom.";
+  }
+  box.classList.remove("hidden");
+}
+
+/* ════════════════════════════════════════════════════════════════
+   TRAFFIC SCENARIOS — unified mega canvas (single segment)
+   ════════════════════════════════════════════════════════════════ */
+
+const STACK_HOPS = [
+  { from: "req", to: "wrap" },
+  { from: "wrap", to: "l1" },
+  { from: "l1", to: "l2" },
+  { from: "l2", to: "l3" },
+  { from: "l3", to: "l4" },
+  { from: "l4", to: "l5" },
+  { from: "l5", to: "l6" },
+  { from: "l6", to: "handler" },
+];
+
+const OVERVIEW_ENTRY = [
+  { from: "client", to: "nginx" },
+  { from: "nginx", to: "app" },
+];
+
+const MEGA_WRITE_ENTRY = prefixHops(OVERVIEW_ENTRY, "ov-").concat(
+  [{ from: "ov-app", to: "st-req", virtual: true }],
+  prefixHops(STACK_HOPS, "st-"),
+  [{ from: "st-handler", to: "wr-wpost", virtual: true }]
+);
+
+const SCENARIOS = [
+  {
+    id: "write-happy",
+    group: "write",
+    label: "Write path — POST → 202 → settled",
+    segments: [{
+      viewId: "mega",
+      hops: MEGA_WRITE_ENTRY.concat([
+        { from: "wr-wpost", to: "wr-wval" },
+        { from: "wr-wval", to: "wr-wkey", pauseMs: 900, overlay: "hash(from) % NUM_SHARDS → txn:{shard}:{ref}" },
+        { from: "wr-wkey", to: "wr-wres" },
+      ]),
+      parallel: [
+        {
+          color: "client",
+          hops: [{ from: "wr-wres", to: "wr-w202", fromSide: "left", toSide: "right" }],
+        },
+        {
+          color: "app",
+          delayMs: 400,
+          hops: prefixHops([
+            { from: "wres", to: "wintake" },
+            { from: "wintake", to: "wq" },
+            { from: "wq", to: "wcons" },
+            { from: "wcons", to: "wapply" },
+            { from: "wapply", to: "wsame" },
+            { from: "wsame", to: "wbus" },
+            { from: "wbus", to: "winval", fromSide: "left", toSide: "right" },
+            { from: "winval", to: "wnotif", fromSide: "left", toSide: "right" },
+          ], "wr-"),
+        },
+      ],
+      tail: [
+        { from: "wr-wnotif", to: "wr-w202", virtual: true },
+        { from: "wr-w202", to: "wr-wpost", virtual: true, label: "GET /status → completed" },
+      ],
+    }],
+  },
+  {
+    id: "write-cross-shard",
+    group: "write",
+    label: "Write path — cross-shard branch",
+    segments: [{
+      viewId: "mega",
+      hops: MEGA_WRITE_ENTRY.concat(
+        prefixHops([
+          { from: "wpost", to: "wval" },
+          { from: "wval", to: "wkey", pauseMs: 600 },
+          { from: "wkey", to: "wres" },
+        ], "wr-")
+      ),
+      parallel: [
+        { color: "client", hops: [{ from: "wr-wres", to: "wr-w202", fromSide: "left", toSide: "right" }] },
+        {
+          color: "app",
+          delayMs: 400,
+          hops: prefixHops([
+            { from: "wres", to: "wintake" },
+            { from: "wintake", to: "wq" },
+            { from: "wq", to: "wcons" },
+            { from: "wcons", to: "wapply" },
+            { from: "wapply", to: "wxs", fromSide: "left", toSide: "right" },
+            { from: "wxs", to: "wxsp" },
+            { from: "wxsp", to: "wbus", fromSide: "right", toSide: "left", kind: "dashed" },
+            { from: "wbus", to: "winval", fromSide: "left", toSide: "right" },
+            { from: "winval", to: "wnotif", fromSide: "left", toSide: "right" },
+          ], "wr-"),
+        },
+      ],
+      tail: [
+        { from: "wr-wnotif", to: "wr-w202", virtual: true },
+        { from: "wr-w202", to: "wr-wpost", virtual: true },
+      ],
+    }],
+  },
+  {
+    id: "write-shed",
+    group: "protection",
+    label: "Protection stack — rate limit shed (429)",
+    segments: [{
+      viewId: "mega",
+      hops: prefixHops(OVERVIEW_ENTRY, "ov-").concat(
+        [{ from: "ov-app", to: "st-req", virtual: true }],
+        prefixHops([
+          { from: "req", to: "wrap" },
+          { from: "wrap", to: "l1" },
+          { from: "l1", to: "l2" },
+          { from: "l2", to: "l3" },
+          { from: "l3", to: "shed", fromSide: "left", toSide: "right", kind: "danger" },
+        ], "st-")
+      ),
+    }],
+  },
+  {
+    id: "write-shed-backpressure",
+    group: "protection",
+    label: "Protection stack — backpressure shed (503)",
+    segments: [{
+      viewId: "mega",
+      hops: prefixHops(OVERVIEW_ENTRY, "ov-").concat(
+        [{ from: "ov-app", to: "st-req", virtual: true }],
+        prefixHops([
+          { from: "req", to: "wrap" },
+          { from: "wrap", to: "l1" },
+          { from: "l1", to: "shed", fromSide: "left", toSide: "right", kind: "danger" },
+        ], "st-")
+      ),
+    }],
+  },
+  {
+    id: "write-shed-degradation",
+    group: "protection",
+    label: "Protection stack — degradation shed (503 read_only)",
+    segments: [{
+      viewId: "mega",
+      hops: prefixHops(OVERVIEW_ENTRY, "ov-").concat(
+        [{ from: "ov-app", to: "st-req", virtual: true }],
+        prefixHops([
+          { from: "req", to: "wrap" },
+          { from: "wrap", to: "l1" },
+          { from: "l1", to: "l2" },
+          { from: "l2", to: "l3" },
+          { from: "l3", to: "l4" },
+          { from: "l4", to: "l5" },
+          { from: "l5", to: "shed", fromSide: "left", toSide: "right", kind: "danger" },
+        ], "st-")
+      ),
+    }],
+  },
+  {
+    id: "write-shed-auth",
+    group: "protection",
+    label: "Protection stack — auth shed (401, optional)",
+    segments: [{
+      viewId: "mega",
+      hops: prefixHops(OVERVIEW_ENTRY, "ov-").concat(
+        [{ from: "ov-app", to: "st-req", virtual: true }],
+        prefixHops([
+          { from: "req", to: "wrap" },
+          { from: "wrap", to: "l1" },
+          { from: "l1", to: "l2" },
+          { from: "l2", to: "l3" },
+          { from: "l3", to: "l4" },
+          { from: "l4", to: "shed", fromSide: "left", toSide: "right", kind: "danger" },
+        ], "st-")
+      ),
+    }],
+  },
+  {
+    id: "read-balance",
+    group: "read",
+    label: "Read path — GET balance (cache tiers)",
+    segments: [{
+      viewId: "mega",
+      hops: prefixHops(OVERVIEW_ENTRY, "ov-").concat(
+        [{ from: "ov-app", to: "rd-rb1", virtual: true, kind: "dashed" }],
+        prefixHops([
+          { from: "rb1", to: "rb2", label: "miss" },
+          { from: "rb2", to: "rb3", label: "miss" },
+          { from: "rb3", to: "rb4" },
+        ], "rd-")
+      ),
+      tail: [{ from: "rd-rb4", to: "rd-rb1", virtual: true, label: "200 + balance JSON" }],
+    }],
+  },
+  {
+    id: "read-status",
+    group: "read",
+    label: "Read path — GET /status/{ref} (poll after write)",
+    segments: [{
+      viewId: "mega",
+      hops: prefixHops(OVERVIEW_ENTRY, "ov-").concat(
+        [{ from: "ov-app", to: "rd-rs1", virtual: true, kind: "dashed" }],
+        prefixHops([
+          { from: "rs1", to: "rs2", label: "miss" },
+        ], "rd-")
+      ),
+      tail: [{ from: "rd-rs2", to: "rd-rs1", virtual: true, label: "200 · pending/completed JSON" }],
+    }],
+  },
+  {
+    id: "read-list",
+    group: "read",
+    label: "Read path — GET list (safe-cursor fan-out)",
+    segments: [{
+      viewId: "mega",
+      hops: prefixHops(OVERVIEW_ENTRY, "ov-").concat(
+        [{ from: "ov-app", to: "rd-rl1", virtual: true, kind: "dashed" }],
+        prefixHops([
+          { from: "rl1", to: "rl2" },
+          { from: "rl2", to: "rl3", label: "miss" },
+          { from: "rl3", to: "rl4" },
+        ], "rd-")
+      ),
+      tail: [{ from: "rd-rl4", to: "rd-rl1", virtual: true, label: "200 + merged page JSON" }],
+    }],
+  },
+];
+
+/* ════════════════════════════════════════════════════════════════
+   DETAILS — facts + clickable proofs per node
+   ════════════════════════════════════════════════════════════════ */
+
+const ADR = {
+  a1: ["docs/adr/0001-modular-monolith.md", "ADR-0001 — modular monolith"],
+  a2: ["docs/adr/0002-cargo-workspace-split.md", "ADR-0002 — cargo workspace split"],
+  a3: ["docs/adr/0003-port-adapter-shape.md", "ADR-0003 — port/adapter shape"],
+  a4: ["docs/adr/0004-in-process-event-bus.md", "ADR-0004 — in-process event bus"],
+  a5: ["docs/adr/0005-patroni-over-pg-auto-failover.md", "ADR-0005 — Patroni over pg_auto_failover"],
+  a6: ["docs/adr/0006-haproxy-primary-routing.md", "ADR-0006 — HAProxy primary routing"],
+  a7: ["docs/adr/0007-v1-cull-and-rename.md", "ADR-0007 — v1 cull & rename"],
+};
+const RB = {
+  patroni: ["docs/runbooks/patroni-failover-manual.md", "Runbook — Patroni failover (manual)"],
+  etcd: ["docs/runbooks/etcd-quorum-loss.md", "Runbook — etcd quorum loss"],
+  sentinel: ["docs/runbooks/redis-sentinel-post-promotion.md", "Runbook — Redis Sentinel post-promotion"],
+  outbox: ["docs/runbooks/cross-shard-outbox-reconciliation.md", "Runbook — cross-shard outbox reconciliation"],
+  rabbit: ["docs/runbooks/rabbitmq-backlog-drain.md", "Runbook — RabbitMQ backlog drain"],
+  hotkey: ["docs/runbooks/hot-key-spike-response.md", "Runbook — hot-key spike response"],
+  expo: ["docs/runbooks/exhibition-readiness.md", "Runbook — exhibition readiness"],
+};
+
+const DETAILS = {
+
+/* — view 1 — */
+client: {
+  plane: "client",
+  facts: [
+    "Entry point for browsers and the k6 load profiles; everything below the edge is reachable only on the internal compose network.",
+    "Single exposed HTTP port: nginx <code>:8080→80</code>.",
+  ],
+  code: [["docker-compose.yml", 358, "nginx service"]],
+  docs: [RB.expo],
+},
+nginx: {
+  plane: "edge",
+  facts: [
+    "Two limit zones: per-IP <code>2000 r/s</code> (zone per_ip, 20m) + whole-server <code>50000 r/s</code> (zone global, 2m); both return <code>429</code>.",
+    "Defaults come from <code>NGINX_PER_IP_RATE=2000</code> / <code>NGINX_GLOBAL_RATE=50000</code>.",
+    "<code>GET /api/v2/transactions</code> is micro-cached for 1s (<code>X-Cache-Status</code> header exposed); other API routes are uncached with request-body streaming (<code>proxy_request_buffering off</code>).",
+    "<code>/health</code> and <code>/metrics</code> bypass rate limits and cache.",
+    "<code>limit_conn conn_per_ip 5000</code> caps concurrent connections per client.",
+  ],
+  code: [
+    ["nginx/nginx.conf.template", 90, "limit zones"],
+    ["nginx/nginx.conf.template", 136, "GET route: cache 1s + limits"],
+    ["nginx/nginx.conf.template", 167, "other API routes"],
+    ["nginx/nginx.conf.template", 122, "/health & /metrics unlimited"],
+    [".env.example", 731, "rate defaults"],
+    ["docker-compose.yml", 358, "service"],
+  ],
+  docs: [RB.hotkey],
+},
+app: {
+  plane: "app",
+  facts: [
+    "<code>replicas: 2</code> × 1.0 CPU — deliberate: more replicas oversubscribe the 8-core host and inflate p95/p99 (comment in compose).",
+    "Hardened: distroless + nonroot (UID 65532), <code>read_only</code> rootfs, <code>cap_drop: ALL</code>, <code>no-new-privileges</code>, pids ≤ 256, /tmp tmpfs 64m.",
+    "Healthcheck execs the binary itself: <code>peakload-capstone --health-check</code> every 10s (TCP probe of /health from inside).",
+    "One binary wires three module crates (accounts, transactions, notifications) + shared_kernel; router composed in <code>bootstrap.rs</code>.",
+    "Boot is gated on pgbouncer-shard0 healthy, schema bootstrap + migrator completed, redis + sentinel + rabbitmq healthy; shard1/shard2/otel deps are <code>required: false</code>.",
+  ],
+  code: [
+    ["docker-compose.yml", 402, "app service (hardening)"],
+    ["docker-compose.yml", 496, "replicas: 2 + rationale"],
+    ["docker-compose.yml", 476, "healthcheck"],
+    ["crates/app/src/bootstrap.rs", 635, "router composition"],
+    ["crates/app/src/main.rs", 46, "--health-check gate"],
+    ["crates/app/src/main.rs", 135, "health_probe()"],
+  ],
+  docs: [ADR.a1, ADR.a2, ADR.a3, ADR.a7],
+},
+"redis-m": {
+  plane: "redis",
+  facts: [
+    "Roles: tiered-cache L2, idempotency reservations (<code>SETNX</code>), pending/inflight intake lists, rate-limit state.",
+    "Persistence: <code>appendonly yes</code> + <code>appendfsync everysec</code> → ≤1s loss bound.",
+    "App connects Sentinel-aware: <code>REDIS_SENTINEL_NODES</code> (3 nodes), master name <code>peakload-master</code>, monitor interval 5s.",
+  ],
+  code: [
+    ["docker-compose.yml", 1026, "redis-master"],
+    ["docker-compose.yml", 422, "sentinel wiring in app env"],
+  ],
+  docs: [RB.sentinel],
+},
+"redis-r": {
+  plane: "redis",
+  facts: [
+    "Async replica of the master; cache reads can be offloaded via <code>REDIS_READ_URL=redis://…@redis-replica:6379</code>.",
+    "Promotion candidate when Sentinel quorum declares the master down.",
+  ],
+  code: [
+    ["docker-compose.yml", 1045, "redis-replica"],
+    [".env.example", 468, "REDIS_READ_URL"],
+  ],
+  docs: [RB.sentinel],
+},
+sentinels: {
+  plane: "redis",
+  facts: [
+    "Three Sentinels monitor <code>peakload-master</code>; quorum promotes the replica on master failure.",
+    "The app re-resolves the master through Sentinel — no restart needed after promotion.",
+  ],
+  code: [
+    ["docker-compose.yml", 1079, "sentinel-1"],
+    ["docker-compose.yml", 1083, "sentinel-2"],
+    ["docker-compose.yml", 1087, "sentinel-3"],
+  ],
+  docs: [RB.sentinel],
+},
+pgb0: {
+  plane: "pg",
+  facts: [
+    "Transaction-pooling pgBouncer in front of shard0's primary; <code>MAX_DB_CONNECTIONS=200</code> caps backend connections.",
+    "Write path: app → pgbouncer-shard0 → HAProxy primary fe <code>:5000</code> → whichever Patroni node is primary.",
+    "Consumer prefetch (200) is sized to stay within this cap.",
+  ],
+  code: [
+    ["docker-compose.yml", 610, "pgbouncer-shard0"],
+    ["crates/transactions/src/infrastructure/consumer.rs", 58, "prefetch ↔ pool cap comment"],
+  ],
+  docs: [ADR.a6],
+},
+pgb1: {
+  plane: "pg",
+  facts: [
+    "Same as shard0's pooler but profile-gated: active because the default <code>COMPOSE_PROFILES=shard1,prometheus,grafana</code> includes <code>shard1</code>.",
+    "App dependency is <code>required: false</code> — compose without the profile boots single-shard.",
+  ],
+  code: [
+    ["docker-compose.yml", 743, "pgbouncer-shard1"],
+    [".env.example", 91, "COMPOSE_PROFILES default"],
+    ["docker-compose.yml", 452, "required:false comment"],
+  ],
+  docs: [],
+},
+readpool: {
+  plane: "pg",
+  facts: [
+    "Optional read-side poolers (profile <code>readpool</code>, off by default): app → pgbouncer-read → HAProxy replica fe.",
+    "Pool size default 30 per shard (<code>PGBOUNCER_READ_DEFAULT_POOL_SIZE</code>); 32M memory cap each.",
+    "Without the profile, app read pools (40/shard) connect straight to HAProxy <code>:5010/:5011</code>.",
+  ],
+  code: [
+    ["docker-compose.yml", 636, "pgbouncer-read-shard0"],
+    ["docker-compose.yml", 655, "pgbouncer-read-shard1"],
+    [".env.example", 133, "readpool toggle docs"],
+  ],
+  docs: [],
+},
+haproxy: {
+  plane: "pg",
+  facts: [
+    "Single HAProxy routes both directions: primary frontends <code>:5000</code> (shard0) / <code>:5001</code> (shard1), replica frontends <code>:5010</code> / <code>:5011</code>.",
+    "Backend selection via Patroni REST health probes — primary fe sends traffic to the node answering as primary, replica fe to the replica.",
+    "Failover = probes flip = routing flips; clients keep one stable address.",
+  ],
+  code: [
+    ["docker-compose.yml", 836, "pg-haproxy"],
+    ["docker-compose.yml", 642, "replica fe :5010 comment"],
+    [".env.example", 149, "read URLs → :5010/:5011"],
+  ],
+  docs: [ADR.a6, ADR.a5],
+},
+etcd: {
+  plane: "infra",
+  facts: [
+    "Three-node etcd = Patroni's DCS: leader election, cluster config, member state.",
+    "Tolerates one node loss; if quorum is lost Patroni demotes all primaries to read-only to prevent split-brain (comment in compose).",
+    "No external port exposure.",
+  ],
+  code: [
+    ["docker-compose.yml", 503, "cluster rationale comment"],
+    ["docker-compose.yml", 515, "etcd-1"],
+  ],
+  docs: [RB.etcd, ADR.a5],
+},
+shard0: {
+  plane: "pg",
+  facts: [
+    "Always-on shard: <code>pg-shard0-node-a</code> + <code>node-b</code>, Patroni-managed streaming replication.",
+    "Accounts are routed to shards by hash (<code>shard_for_account</code>); shard0 is the default home.",
+  ],
+  code: [
+    ["docker-compose.yml", 558, "node-a"],
+    ["docker-compose.yml", 584, "node-b"],
+  ],
+  docs: [ADR.a5, RB.patroni],
+},
+shard1: {
+  plane: "pg",
+  facts: [
+    "Profile <code>shard1</code> — ON in the default profile set.",
+    "Identical Patroni pair shape as shard0; writes arrive via pgbouncer-shard1 → HAProxy <code>:5001</code>.",
+  ],
+  code: [
+    ["docker-compose.yml", 699, "node-a"],
+    ["docker-compose.yml", 720, "node-b"],
+    [".env.example", 91, "COMPOSE_PROFILES default"],
+  ],
+  docs: [ADR.a5],
+},
+shard2: {
+  plane: "pg",
+  facts: [
+    "Profile <code>shard2</code> — OFF by default; the pair + its pgbouncer exist in compose but don't start.",
+    "Enabling = add the profile + uncomment <code>DATABASE_SHARD2_*</code> URLs (read fe would be <code>:5012</code>).",
+  ],
+  code: [
+    ["docker-compose.yml", 766, "node-a"],
+    ["docker-compose.yml", 787, "node-b"],
+    ["docker-compose.yml", 810, "pgbouncer-shard2"],
+    [".env.example", 155, "shard2 read URL (commented)"],
+  ],
+  docs: [],
+},
+rabbit: {
+  plane: "mq",
+  facts: [
+    "One work queue: <code>transactions.process</code>, durable, with DLX → DLQ for poison messages.",
+    "Producers: redis-intake + publish-outbox workers. Consumer: in-app batch consumer, prefetch 200.",
+  ],
+  code: [
+    ["docker-compose.yml", 1094, "rabbitmq service"],
+    ["crates/transactions/src/infrastructure/consumer.rs", 56, "QUEUE_NAME"],
+  ],
+  docs: [RB.rabbit],
+},
+jobs: {
+  plane: "infra",
+  facts: [
+    "<code>db-bootstrap-schema</code>: one-shot psql apply of <code>db/init.sql</code> per shard primary (idempotent).",
+    "<code>db-migrator</code>: the app binary with <code>--migrate</code> — applies sqlx migrations with its own 60s lock/statement timeouts (overriding the 2s/500ms server defaults).",
+    "Both must complete before the app starts (<code>service_completed_successfully</code>).",
+  ],
+  code: [
+    ["docker-compose.yml", 928, "db-bootstrap-schema"],
+    ["docker-compose.yml", 988, "db-migrator"],
+    ["crates/app/src/main.rs", 59, "--migrate gate"],
+    ["crates/app/src/main.rs", 83, "migrate_all_shards()"],
+  ],
+  docs: [],
+},
+obs: {
+  plane: "obs",
+  facts: [
+    "Default profile set is <code>shard1,prometheus,grafana</code> — so Prometheus + Grafana run by default; otel-collector, Jaeger and cAdvisor are opt-in profiles.",
+    "App's otel dependency is <code>required: false</code> — tracing export degrades gracefully when the collector is absent.",
+  ],
+  code: [
+    ["docker-compose.yml", 1142, "prometheus"],
+    ["docker-compose.yml", 1236, "grafana"],
+    ["docker-compose.yml", 1176, "otel-collector"],
+    ["docker-compose.yml", 1212, "jaeger"],
+    ["docker-compose.yml", 1272, "cadvisor"],
+    [".env.example", 91, "COMPOSE_PROFILES default"],
+  ],
+  docs: [RB.expo],
+},
+
+/* — view 2 — */
+req:  { plane: "client", facts: ["Arrives from nginx with <code>X-Real-IP</code> set — the rate limiter keys on it."], code: [["nginx/nginx.conf.template", 136, "proxied API route"]], docs: [] },
+wrap: {
+  plane: "app",
+  facts: [
+    "Outside the protection stack proper: CORS, <code>TraceLayer</code> (http.request spans), <code>TimeoutLayer</code>, request-id injector.",
+    "These run before/around everything so even shed requests get traced and stamped.",
+  ],
+  code: [
+    ["crates/app/src/bootstrap.rs", 661, "TimeoutLayer"],
+    ["crates/app/src/bootstrap.rs", 666, "TraceLayer"],
+    ["crates/app/src/middleware/request_id.rs", null, "request_id middleware"],
+  ],
+  docs: [],
+},
+l1: {
+  plane: "app",
+  facts: [
+    "Semaphore-bounded concurrency. A request waits up to <code>BACKPRESSURE_WAIT_MS=50</code> (default) for a permit, then sheds <code>503 + Retry-After</code>.",
+    "Outermost stack layer: cheapest rejection happens before any other work.",
+  ],
+  code: [
+    ["crates/app/src/middleware/backpressure.rs", null, "middleware"],
+    ["crates/app/src/config.rs", 369, "BACKPRESSURE_WAIT_MS default"],
+  ],
+  docs: [],
+},
+l2: {
+  plane: "app",
+  facts: [
+    "Three states tracked lock-free: <code>CLOSED / OPEN / HALF_OPEN</code> (CAS transitions).",
+    "Failure threshold default <code>CIRCUIT_BREAKER_FAILURE_THRESHOLD=50</code>.",
+    "Sits above rate-limit/auth so an open breaker sheds before they spend cycles.",
+  ],
+  code: [
+    ["crates/app/src/middleware/circuit_breaker.rs", 25, "state constants"],
+    ["crates/app/src/config.rs", 321, "threshold default"],
+  ],
+  docs: [],
+},
+l3: {
+  plane: "app",
+  facts: [
+    "Token accounting sharded across <code>SHARDS=64</code> lock stripes to avoid a single hot mutex.",
+    "Defaults <code>RATE_LIMIT_PER_SECOND=2000</code>, <code>RATE_LIMIT_BURST=4000</code>; rejection = <code>429 + Retry-After</code>.",
+    "Second line behind nginx's per-IP/global zones — defence in depth.",
+  ],
+  code: [
+    ["crates/app/src/middleware/rate_limit.rs", 27, "SHARDS = 64"],
+    ["crates/app/src/config.rs", 314, "rps + burst defaults"],
+  ],
+  docs: [RB.hotkey],
+},
+l4: {
+  plane: "app",
+  facts: [
+    "Validator and decoding key are process-wide statics, pinned to HS256 — an HS512-signed token is rejected (S-1 regression test).",
+    "<code>ENABLE_AUTH=false</code> by default (exhibition mode); when on, boot fails closed if issuer/audience config is missing.",
+  ],
+  code: [
+    ["crates/app/src/middleware/auth.rs", 15, "pinned statics"],
+    ["crates/app/src/middleware/auth.rs", 257, "S-1 HS512-rejection test"],
+    ["crates/app/src/config.rs", 353, "ENABLE_AUTH default"],
+    ["docker-compose.yml", 433, "fail-closed comment"],
+  ],
+  docs: [],
+},
+l5: {
+  plane: "app",
+  facts: [
+    "R-9 operator posture: <code>DEGRADATION_MODE=normal</code> default; <code>read_only</code> sheds writes with 503 while reads keep flowing.",
+    "Flippable at runtime via <code>PUT /api/v2/admin/degradation</code> — no restart.",
+  ],
+  code: [
+    ["crates/app/src/config.rs", 351, "mode default"],
+    ["docker-compose.yml", 439, "R-9 seed + admin flip comment"],
+    ["crates/app/src/degradation.rs", null, "DegradationFlag"],
+  ],
+  docs: [RB.expo],
+},
+l6: {
+  plane: "app",
+  facts: [
+    "Innermost layer records <code>http_requests_total</code> + latency histograms — by position, traffic shed at L1–L5 never pollutes success-rate metrics.",
+    "Shed traffic is counted by per-layer shed counters instead.",
+  ],
+  code: [["crates/app/src/middleware/metrics.rs", null, "metrics layer"]],
+  docs: [],
+},
+handler: {
+  plane: "app",
+  facts: [
+    "Module routers merged in bootstrap: accounts, transactions, notifications + health/metrics endpoints.",
+    "Admin router mounts with an extra <code>require_admin_middleware</code> gate.",
+  ],
+  code: [
+    ["crates/app/src/bootstrap.rs", 635, "Router::new() composition"],
+    ["crates/app/src/bootstrap.rs", 630, "admin mount"],
+  ],
+  docs: [ADR.a7],
+},
+shed: {
+  plane: "edge",
+  facts: [
+    "Every layer rejects with the cheapest possible response + <code>Retry-After</code> where meaningful.",
+    "Each shed increments its own counter family — dashboards can tell <em>which</em> layer is shedding.",
+  ],
+  code: [["crates/app/src/middleware/backpressure.rs", null, "503"], ["crates/app/src/middleware/rate_limit.rs", null, "429"]],
+  docs: [],
+},
+proof: {
+  plane: "infra",
+  facts: [
+    "With sequential <code>Router::layer</code> calls the <strong>last</strong> <code>.layer()</code> added is the <strong>outermost</strong> at runtime — the bootstrap comment spells out the resulting order: backpressure → breaker → rate-limit → auth → degradation → metrics → handler.",
+    "Stack is applied in one place: <code>apply_protection_stack(...)</code>.",
+  ],
+  code: [
+    ["crates/app/src/bootstrap.rs", 687, "apply_protection_stack + order comment"],
+    ["crates/app/src/bootstrap.rs", 563, "call site"],
+  ],
+  docs: [],
+},
+admin: {
+  plane: "infra",
+  facts: [
+    "<code>/api/v2/admin/*</code> (degradation posture, etc.) guarded by <code>require_admin_middleware</code>.",
+  ],
+  code: [["crates/app/src/bootstrap.rs", 630, "admin mount"], ["crates/app/src/admin.rs", null, "handlers"]],
+  docs: [],
+},
+
+/* — view 3 — */
+wpost: {
+  plane: "client",
+  facts: [
+    "Client supplies <code>reference_id</code> for idempotent retries (server generates a UUID if absent).",
+    "Success contract is <code>202 Accepted</code> — settlement is asynchronous.",
+  ],
+  code: [["docs/apiContract.yaml", null, "API contract"]],
+  docs: [],
+},
+wval: {
+  plane: "app",
+  facts: [
+    "Validation chain: amount (positive, matches DB constraint — property-tested), currency, reference_id ASCII-only ≤100 chars (closes NFC/NFD dedupe ambiguity).",
+    "Optional cross-module sender check is OFF by default (<code>TX_VERIFY_FROM_ACCOUNT=false</code>): the consumer re-validates balance under <code>UPDATE … WHERE balance &gt;= $1</code> anyway.",
+  ],
+  code: [
+    ["crates/transactions/src/api/handlers.rs", null, "handler"],
+    ["crates/transactions/src/application/mod.rs", 335, "optional sender check"],
+    ["crates/app/src/config.rs", 365, "TX_VERIFY_FROM_ACCOUNT default"],
+  ],
+  docs: [ADR.a3],
+},
+wkey: {
+  plane: "app",
+  facts: [
+    "Shard = hash(from_account). Idempotency key = <code>txn:{shard}:{reference_id}</code> — shard embedded so equal reference_ids on different shards stay distinct (injectivity property-tested).",
+    "SHA-256 of the canonical payload becomes <code>request_hash</code> — replays with different bodies are detected as conflicts.",
+  ],
+  code: [["crates/transactions/src/application/mod.rs", 360, "key + hash build"]],
+  docs: [],
+},
+wres: {
+  plane: "redis",
+  facts: [
+    "<code>IDEMPOTENCY_BACKEND=hybrid</code> (default): Redis is the primary reservation store, PG engages only when Redis errors synchronously.",
+    "Reserve = <code>SETNX v1:idemp:{key}</code> (TTL <code>86_400</code>s = 24h) storing request_hash + both payloads + shard, then <code>LPUSH v1:idemp_pending:s{shard}</code>.",
+    "Replay with same hash → replays stored 202; different hash → conflict.",
+  ],
+  code: [
+    ["crates/app/src/config.rs", 159, "backend selection"],
+    ["crates/transactions/src/infrastructure/redis_idempotency.rs", 67, "TTL_SECS = 86_400"],
+    ["crates/transactions/src/infrastructure/redis_idempotency.rs", 82, "entry/pending/inflight keys"],
+    ["crates/transactions/src/infrastructure/redis_idempotency.rs", 135, "SETNX reserve"],
+  ],
+  docs: [],
+},
+wfall: {
+  plane: "pg",
+  facts: [
+    "Fallback lane only on synchronous Redis <code>Err</code>: reservation row in PG with the same 24h TTL semantics (<code>IDEMPOTENCY_TTL_SECS=86_400</code>).",
+    "A SETNX that succeeds and is later lost in failover does NOT trigger fallback — the PG <code>ON CONFLICT</code> in the batch apply is the last line of dedupe.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/repository.rs", 433, "PG TTL"],
+    ["crates/transactions/src/infrastructure/redis_idempotency.rs", 38, "hybrid semantics doc"],
+  ],
+  docs: [],
+},
+w202: {
+  plane: "client",
+  facts: [
+    "Returned as soon as the reservation lands — DB write happens later on the intake worker.",
+    "Client polls <code>GET /api/v2/transactions/status/{reference_id}</code>.",
+  ],
+  code: [["crates/transactions/src/api/handlers.rs", 286, "status endpoint"]],
+  docs: [],
+},
+wintake: {
+  plane: "app",
+  facts: [
+    "Drains <code>v1:idemp_pending:s{shard}</code> with <code>RPOPLPUSH pending → inflight</code> — atomic claim; crash-restart drains inflight first so nothing is lost between SETNX and PG commit.",
+    "Idle tick 10ms · error backoff 500ms · publish concurrency 16 · queue-depth sampled every 5s.",
+    "GETs the full entry from the <em>master</em> pool to avoid replication-lag staleness.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/redis_intake.rs", 45, "ticks + backoff"],
+    ["crates/transactions/src/infrastructure/redis_intake.rs", 65, "PUBLISH_CONCURRENCY = 16"],
+    ["crates/transactions/src/infrastructure/redis_idempotency.rs", 94, "inflight key"],
+  ],
+  docs: [],
+},
+wpub: {
+  plane: "app",
+  facts: [
+    "Companion worker for the PG-fallback lane: leases unpublished outbox rows (lease 600s), publishes to RabbitMQ in batches of 25, concurrency 8.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/publish_outbox.rs", 28, "BATCH_SIZE = 25"],
+    ["crates/transactions/src/infrastructure/publish_outbox.rs", 57, "LEASE_SECS = 600"],
+  ],
+  docs: [],
+},
+wq: {
+  plane: "mq",
+  facts: [
+    "Durable queue <code>transactions.process</code>; AMQP prefetch derives from <code>BATCH_SIZE=200</code> (<code>basic_qos</code>), sized within pgbouncer's 200-connection cap.",
+    "Dead-letter exchange routes poison messages to the DLQ.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/consumer.rs", 56, "queue + tag"],
+    ["crates/transactions/src/infrastructure/consumer.rs", 58, "prefetch rationale"],
+  ],
+  docs: [RB.rabbit],
+},
+wdlq: {
+  plane: "mq",
+  facts: [
+    "Rejected without requeue: undeserializable JSON, NULL <code>reference_id</code> (would bypass <code>ON CONFLICT (reference_id, …)</code> dedupe).",
+    "Drain procedure lives in the runbook.",
+  ],
+  code: [["crates/transactions/src/infrastructure/consumer.rs", 547, "deserialize + guard"]],
+  docs: [RB.rabbit],
+},
+wcons: {
+  plane: "app",
+  facts: [
+    "Buffers deliveries; flushes on size (<code>BATCH_SIZE=200</code>) or idle (<code>IDLE_FLUSH_MS=250</code>, checked every <code>CHECK_INTERVAL_MS=50</code>).",
+    "250ms idle window exists because the old fixed 50ms timer fired before batches accumulated (avg 2.1 msgs/batch — see the doc comment).",
+    "Each message's span is parented to the originating HTTP trace via AMQP headers.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/consumer.rs", 66, "BATCH_SIZE"],
+    ["crates/transactions/src/infrastructure/consumer.rs", 67, "IDLE_FLUSH_MS doc + 2.1 rationale"],
+    ["crates/transactions/src/infrastructure/consumer.rs", 85, "CHECK_INTERVAL_MS"],
+  ],
+  docs: [ADR.a4],
+},
+wapply: {
+  plane: "pg",
+  facts: [
+    "One PL/pgSQL call per shard-batch: bulk-claims rows with a <code>WITH ins AS (INSERT … ON CONFLICT DO NOTHING RETURNING …)</code> CTE, then loops rows for debit/credit.",
+    "<code>UNIQUE (reference_id, from_account)</code> is the serialization point — losers of the conflict are 'skipped' (already processed) and ACKed without re-debiting.",
+    "Balance check inside: <code>UPDATE … WHERE balance &gt;= $1</code> — insufficient funds → row marked failed, no partial debit.",
+  ],
+  code: [
+    ["db/init.sql", 366, "bulk claim CTE"],
+    ["db/init.sql", 387, "per-row loop"],
+  ],
+  docs: [],
+},
+wsame: {
+  plane: "pg",
+  facts: [
+    "Receiver on the same shard → debit + credit inside the same transaction; status flips to <code>completed</code>; message ACKed.",
+  ],
+  code: [["db/init.sql", 387, "debit/credit loop"]],
+  docs: [],
+},
+wxs: {
+  plane: "pg",
+  facts: [
+    "Receiver lives on another shard → the function emits a row into the transactional outbox on the sender's shard (same txn as the debit).",
+    "Processor claims with <code>FOR UPDATE SKIP LOCKED</code>, lease 60s; poll 250ms; batch 100; apply concurrency 8.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/cross_shard_processor.rs", 49, "poll + batch"],
+    ["crates/transactions/src/infrastructure/cross_shard_processor.rs", 61, "concurrency + attempts + lease"],
+  ],
+  docs: [RB.outbox],
+},
+wxsp: {
+  plane: "pg",
+  facts: [
+    "Credits the receiver shard idempotently (<code>ON CONFLICT … DO NOTHING</code>); on success marks applied + DELs the stale <code>tx_status:</code> cache immediately.",
+    "Retries ≤ <code>MAX_ATTEMPTS=10</code>; exhaustion → refund path marks sender <code>failed</code> (R-8); stuck refunds back off 300s.",
+    "Applied rows pruned after retention (floor 3600s), batched 10k × ≤50.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/cross_shard_processor.rs", 62, "MAX_ATTEMPTS"],
+    ["crates/transactions/src/infrastructure/cross_shard_processor.rs", 74, "refund backoff"],
+    ["crates/transactions/src/infrastructure/cross_shard_processor.rs", 96, "retention floor"],
+    ["crates/transactions/src/infrastructure/cross_shard_processor.rs", 233, "immediate tx_status DEL"],
+  ],
+  docs: [RB.outbox],
+},
+wbus: {
+  plane: "app",
+  facts: [
+    "<code>tokio::broadcast</code> bus, capacity <code>8192</code>; event name <code>transactions.committed</code>.",
+    "In-process by design (ADR-0004): consumers are the cache invalidator and the notifications dispatcher.",
+  ],
+  code: [
+    ["crates/shared_kernel/src/events.rs", 45, "DEFAULT_BUS_CAPACITY"],
+    ["crates/shared_kernel/src/events.rs", 51, "event name"],
+  ],
+  docs: [ADR.a4],
+},
+winval: {
+  plane: "redis",
+  facts: [
+    "Subscriber DELs <code>txn:{id}</code>, <code>tx_status:{reference_id}</code> and the <code>txn_list:*</code> buckets on every commit event — bounds read staleness to the TTLs even if an event is missed.",
+  ],
+  code: [["crates/transactions/src/infrastructure/cache_invalidator.rs", 81, "DEL keys"]],
+  docs: [],
+},
+wnotif: {
+  plane: "app",
+  facts: [
+    "Dispatcher dedupes on a 4096-entry sliding window, stores into a 512-slot ring buffer; <code>GET /api/v2/notifications/recent</code> clamps limit to ≤200.",
+  ],
+  code: [
+    ["crates/notifications/src/application/mod.rs", 98, "DEDUPE_WINDOW = 4096"],
+    ["crates/notifications/src/infrastructure/mod.rs", 49, "ring capacity 512"],
+    ["crates/notifications/src/application/mod.rs", 30, "MAX_RECENT = 200"],
+  ],
+  docs: [ADR.a4],
+},
+wclean: {
+  plane: "infra",
+  facts: [
+    "Background sweeper: every 30s, cleans expired idempotency reservations and stale outbox state; published rows get a 300s grace; sweep statements run with a 60s timeout.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/cleanup.rs", 23, "interval"],
+    ["crates/transactions/src/infrastructure/cleanup.rs", 33, "published grace"],
+  ],
+  docs: [],
+},
+
+/* — view 4 — */
+rb1: {
+  plane: "app",
+  facts: [
+    "In-process moka cache, TTL <code>1s</code>, sized for ≈50 MB (≈80-byte entries) — zero TCP on hit.",
+    "Hit increments <code>cache_hits_total{tier=\"moka\"}</code>.",
+    "Worst-case staleness for a warm key = moka TTL + Redis TTL (1s + 10s).",
+  ],
+  code: [
+    ["crates/accounts/src/infrastructure/mod.rs", 56, "MOKA_BALANCE_TTL_SECS = 1"],
+    ["crates/accounts/src/api/handlers.rs", 125, "L1 lookup + metric"],
+  ],
+  docs: [RB.hotkey],
+},
+rb2: {
+  plane: "redis",
+  facts: [
+    "Shared L2 across both app replicas: key <code>acc:{account}</code>, TTL <code>BALANCE_CACHE_TTL_SECS=10</code>.",
+    "Filled on miss by handler and service layer; debit-path correctness never depends on it (balance is enforced in SQL).",
+  ],
+  code: [
+    ["crates/accounts/src/application/mod.rs", 36, "TTL = 10"],
+    ["crates/accounts/src/api/handlers.rs", 165, "L2 fill"],
+  ],
+  docs: [],
+},
+rb3: {
+  plane: "app",
+  facts: [
+    "Read pools are separate from write pools: <code>DB_READ_POOL_SIZE=40</code> per shard, pointed at the replica frontends.",
+    "Repo wraps queries in retry + dependency breaker (R-7).",
+  ],
+  code: [
+    [".env.example", 213, "DB_READ_POOL_SIZE"],
+    ["crates/accounts/src/infrastructure/mod.rs", null, "repo wiring"],
+  ],
+  docs: [],
+},
+rb4: {
+  plane: "pg",
+  facts: [
+    "Replica frontends <code>:5010</code> (shard0) / <code>:5011</code> (shard1); Patroni REST probes keep them pointed at the live replica.",
+  ],
+  code: [
+    [".env.example", 149, "read URLs"],
+    ["docker-compose.yml", 836, "pg-haproxy"],
+  ],
+  docs: [ADR.a6],
+},
+rl1: {
+  plane: "app",
+  facts: [
+    "<code>offset</code> is rejected with 400 — cursor-only (<code>before</code> RFC3339 + <code>before_id</code> tiebreaker).",
+    "<code>limit</code> defaults 20, capped at 100.",
+  ],
+  code: [["crates/transactions/src/api/handlers.rs", 205, "param handling"]],
+  docs: [],
+},
+rl2: {
+  plane: "redis",
+  facts: [
+    "Cursor timestamp floored to <code>CACHE_BUCKET_SECS=5</code> → near-simultaneous pagers share one cache entry.",
+    "Key shape <code>txn_list:{limit}:{bucket}:{before_id}</code>; <code>before_id</code> stays un-bucketed (it's the tiebreaker).",
+  ],
+  code: [["crates/transactions/src/api/handlers.rs", 227, "bucket + key build"]],
+  docs: [],
+},
+rl3: {
+  plane: "pg",
+  facts: [
+    "One <code>tokio::spawn</code> per shard, each fetching <code>limit+1</code> rows — the extra row is a <em>tail probe</em>: the oldest row that shard would have dropped.",
+    "Replaces a slack-based heuristic that silently dropped tail rows on lopsided pages (D-3 audit fix).",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/repository.rs", 156, "two-phase comment"],
+    ["crates/transactions/src/infrastructure/repository.rs", 177, "per-shard spawn"],
+  ],
+  docs: [],
+},
+rl4: {
+  plane: "app",
+  facts: [
+    "MAX of the tail probes = <em>safe cursor</em>; merged rows older than it are dropped so the client's next-page cursor never skips rows.",
+    "Result cached 30s — amortizes the fan-out across the 5s bucket window (worst staleness ≈ bucket + TTL).",
+  ],
+  code: [["crates/transactions/src/api/handlers.rs", 262, "TTL rationale comment"]],
+  docs: [],
+},
+rs1: {
+  plane: "redis",
+  facts: [
+    "TTL split by state: terminal (<code>completed/failed/reversed</code>) 5s, transient 1s — long enough to absorb poll bursts, short enough that DEL + 1s ceiling keep staleness ≈1s.",
+  ],
+  code: [["crates/transactions/src/api/handlers.rs", 279, "status_cache_ttl()"]],
+  docs: [],
+},
+rs2: {
+  plane: "app",
+  facts: [
+    "Resolution order: PG row wins; else a live idempotency reservation ⇒ <code>pending</code>; else 404.",
+  ],
+  code: [["crates/transactions/src/application/mod.rs", 472, "get_status_by_reference"]],
+  docs: [],
+},
+rs3: {
+  plane: "redis",
+  facts: [
+    "By-id GET: cache key <code>txn:{id}</code>, TTL 30s; on miss the repo probes shards with a 500ms per-shard timeout.",
+  ],
+  code: [
+    ["crates/transactions/src/api/handlers.rs", 182, "cache + TTL"],
+    ["crates/transactions/src/infrastructure/repository.rs", 22, "per-shard timeout"],
+  ],
+  docs: [],
+},
+rs4: {
+  plane: "app",
+  facts: [
+    "Cache invalidator DELs status/by-id/list keys on <code>transactions.committed</code>; the cross-shard processor additionally DELs <code>tx_status:</code> immediately when the receiver credit lands.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/cache_invalidator.rs", 81, "DELs"],
+    ["crates/transactions/src/infrastructure/cross_shard_processor.rs", 233, "immediate DEL"],
+  ],
+  docs: [],
+},
+rfb: {
+  plane: "pg",
+  facts: [
+    "If a replica goes unhealthy, reads fall back to the primary frontend rather than failing — per-replica health is probed every <code>DB_HEALTH_CHECK_INTERVAL_SECS=5</code>.",
+  ],
+  code: [["crates/app/src/config.rs", 285, "probe interval default"]],
+  docs: [ADR.a6],
+},
+
+/* — view 5 — */
+hpair: {
+  plane: "pg",
+  facts: [
+    "Each shard = 2 Postgres nodes managed by Patroni; replication is streaming, promotion is automatic via the DCS lease.",
+  ],
+  code: [["docker-compose.yml", 558, "shard0 pair"]],
+  docs: [ADR.a5, RB.patroni],
+},
+hetcd: {
+  plane: "infra",
+  facts: [
+    "Leader lease lives in etcd; majority required. Quorum loss ⇒ Patroni demotes ALL primaries to read-only (split-brain prevention).",
+  ],
+  code: [["docker-compose.yml", 503, "comment in compose"]],
+  docs: [RB.etcd],
+},
+hwin: {
+  plane: "infra",
+  facts: [
+    "Promotion window is typically 5–15s, bounded by the etcd leader-lease TTL (compose comment above the retry config).",
+  ],
+  code: [["docker-compose.yml", 427, "window comment"]],
+  docs: [],
+},
+hhap: {
+  plane: "pg",
+  facts: [
+    "HAProxy continuously probes each node's Patroni REST API; the primary frontend follows whoever answers as primary. Apps never re-configure.",
+  ],
+  code: [["docker-compose.yml", 836, "pg-haproxy"]],
+  docs: [ADR.a6],
+},
+hboot: {
+  plane: "infra",
+  facts: [
+    "App start is gated on schema bootstrap + migrations completing (<code>service_completed_successfully</code>) — a half-initialized shard can't receive traffic.",
+  ],
+  code: [["docker-compose.yml", 463, "depends_on gates"]],
+  docs: [],
+},
+hbackup: {
+  plane: "infra",
+  facts: [
+    "pgBackRest WAL archiving is wired into the Patroni nodes but OFF by default (<code>BACKUP_ENABLED=false</code>); enabling pushes lz4-compressed WAL segments to the configured repo for PITR.",
+  ],
+  code: [
+    ["docker-compose.yml", 168, "BACKUP_ENABLED plumbing"],
+    [".env.example", 394, "default off + docs"],
+  ],
+  docs: [],
+},
+hretry: {
+  plane: "app",
+  facts: [
+    "Write retry budget <code>DB_WRITE_RETRY_MAX_ATTEMPTS=6</code> × <code>DB_WRITE_RETRY_BACKOFF_MS=200</code> ≈ 1.2s+ of cover — tuned to ride out the Patroni promotion window.",
+    "Dependency breaker around the DB (R-7): recovery ≈30s, so a dead shard doesn't hold request threads.",
+  ],
+  code: [
+    ["docker-compose.yml", 431, "retry env + rationale"],
+    ["crates/app/src/config.rs", 295, "defaults in code"],
+    ["crates/shared_kernel/src/db/shard.rs", 14, "breaker recovery comment"],
+  ],
+  docs: [],
+},
+hprobe: {
+  plane: "app",
+  facts: [
+    "Per-replica health probes every <code>DB_HEALTH_CHECK_INTERVAL_SECS=5</code>; unhealthy replicas are skipped, reads fall back to primary.",
+  ],
+  code: [
+    ["docker-compose.yml", 426, "interval env"],
+    ["crates/app/src/config.rs", 285, "default"],
+  ],
+  docs: [],
+},
+hdeg: {
+  plane: "app",
+  facts: [
+    "Operator switch, not auto: seed via <code>DEGRADATION_MODE</code> env or flip live with <code>PUT /api/v2/admin/degradation</code> — writes shed 503, reads continue.",
+  ],
+  code: [["docker-compose.yml", 439, "R-9 comment"], ["crates/app/src/degradation.rs", null, "flag"]],
+  docs: [RB.expo],
+},
+hheal: {
+  plane: "app",
+  facts: [
+    "Docker healthcheck runs the binary's own <code>--health-check</code> TCP probe every 10s (3 retries, 15s start period); <code>restart: unless-stopped</code>; 2 replicas so one crash leaves a survivor.",
+  ],
+  code: [
+    ["docker-compose.yml", 476, "healthcheck"],
+    ["crates/app/src/main.rs", 135, "health_probe()"],
+  ],
+  docs: [],
+},
+hsent: {
+  plane: "redis",
+  facts: [
+    "Sentinel quorum (3 nodes) promotes the replica; the app's Sentinel-aware client re-resolves <code>peakload-master</code> (monitor interval 5s) without restart.",
+  ],
+  code: [["docker-compose.yml", 422, "sentinel env"]],
+  docs: [RB.sentinel],
+},
+haof: {
+  plane: "redis",
+  facts: [
+    "<code>appendonly yes</code> + <code>appendfsync everysec</code> bounds loss on a master crash to ≤1s of acknowledged writes.",
+  ],
+  code: [["docker-compose.yml", 1026, "redis-master args"]],
+  docs: [],
+},
+hidem: {
+  plane: "redis",
+  facts: [
+    "Hybrid backend's honest caveat (module doc): a SETNX that succeeded then vanished in failover is NOT detected — the PG <code>ON CONFLICT (reference_id, from_account)</code> claim is the final dedupe line.",
+  ],
+  code: [["crates/transactions/src/infrastructure/redis_idempotency.rs", 38, "semantics doc"]],
+  docs: [],
+},
+hmq: {
+  plane: "mq",
+  facts: [
+    "Queue and messages are durable; consumer NACKs poison without requeue (straight to DLQ) so a bad message can't wedge the pipeline.",
+  ],
+  code: [["crates/transactions/src/infrastructure/consumer.rs", 547, "NACK path"]],
+  docs: [RB.rabbit],
+},
+hrun: {
+  plane: "infra",
+  facts: ["Step-by-step operator procedures for every failure domain in this view."],
+  code: [],
+  docs: [RB.patroni, RB.etcd, RB.sentinel, RB.outbox, RB.rabbit, RB.expo],
+},
+
+/* — view 6 — */
+oreg: {
+  plane: "app",
+  facts: [
+    "<code>metrics-exporter-prometheus</code> recorder installed at boot; ~50+ metric families described up front.",
+    "Latency histogram buckets are chosen to straddle the 500ms SLO so the P95 question is answerable from buckets, not guesses.",
+  ],
+  code: [
+    ["crates/app/src/bootstrap.rs", 131, "recorder + buckets"],
+    ["crates/app/src/bootstrap.rs", 143, "describe_*"],
+  ],
+  docs: [],
+},
+ozero: {
+  plane: "app",
+  facts: [
+    "Counters that alerting depends on are zero-initialized at boot — <code>rate()</code> over an absent series silently returns nothing; over a zero series it returns 0.",
+  ],
+  code: [["crates/app/src/bootstrap.rs", 342, "zero-init block"]],
+  docs: [],
+},
+omet: {
+  plane: "app",
+  facts: [
+    "<code>/metrics</code> renders the Prometheus registry; <code>/health</code> aggregates dependency state. nginx exempts both from rate limiting and caching.",
+  ],
+  code: [
+    ["crates/app/src/health.rs", null, "handlers"],
+    ["nginx/nginx.conf.template", 122, "unlimited locations"],
+  ],
+  docs: [],
+},
+oprom: {
+  plane: "obs",
+  facts: ["Scrapes app replicas (and cAdvisor when enabled). Part of the default profile set."],
+  code: [["docker-compose.yml", 1142, "service"], [".env.example", 91, "default profiles"]],
+  docs: [],
+},
+ograf: {
+  plane: "obs",
+  facts: ["Dashboards + datasource provisioned from the repo's <code>grafana/</code> directory; default ON."],
+  code: [["docker-compose.yml", 1236, "service"]],
+  docs: [RB.expo],
+},
+ocadv: {
+  plane: "obs",
+  facts: ["Container-level CPU/memory/network metrics into Prometheus; profile-gated."],
+  code: [["docker-compose.yml", 1272, "service"]],
+  docs: [],
+},
+osig: {
+  plane: "app",
+  facts: [
+    "RED metrics from L6 (shed traffic excluded by stack position) + per-layer shed counters + <code>cache_hits_total{tier}</code> + intake queue depth sampled every 5s.",
+  ],
+  code: [
+    ["crates/accounts/src/api/handlers.rs", 127, "tiered cache metric"],
+    ["crates/transactions/src/infrastructure/redis_intake.rs", 100, "depth sample interval"],
+  ],
+  docs: [],
+},
+oslo: {
+  plane: "infra",
+  facts: ["Targets documented in the architecture overview: 99.9% availability, P95 &lt; 500ms under the k6 exhibition profile."],
+  code: [["docs/architecture.md", null, "overview §1"]],
+  docs: [RB.expo],
+},
+orid: {
+  plane: "app",
+  facts: ["UUID per request, echoed in the response header and stamped on logs — correlate a user report to traces in seconds."],
+  code: [["crates/app/src/middleware/request_id.rs", null, "middleware"]],
+  docs: [],
+},
+otrl: {
+  plane: "app",
+  facts: ["Tower-http <code>TraceLayer</code> opens an <code>http.request</code> span per request with method/uri/status."],
+  code: [["crates/app/src/bootstrap.rs", 666, "TraceLayer init"]],
+  docs: [],
+},
+oprop: {
+  plane: "app",
+  facts: [
+    "The producer injects <code>traceparent</code> into AMQP headers; the consumer extracts it and parents its span — one trace spans HTTP → storage → worker → AMQP → consumer.",
+  ],
+  code: [["crates/transactions/src/infrastructure/consumer.rs", null, "set_parent on consume"]],
+  docs: [],
+},
+ootel: {
+  plane: "obs",
+  facts: [
+    "OTLP gRPC sink (<code>OTEL_EXPORTER_OTLP_ENDPOINT</code>); app dependency is <code>required: false</code> so the stack boots without it.",
+  ],
+  code: [
+    ["docker-compose.yml", 1176, "service"],
+    ["docker-compose.yml", 444, "app env"],
+  ],
+  docs: [],
+},
+ojae: {
+  plane: "obs",
+  facts: ["Trace UI; receives from otel-collector. Profile-gated."],
+  code: [["docker-compose.yml", 1212, "service"]],
+  docs: [],
+},
+};
+
+/* ════════════════════════════════════════════════════════════════
+   RENDER
+   ════════════════════════════════════════════════════════════════ */
+
+const $ = (s) => document.querySelector(s);
+const SVG_NS = "http://www.w3.org/2000/svg";
+const REDUCED_MOTION = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const BASE_PX_PER_SEC = REDUCED_MOTION ? 320 : 95;
+let activeView = MEGA_VIEW;
+let selectedNode = null;
+
+function renderSidebar(filter) {
+  const list = $("#viewList");
+  list.innerHTML = "";
+  const q = (filter || "").toLowerCase();
+  const simRunning = trafficEngine.playing;
+  list.classList.toggle("sim-running", simRunning);
+
+  const regionTitle = document.createElement("div");
+  regionTitle.className = "sidebar-section-title";
+  regionTitle.textContent = "Unified tour map · regions";
+  list.appendChild(regionTitle);
+
+  const regionOrder = ["overview", "stack", "write", "read"];
+  regionOrder.forEach((key, i) => {
+    const r = MEGA_VIEW.regions[key];
+    const hay = (r.shortLabel + " " + r.label).toLowerCase();
+    if (q && !hay.includes(q)) return;
+    const card = document.createElement("div");
+    let cls = "view-card";
+    if (!simRunning && trafficEngine.currentRegion === key) cls += " active";
+    if (simRunning && trafficEngine.currentRegion === key) cls += " sim-active";
+    card.className = cls;
+    card.dataset.region = key;
+    card.innerHTML =
+      '<div class="head"><div class="num">' + (i + 1) + '</div><div class="title">' + r.shortLabel + '</div></div>' +
+      '<div class="summary">' + r.label + '</div>';
+    card.onclick = () => {
+      if (trafficEngine.playing) return;
+      activeView = MEGA_VIEW;
+      trafficEngine.focusRegion(key, true);
+      renderSidebar($("#search").value);
+    };
+    list.appendChild(card);
+  });
+
+  if (q) {
+    let compTitle = null;
+    MEGA_VIEW.nodes.forEach((n) => {
+      const hay = (n.t + " " + (n.s || "") + " " + n.id).toLowerCase();
+      if (!hay.includes(q)) return;
+      if (!compTitle) {
+        compTitle = document.createElement("div");
+        compTitle.className = "sidebar-section-title";
+        compTitle.textContent = "Components";
+        list.appendChild(compTitle);
+      }
+      const card = document.createElement("div");
+      card.className = "view-card";
+      card.innerHTML =
+        '<div class="head"><div class="num">·</div><div class="title">' + n.t + '</div></div>' +
+        (n.s ? '<div class="summary">' + n.s + '</div>' : "");
+      card.onclick = () => {
+        if (trafficEngine.playing) return;
+        activeView = MEGA_VIEW;
+        const rk = regionKeyFromNode(n.id);
+        if (rk) trafficEngine.focusRegion(rk, true);
+        openInspector(n);
+      };
+      list.appendChild(card);
+    });
+  }
+}
+
+function legendHtml() {
+  let chips = "";
+  for (const k in PLANES) {
+    chips += '<span class="chip"><span class="dot" style="background:' + PLANES[k].color + '"></span>' + PLANES[k].label + '</span>';
+  }
+  return '<div class="legend">' + chips + '</div>';
+}
+
+function updateMegaRegionPills(regionKey) {
+  document.querySelectorAll(".mega-region-pill").forEach((pill) => {
+    const key = pill.dataset.region;
+    const active = !!regionKey && key === regionKey;
+    pill.classList.toggle("active", active);
+    if (active && MEGA_VIEW.regions[key]) {
+      pill.style.background = MEGA_VIEW.regions[key].color;
+      pill.style.borderColor = MEGA_VIEW.regions[key].color;
+    } else {
+      pill.style.background = "";
+      pill.style.borderColor = "";
+    }
+  });
+}
+
+function renderMegaTopbar(view) {
+  const bar = document.createElement("div");
+  bar.className = "ice-topbar mega-topbar";
+
+  const lead = document.createElement("div");
+  lead.style.cssText = "display:flex;align-items:center;gap:8px;min-width:0;flex:1";
+
+  const title = document.createElement("div");
+  title.className = "mega-title";
+  title.textContent = view.title;
+  lead.appendChild(title);
+
+  const pills = document.createElement("div");
+  pills.className = "mega-region-pills";
+  pills.id = "megaRegionPills";
+  Object.keys(view.regions).forEach((key) => {
+    const r = view.regions[key];
+    const pill = document.createElement("button");
+    pill.type = "button";
+    pill.className = "mega-region-pill";
+    pill.dataset.region = key;
+    pill.textContent = r.shortLabel;
+    pill.title = r.label;
+    pill.onclick = () => trafficEngine.focusRegion(key, true);
+    pills.appendChild(pill);
+  });
+  lead.appendChild(pills);
+  bar.appendChild(lead);
+
+  const meta = document.createElement("div");
+  meta.className = "ice-scope-meta";
+  meta.innerHTML = '<span class="lvl">∞</span>Unified canvas · simulasi traffic';
+  meta.title = view.summary;
+  bar.appendChild(meta);
+
+  return bar;
+}
+
+function renderMegaTourPanel(container) {
+  const view = activeView;
+  container.classList.add("mega-canvas-active");
+
+  const viewer = document.createElement("div");
+  viewer.className = "mega-viewer";
+  viewer.appendChild(renderMegaTopbar(view));
+
+  const viewport = document.createElement("div");
+  viewport.id = "canvasViewport";
+  viewport.className = "canvas-viewport mega-mode";
+
+  const stage = document.createElement("div");
+  stage.id = "canvasStage";
+  stage.className = "canvas-stage mega-stage";
+
+  const dia = document.createElement("div");
+  dia.className = "diagram mega-diagram";
+  dia.style.width = view.w + "px";
+  dia.style.height = view.h + "px";
+
+  Object.keys(view.regions).forEach((key) => {
+    const r = view.regions[key];
+    const frame = document.createElement("div");
+    frame.className = "region-frame";
+    frame.dataset.region = key;
+    frame.style.left = (r.x - 10) + "px";
+    frame.style.top = (r.y - 8) + "px";
+    frame.style.width = (r.w + 20) + "px";
+    frame.style.height = (r.h + 16) + "px";
+    frame.title = r.label;
+    frame.innerHTML = '<span class="region-label">' + r.shortLabel + "</span>";
+    dia.appendChild(frame);
+  });
+
+  if (view.nestContainers) {
+    Object.keys(view.nestContainers).forEach((key) => {
+      const nc = view.nestContainers[key];
+      const frame = document.createElement("div");
+      frame.className = "nest-frame";
+      frame.dataset.nest = key;
+      frame.style.left = nc.x + "px";
+      frame.style.top = nc.y + "px";
+      frame.style.width = nc.w + "px";
+      frame.style.height = nc.h + "px";
+      frame.innerHTML = '<span class="nest-label">' + nc.label + "</span>";
+      dia.appendChild(frame);
+    });
+  }
+
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("class", "wires");
+  svg.innerHTML =
+    '<defs>' +
+    '<marker id="arr-flow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3b82f6"/></marker>' +
+    '<marker id="arr-dashed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/></marker>' +
+    '<marker id="arr-danger" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#ef4444"/></marker>' +
+    '<marker id="arr-obs" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#14b8a6"/></marker>' +
+    '</defs>';
+  dia.appendChild(svg);
+
+  const trafficSvg = document.createElementNS(SVG_NS, "svg");
+  trafficSvg.setAttribute("class", "traffic-layer");
+  trafficSvg.innerHTML =
+    '<defs><filter id="particle-glow" x="-50%" y="-50%" width="200%" height="200%">' +
+    '<feGaussianBlur stdDeviation="2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>';
+  dia.appendChild(trafficSvg);
+
+  (view.planes || []).forEach((p) => {
+    const el = document.createElement("div");
+    el.className = "plane-label";
+    el.style.left = p.x + "px";
+    el.style.top = p.y + "px";
+    el.textContent = p.text;
+    dia.appendChild(el);
+  });
+
+  view.nodes.forEach((n) => {
+    const el = document.createElement("div");
+    el.className = "node p-" + n.plane + (n.ghost ? " ghost" : "");
+    el.id = "n-" + n.id;
+    el.style.left = n.x + "px";
+    el.style.top = n.y + "px";
+    el.style.width = n.w + "px";
+    el.innerHTML =
+      '<div class="t">' + (n.step ? '<span class="step">' + n.step + '</span>' : '') + n.t + '</div>' +
+      (n.s ? '<div class="s">' + n.s + '</div>' : '');
+    el.onclick = (ev) => { ev.stopPropagation(); openInspector(n); };
+    dia.appendChild(el);
+  });
+
+  stage.appendChild(dia);
+  viewport.appendChild(stage);
+
+  const hint = document.createElement("div");
+  hint.className = "pan-hint";
+  hint.textContent = "Drag to pan · Scroll to zoom · Klik region pill untuk fokus";
+  viewport.appendChild(hint);
+
+  viewer.appendChild(viewport);
+
+  const footer = document.createElement("div");
+  footer.className = "ice-footer";
+  footer.innerHTML = iceFooterHtml();
+  viewer.appendChild(footer);
+
+  container.appendChild(viewer);
+
+  requestAnimationFrame(() => {
+    drawEdges(svg, dia);
+    trafficEngine.onViewReady(dia);
+    if (trafficEngine.playing && trafficEngine.currentRegion) {
+      trafficEngine.focusRegion(trafficEngine.currentRegion, false);
+    } else if (!trafficEngine.playing) {
+      trafficEngine.fitMegaAll(false);
+    }
+  });
+}
+
+function renderView() {
+  activeView = MEGA_VIEW;
+  const c = $("#canvas");
+  c.innerHTML = "";
+  c.classList.remove("ice-canvas-active", "mega-canvas-active");
+
+  const narr = document.createElement("div");
+  narr.id = "simNarration";
+  narr.className = "sim-narration" + (trafficEngine.playing ? "" : " hidden");
+  narr.innerHTML = '<div class="sim-crumb" id="simCrumb"></div><div class="sim-caption" id="simCaption"></div><div class="sim-hint" id="simHint" style="margin-top:8px;font-size:11px;color:var(--dim)">Panel ini = penjelasan teknis per langkah. Zoom otomatis hanya saat masuk <em>container</em> (mis. app ×2 → protection stack di dalamnya), bukan setiap node.</div>';
+  c.appendChild(narr);
+
+  renderMegaTourPanel(c);
+}
+
+function rectOf(dia, id) {
+  const el = dia.querySelector("#n-" + id);
+  if (!el) return { x: 0, y: 0, w: 0, h: 0 };
+  return { x: el.offsetLeft, y: el.offsetTop, w: el.offsetWidth, h: el.offsetHeight };
+}
+function anchor(r, side) {
+  switch (side) {
+    case "top":    return { x: r.x + r.w / 2, y: r.y, nx: 0, ny: -1 };
+    case "bottom": return { x: r.x + r.w / 2, y: r.y + r.h, nx: 0, ny: 1 };
+    case "left":   return { x: r.x, y: r.y + r.h / 2, nx: -1, ny: 0 };
+    default:       return { x: r.x + r.w, y: r.y + r.h / 2, nx: 1, ny: 0 };
+  }
+}
+function autoSides(a, b) {
+  const acx = a.x + a.w / 2, acy = a.y + a.h / 2;
+  const bcx = b.x + b.w / 2, bcy = b.y + b.h / 2;
+  const dx = bcx - acx, dy = bcy - acy;
+  if (Math.abs(dy) >= Math.abs(dx)) {
+    return dy > 0 ? ["bottom", "top"] : ["top", "bottom"];
+  }
+  return dx > 0 ? ["right", "left"] : ["left", "right"];
+}
+
+function resolveEdge(dia, edge) {
+  const ra = rectOf(dia, edge.from);
+  const rb = rectOf(dia, edge.to);
+  const sides = autoSides(ra, rb);
+  const sa = anchor(ra, edge.fromSide || sides[0]);
+  const sb = anchor(rb, edge.toSide || sides[1]);
+  const dist = Math.hypot(sb.x - sa.x, sb.y - sa.y);
+  const k = Math.min(64, Math.max(28, dist * 0.38));
+  return {
+    sa, sb,
+    c1: { x: sa.x + sa.nx * k, y: sa.y + sa.ny * k },
+    c2: { x: sb.x + sb.nx * k, y: sb.y + sb.ny * k },
+    kind: edge.kind || "flow",
+  };
+}
+
+function bezierPoint(geom, t) {
+  const sa = geom.sa, c1 = geom.c1, c2 = geom.c2, sb = geom.sb;
+  const mt = 1 - t;
+  return {
+    x: mt * mt * mt * sa.x + 3 * mt * mt * t * c1.x + 3 * mt * t * t * c2.x + t * t * t * sb.x,
+    y: mt * mt * mt * sa.y + 3 * mt * mt * t * c1.y + 3 * mt * t * t * c2.y + t * t * t * sb.y,
+  };
+}
+
+function resolveHop(dia, hop, view) {
+  const match = (view.edges || []).find((e) => e.from === hop.from && e.to === hop.to);
+  if (match && !hop.virtual) {
+    const merged = Object.assign({}, match);
+    if (hop.fromSide) merged.fromSide = hop.fromSide;
+    if (hop.toSide) merged.toSide = hop.toSide;
+    if (hop.kind) merged.kind = hop.kind;
+    return resolveEdge(dia, merged);
+  }
+  const ra = rectOf(dia, hop.from);
+  const rb = rectOf(dia, hop.to);
+  const acx = ra.x + ra.w / 2, acy = ra.y + ra.h / 2;
+  const bcx = rb.x + rb.w / 2, bcy = rb.y + rb.h / 2;
+  const dx = bcx - acx, dy = bcy - acy;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = dx / len, ny = dy / len;
+  const k = Math.max(36, len * 0.32);
+  const sa = { x: acx, y: acy, nx: nx, ny: ny };
+  const sb = { x: bcx, y: bcy, nx: -nx, ny: -ny };
+  return {
+    sa, sb,
+    c1: { x: sa.x + nx * k, y: sa.y + ny * k },
+    c2: { x: sb.x - nx * k, y: sb.y - ny * k },
+    kind: hop.kind || "flow",
+  };
+}
+
+function appendEdgePath(svg, geom, label) {
+  const p = document.createElementNS(SVG_NS, "path");
+  p.setAttribute(
+    "d",
+    "M " + geom.sa.x + " " + geom.sa.y +
+    " C " + geom.c1.x + " " + geom.c1.y + ", " + geom.c2.x + " " + geom.c2.y + ", " + geom.sb.x + " " + geom.sb.y
+  );
+  p.setAttribute("class", geom.kind);
+  p.setAttribute("marker-end", "url(#arr-" + geom.kind + ")");
+  svg.appendChild(p);
+  if (label) {
+    const t = 0.5, mt = 1 - t;
+    const mx = mt * mt * mt * geom.sa.x + 3 * mt * mt * t * geom.c1.x + 3 * mt * t * t * geom.c2.x + t * t * t * geom.sb.x;
+    const my = mt * mt * mt * geom.sa.y + 3 * mt * mt * t * geom.c1.y + 3 * mt * t * t * geom.c2.y + t * t * t * geom.sb.y;
+    const txt = document.createElementNS(SVG_NS, "text");
+    txt.setAttribute("x", mx);
+    txt.setAttribute("y", my - 4);
+    txt.setAttribute("text-anchor", "middle");
+    txt.textContent = label;
+    svg.appendChild(txt);
+  }
+}
+
+function drawEdges(svg, dia, view) {
+  view = view || activeView;
+  (view.edges || []).forEach((e) => {
+    const geom = resolveEdge(dia, e);
+    appendEdgePath(svg, geom, e.label);
+  });
+}
+
+function viewById(id) {
+  return VIEWS.find((v) => v.id === id);
+}
+
+function planeColor(key) {
+  if (key === "success") return PLANES.pg.color;
+  return (PLANES[key] || PLANES.app).color;
+}
+
+function resolveScenario(id) {
+  return SCENARIOS.find((s) => s.id === id);
+}
+
+function pulseNode(dia, nodeId, passed) {
+  const el = dia.querySelector("#n-" + nodeId);
+  if (!el) return;
+  el.classList.remove("traffic-active");
+  void el.offsetWidth;
+  el.classList.add("traffic-active");
+  if (passed) el.classList.add("traffic-passed");
+  if (trafficEngine.playing) showNarration(nodeId);
+}
+
+function showTrafficOverlay(dia, nodeId, text) {
+  trafficEngine.hideOverlay();
+  const node = dia.querySelector("#n-" + nodeId);
+  if (!node || !text) return;
+  const box = document.createElement("div");
+  box.className = "traffic-overlay";
+  box.textContent = text;
+  box.style.left = node.offsetLeft + "px";
+  box.style.top = Math.max(0, node.offsetTop - 36) + "px";
+  dia.appendChild(box);
+  trafficEngine.overlayEl = box;
+}
+
+function createParticle(svg, color) {
+  const maxTail = REDUCED_MOTION ? 0 : 16;
+  const g = document.createElementNS(SVG_NS, "g");
+  g.setAttribute("class", "particle");
+  const tail = document.createElementNS(SVG_NS, "polyline");
+  tail.setAttribute("class", "particle-tail");
+  tail.setAttribute("stroke", color);
+  const head = document.createElementNS(SVG_NS, "circle");
+  head.setAttribute("class", "particle-head");
+  head.setAttribute("r", "5");
+  head.setAttribute("fill", color);
+  g.appendChild(tail);
+  g.appendChild(head);
+  svg.appendChild(g);
+  return {
+    g, tail, head, history: [], maxTail,
+    setPos(x, y) {
+      head.setAttribute("cx", x);
+      head.setAttribute("cy", y);
+      if (maxTail === 0) return;
+      this.history.push({ x, y });
+      if (this.history.length > maxTail) this.history.shift();
+      if (this.history.length > 1) {
+        tail.setAttribute("points", this.history.map((p) => p.x + "," + p.y).join(" "));
+        tail.setAttribute("opacity", String(0.12 + 0.5 * (this.history.length / maxTail)));
+      }
+    },
+    remove() { g.remove(); },
+  };
+}
+
+function buildArcTable(geom, steps) {
+  steps = steps || 36;
+  const pts = [{ t: 0, d: 0 }];
+  let total = 0;
+  let prev = bezierPoint(geom, 0);
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    const p = bezierPoint(geom, t);
+    total += Math.hypot(p.x - prev.x, p.y - prev.y);
+    pts.push({ t, d: total });
+    prev = p;
+  }
+  return { pts, total };
+}
+
+function tAtDistance(table, dist) {
+  if (dist <= 0) return 0;
+  if (dist >= table.total) return 1;
+  const pts = table.pts;
+  for (let i = 1; i < pts.length; i++) {
+    if (pts[i].d >= dist) {
+      const a = pts[i - 1];
+      const b = pts[i];
+      const f = (dist - a.d) / (b.d - a.d || 1);
+      return a.t + f * (b.t - a.t);
+    }
+  }
+  return 1;
+}
+
+function newTrack(svg, view, dia, branch, colorKey) {
+  return {
+    svg, view, dia, branch,
+    color: planeColor(colorKey || "app"),
+    hopIdx: 0,
+    dist: 0,
+    geom: null,
+    arc: null,
+    particle: null,
+    delayMs: branch.delayMs || 0,
+    delayLeft: branch.delayMs || 0,
+    pauseLeft: 0,
+    awaitingDive: false,
+    done: false,
+  };
+}
+
+function startTrackHop(track, afterDive) {
+  const hop = track.branch.hops[track.hopIdx];
+  if (!hop) {
+    track.done = true;
+    if (track.particle) track.particle.remove();
+    return;
+  }
+  const container = containerForHop(hop);
+  if (!afterDive && trafficEngine.playing && container) {
+    trafficEngine.playContainerDive(container);
+    track.pauseLeft = container.divePauseMs || 1100;
+    track.awaitingDive = true;
+    if (!track.particle) track.particle = createParticle(track.svg, track.color);
+    return;
+  }
+  track.awaitingDive = false;
+  track.geom = resolveHop(track.dia, hop, track.view);
+  track.arc = buildArcTable(track.geom);
+  track.dist = 0;
+  if (!track.particle) track.particle = createParticle(track.svg, track.color);
+  pulseNode(track.dia, hop.from, true);
+}
+
+const trafficEngine = {
+  playing: false,
+  paused: false,
+  speed: 0.35,
+  scenario: null,
+  segmentIdx: 0,
+  phase: "idle",
+  hopIdx: 0,
+  tracks: [],
+  tailTracks: [],
+  dia: null,
+  trafficSvg: null,
+  raf: null,
+  lastTs: 0,
+  waitUntil: 0,
+  overlayEl: null,
+  resumeAfterView: false,
+  currentRegion: "overview",
+  camera: { tx: 0, ty: 0, scale: 1 },
+  panDrag: null,
+  _diveT: null,
+  simActive: false,
+  timeline: null,
+  timelineIdx: 0,
+  maxReachedIdx: 0,
+  _seeking: false,
+
+  updateStepNavUi() {
+    const back = $("#simBack");
+    const fwd = $("#simForward");
+    const canNav = this.simActive && this.timeline && this.timeline.length > 1;
+    const lastIdx = this.timeline ? this.timeline.length - 1 : 0;
+    if (back) back.disabled = !canNav || this.timelineIdx <= 0;
+    if (fwd) fwd.disabled = !canNav || this.timelineIdx >= lastIdx;
+  },
+
+  commitStep(nodeId) {
+    if (this._seeking || !this.simActive || !this.timeline) return;
+    if (nodeId) {
+      for (let i = this.timelineIdx + 1; i < this.timeline.length; i++) {
+        if (this.timeline[i].nodeId === nodeId) {
+          this.timelineIdx = i;
+          break;
+        }
+      }
+    }
+    this.maxReachedIdx = Math.max(this.maxReachedIdx, this.timelineIdx);
+    this.updateStepNavUi();
+    this.refreshProgressLabel();
+  },
+
+  advanceTimelineToKind(kind) {
+    if (this._seeking || !this.simActive || !this.timeline) return;
+    for (let i = this.timelineIdx + 1; i < this.timeline.length; i++) {
+      if (this.timeline[i].kind === kind) {
+        this.timelineIdx = i;
+        break;
+      }
+    }
+    this.maxReachedIdx = Math.max(this.maxReachedIdx, this.timelineIdx);
+    this.updateStepNavUi();
+    this.refreshProgressLabel();
+  },
+
+  refreshProgressLabel() {
+    if (!this.timeline) return;
+    const step = this.timeline[this.timelineIdx];
+    const total = this.timeline.length - 1;
+    const label = step && step.label ? step.label : "…";
+    const regionLabel = activeView.regions && activeView.regions[this.currentRegion]
+      ? activeView.regions[this.currentRegion].shortLabel
+      : activeView.title;
+    const scHint = this.scenario ? this.scenario.label : "";
+    this.setProgress(
+      (scHint ? scHint + " · " : "") +
+      regionLabel + " · langkah " + this.timelineIdx + "/" + total + " · " + label
+    );
+  },
+
+  stepBack() {
+    if (!this.simActive || this.timelineIdx <= 0) return;
+    this.seekToStep(this.timelineIdx - 1);
+  },
+
+  stepForward() {
+    if (!this.simActive || !this.timeline || this.timelineIdx >= this.timeline.length - 1) return;
+    this.seekToStep(this.timelineIdx + 1);
+  },
+
+  seekToStep(idx, resumePlay) {
+    if (!this.timeline || idx < 0 || idx >= this.timeline.length) return;
+    this._seeking = true;
+    this.paused = !resumePlay;
+    $("#simPause").textContent = this.paused ? "▶" : "⏸";
+    if (this.raf) cancelAnimationFrame(this.raf);
+    this.raf = null;
+    clearTimeout(this._diveT);
+    this._diveT = null;
+    this.hideOverlay();
+    this.clearParticles();
+
+    this.timelineIdx = idx;
+    const step = this.timeline[idx];
+    const state = computeStateAtTimelineStep(this.timeline, idx, this.scenario);
+    this.segmentIdx = state.segmentIdx;
+    this.phase = state.phase;
+
+    if (this.dia) {
+      this.clearNodeMarks(this.dia);
+      this.dia.querySelectorAll(".node.dive-target, .node.nest-parent").forEach((n) => {
+        n.classList.remove("dive-target", "nest-parent");
+      });
+      this.dia.querySelectorAll(".region-frame.region-dive").forEach((f) => f.classList.remove("region-dive"));
+    }
+    const vp = $("#canvasViewport");
+    if (vp) vp.querySelectorAll(".nest-frame.nest-active").forEach((f) => f.classList.remove("nest-active"));
+
+    const passed = new Set();
+    for (let i = 0; i <= idx; i++) {
+      const s = this.timeline[i];
+      if (s.fromNode) passed.add(s.fromNode);
+      if (s.nodeId) passed.add(s.nodeId);
+    }
+    if (step.kind === "start") passed.add("ov-client");
+    passed.forEach((id) => {
+      const el = this.dia && this.dia.querySelector("#n-" + id);
+      if (el) el.classList.add("traffic-passed");
+    });
+
+    if (state.activeNodeId && this.dia) {
+      const el = this.dia.querySelector("#n-" + state.activeNodeId);
+      if (el) {
+        el.classList.add("traffic-active", "traffic-passed");
+      }
+      showNarration(state.activeNodeId);
+    } else if (step.kind === "start") {
+      showNarration("ov-client");
+    }
+
+    this.syncCameraForState(state, step);
+    if (state.overlay && state.activeNodeId) {
+      showTrafficOverlay(this.dia, state.activeNodeId, state.overlay);
+    }
+
+    this.rebuildTracksFromState(state);
+    this._seeking = false;
+    this.updateStepNavUi();
+    this.refreshProgressLabel();
+
+    if (resumePlay) {
+      this.playing = true;
+      this.lastTs = 0;
+      this.loop();
+    }
+  },
+
+  syncCameraForState(state, step) {
+    if (!activeView.mega) return;
+    const vp = $("#canvasViewport");
+    if (step && step.kind === "start") {
+      this.currentRegion = "overview";
+      this.focusRegion("overview", false);
+      return;
+    }
+    if (state.activeNodeId) {
+      const rk = regionKeyFromNode(state.activeNodeId);
+      this.currentRegion = rk;
+      if (state.lastContainer && step && step.hop && containerForHop(step.hop)) {
+        this.focusRegion(state.lastContainer.childRegion, false);
+      } else {
+        this.focusRegion(rk, false);
+      }
+    }
+    if (vp && step && step.hop && containerForHop(step.hop)) {
+      const c = containerForHop(step.hop);
+      vp.querySelectorAll(".nest-frame").forEach((f) => {
+        f.classList.toggle("nest-active", f.dataset.nest === c.id);
+      });
+    }
+  },
+
+  rebuildTracksFromState(state) {
+    const seg = this.currentSegment();
+    if (!seg || !this.dia || !this.trafficSvg) return;
+
+    if (state.phase === "hops") {
+      const hops = seg.hops || [];
+      this.tracks = [{
+        svg: this.trafficSvg,
+        view: activeView,
+        dia: this.dia,
+        branch: { hops: hops },
+        color: planeColor("client"),
+        hopIdx: state.mainHopIdx,
+        dist: 0,
+        geom: null,
+        arc: null,
+        particle: null,
+        delayMs: 0,
+        delayLeft: 0,
+        pauseLeft: 0,
+        awaitingDive: false,
+        done: state.mainDone,
+      }];
+      return;
+    }
+
+    if (state.phase === "parallel" && seg.parallel) {
+      this.tracks = seg.parallel.map((branch, bi) => {
+        const hopIdx = state.parallelHopIdxs ? state.parallelHopIdxs[bi] : 0;
+        return {
+          svg: this.trafficSvg,
+          view: activeView,
+          dia: this.dia,
+          branch: branch,
+          color: planeColor(branch.color || "app"),
+          hopIdx: hopIdx,
+          dist: 0,
+          geom: null,
+          arc: null,
+          particle: null,
+          delayMs: branch.delayMs || 0,
+          delayLeft: 0,
+          pauseLeft: 0,
+          awaitingDive: false,
+          done: hopIdx >= branch.hops.length,
+        };
+      });
+      return;
+    }
+
+    if (state.phase === "tail" && seg.tail) {
+      this.tracks = [{
+        svg: this.trafficSvg,
+        view: activeView,
+        dia: this.dia,
+        branch: { hops: seg.tail },
+        color: planeColor("success"),
+        hopIdx: state.tailHopIdx,
+        dist: 0,
+        geom: null,
+        arc: null,
+        particle: null,
+        delayMs: 0,
+        delayLeft: 0,
+        pauseLeft: 0,
+        awaitingDive: false,
+        done: state.tailDone,
+      }];
+    }
+  },
+
+  applyCamera(animate, slow) {
+    const stage = $("#canvasStage");
+    if (!stage) return;
+    const c = this.camera;
+    stage.style.transformOrigin = "0 0";
+    const dur = slow ? "1.15s cubic-bezier(0.22, 1, 0.36, 1)" : "0.9s cubic-bezier(0.4, 0, 0.2, 1)";
+    stage.style.transition = animate && !this.panDrag ? "transform " + dur : "none";
+    stage.style.transform = "translate(" + c.tx + "px," + c.ty + "px) scale(" + c.scale + ")";
+  },
+
+  focusRect(rect, animate, pad, slow, maxScale) {
+    if (!rect || rect.w < 1) return;
+    pad = pad == null ? 24 : pad;
+    maxScale = maxScale || 2.2;
+    const viewport = $("#canvasViewport");
+    const vw = viewport.clientWidth || 800;
+    const vh = viewport.clientHeight || 600;
+    const scale = Math.min((vw - pad * 2) / rect.w, (vh - pad * 2) / rect.h, maxScale);
+    this.camera.tx = (vw - rect.w * scale) / 2 - rect.x * scale;
+    this.camera.ty = (vh - rect.h * scale) / 2 - rect.y * scale;
+    this.camera.scale = scale;
+    this.applyCamera(animate, slow);
+  },
+
+  focusNode(nodeId, animate, pad, slow) {
+    pad = pad == null ? 48 : pad;
+    const dia = this.dia;
+    if (!dia || !activeView.mega) return;
+    const r = rectOf(dia, nodeId);
+    if (!r || r.w < 1) return;
+    this.focusRect(r, animate, pad, slow, nodeId === "ov-app" ? 2.2 : 2.0);
+    dia.querySelectorAll(".node.dive-target, .node.nest-parent").forEach((n) => {
+      n.classList.remove("dive-target", "nest-parent");
+    });
+    const el = dia.querySelector("#n-" + nodeId);
+    if (el) el.classList.add("nest-parent");
+  },
+
+  playContainerDive(container) {
+    clearTimeout(this._diveT);
+    const dia = this.dia;
+    const viewport = $("#canvasViewport");
+    if (!dia || !activeView.nestContainers) return;
+    const nestBox = activeView.nestContainers[container.id];
+    showNarration(container.parentNode, container.diveNarration);
+    this.currentRegion = regionKeyFromNode(container.parentNode);
+    if (nestBox) {
+      this.focusRect(nestBox, true, 28, true, 1.05);
+      if (viewport) {
+        viewport.querySelectorAll(".nest-frame").forEach((f) => {
+          f.classList.toggle("nest-active", f.dataset.nest === container.id);
+        });
+      }
+    } else {
+      this.focusNode(container.parentNode, true, 32, true);
+    }
+    this._diveT = setTimeout(() => {
+      if (!this.playing) return;
+      this.focusRegion(container.childRegion, true, true);
+      if (dia) {
+        dia.querySelectorAll(".region-frame").forEach((f) => {
+          f.classList.remove("region-dive");
+          if (f.dataset.region === container.childRegion) {
+            f.classList.add("region-dive");
+            setTimeout(() => f.classList.remove("region-dive"), 1200);
+          }
+        });
+      }
+    }, 820);
+  },
+
+  focusRegion(regionKey, animate, slow) {
+    if (!activeView.mega || !activeView.regions) return;
+    const r = activeView.regions[regionKey];
+    if (!r) return;
+    this.currentRegion = regionKey;
+    const viewport = $("#canvasViewport");
+    if (!viewport) return;
+    const pad = regionKey === "overview" ? 36 : 12;
+    const maxScale = regionKey === "overview" ? 1.08 : (regionKey === "stack" ? 2.25 : 2.05);
+    const vw = viewport.clientWidth || 800;
+    const vh = viewport.clientHeight || 600;
+    const scale = Math.min((vw - pad * 2) / r.w, (vh - pad * 2) / r.h, maxScale);
+    this.camera.tx = (vw - r.w * scale) / 2 - r.x * scale;
+    this.camera.ty = (vh - r.h * scale) / 2 - r.y * scale + 8;
+    this.camera.scale = scale;
+    this.applyCamera(animate, slow);
+    viewport.querySelectorAll(".region-frame").forEach((f) => {
+      f.classList.toggle("region-active", f.dataset.region === regionKey);
+    });
+    updateMegaRegionPills(regionKey);
+    if (this.dia) this.dia.querySelectorAll(".node.dive-target").forEach((n) => n.classList.remove("dive-target"));
+    renderSidebar($("#search").value);
+  },
+
+  fitMegaAll(animate) {
+    if (!activeView.mega) return;
+    const viewport = $("#canvasViewport");
+    if (!viewport) return;
+    const pad = 36;
+    const vw = viewport.clientWidth || 800;
+    const vh = viewport.clientHeight || 600;
+    const scale = Math.min((vw - pad * 2) / activeView.w, (vh - pad * 2) / activeView.h, 1);
+    this.camera.tx = (vw - activeView.w * scale) / 2;
+    this.camera.ty = Math.max(12, (vh - activeView.h * scale) / 2);
+    this.camera.scale = scale;
+    this.applyCamera(animate);
+    viewport.querySelectorAll(".region-frame").forEach((f) => f.classList.remove("region-active"));
+    updateMegaRegionPills(null);
+    renderSidebar($("#search").value);
+  },
+
+  currentSegment() {
+    if (!this.scenario || !this.scenario.segments) return null;
+    return this.scenario.segments[this.segmentIdx] || null;
+  },
+
+  setProgress(text) {
+    const el = $("#simProgress");
+    if (el) el.textContent = text;
+  },
+
+  setUiRunning(on) {
+    $("#simPlay").disabled = on && !this.paused;
+    $("#simPause").disabled = !on && !this.simActive;
+    $("#simReset").disabled = !this.simActive;
+    $("#simScenario").disabled = on && !this.paused;
+    this.updateStepNavUi();
+  },
+
+  hideOverlay() {
+    if (this.overlayEl) {
+      this.overlayEl.remove();
+      this.overlayEl = null;
+    }
+  },
+
+  clearParticles() {
+    if (this.trafficSvg) this.trafficSvg.querySelectorAll(".particle").forEach((p) => p.remove());
+    this.tracks = [];
+    this.tailTracks = [];
+  },
+
+  clearNodeMarks(dia) {
+    if (!dia) return;
+    dia.querySelectorAll(".node.traffic-active, .node.traffic-passed").forEach((n) => {
+      n.classList.remove("traffic-active", "traffic-passed");
+    });
+  },
+
+  reset() {
+    this.playing = false;
+    this.paused = false;
+    this.simActive = false;
+    this.scenario = null;
+    this.timeline = null;
+    this.timelineIdx = 0;
+    this.maxReachedIdx = 0;
+    this._seeking = false;
+    this.segmentIdx = 0;
+    this.phase = "idle";
+    this.hopIdx = 0;
+    this.waitUntil = 0;
+    this.resumeAfterView = false;
+    this.currentRegion = "overview";
+    clearTimeout(this._diveT);
+    this._diveT = null;
+    if (this.raf) cancelAnimationFrame(this.raf);
+    this.raf = null;
+    this.hideOverlay();
+    this.clearParticles();
+    if (this.dia) {
+      this.clearNodeMarks(this.dia);
+      this.dia.querySelectorAll(".node.dive-target, .node.nest-parent").forEach((n) => {
+        n.classList.remove("dive-target", "nest-parent");
+      });
+      this.dia.querySelectorAll(".region-frame.region-dive").forEach((f) => f.classList.remove("region-dive"));
+    }
+    const vp = $("#canvasViewport");
+    if (vp) vp.querySelectorAll(".nest-frame.nest-active").forEach((f) => f.classList.remove("nest-active"));
+    const narr = $("#simNarration");
+    if (narr) narr.classList.add("hidden");
+    this.setUiRunning(false);
+    this.setProgress("Ready");
+    activeView = MEGA_VIEW;
+    renderSidebar($("#search").value);
+    renderView();
+  },
+
+  play(id) {
+    const scId = id || $("#simScenario").value;
+    this.reset();
+    const sc = resolveScenario(scId);
+    if (!sc || !sc.segments || !sc.segments.length) return;
+    this.scenario = sc;
+    this.timeline = buildSimTimeline(sc);
+    this.timelineIdx = 0;
+    this.maxReachedIdx = 0;
+    this.simActive = true;
+    this.speed = parseFloat($("#simSpeed").value) || 0.35;
+    this.playing = true;
+    this.paused = false;
+    this.segmentIdx = 0;
+    this.phase = "segment";
+    this.currentRegion = "overview";
+    this.setUiRunning(true);
+    activeView = MEGA_VIEW;
+    this.resumeAfterView = true;
+    closeInspector();
+    renderSidebar($("#search").value);
+    renderView();
+  },
+
+  pause() {
+    if (!this.playing && !this.simActive) return;
+    this.paused = !this.paused;
+    $("#simPause").textContent = this.paused ? "▶" : "⏸";
+    this.setUiRunning(this.playing || this.simActive);
+    if (!this.paused && this.playing) {
+      this.lastTs = 0;
+      this.loop();
+    }
+  },
+
+  beginSegment() {
+    const seg = this.currentSegment();
+    if (!seg) return this.finish();
+    const view = viewById(seg.viewId);
+    if (!view) return this.finish();
+    this.phase = "hops";
+    this.hopIdx = 0;
+    this.tracks = [];
+    this.tailTracks = [];
+    this.hideOverlay();
+    if (this.dia) this.clearNodeMarks(this.dia);
+    this.setProgress(
+      (activeView.mega ? "Unified map · " : "Segment " + (this.segmentIdx + 1) + "/" + this.scenario.segments.length + " · ") +
+      view.title + " · starting…"
+    );
+    if (activeView.id !== view.id) {
+      activeView = view;
+      this.resumeAfterView = true;
+      closeInspector();
+      renderSidebar($("#search").value);
+      renderView();
+      return;
+    }
+    this.resumeAfterView = false;
+    if (activeView.mega && this.segmentIdx === 0) {
+      this.fitMegaAll(true);
+      this.phase = "intro-wait";
+      this.waitUntil = performance.now() + 1100;
+      this.lastTs = 0;
+      this.loop();
+      return;
+    }
+    this.ensureMainTrack();
+    this.lastTs = 0;
+    this.loop();
+  },
+
+  ensureMainTrack() {
+    const seg = this.currentSegment();
+    if (!seg || !this.dia || !this.trafficSvg) return;
+    this.tracks = [{
+      svg: this.trafficSvg,
+      view: activeView,
+      dia: this.dia,
+      branch: { hops: seg.hops || [] },
+      color: planeColor("client"),
+      hopIdx: 0,
+      dist: 0,
+      geom: null,
+      arc: null,
+      particle: null,
+      delayMs: 0,
+      delayLeft: 0,
+      pauseLeft: 0,
+      awaitingDive: false,
+      done: false,
+    }];
+    startTrackHop(this.tracks[0]);
+  },
+
+  beginParallel() {
+    const seg = this.currentSegment();
+    if (!seg || !seg.parallel) return this.beginTail();
+    this.phase = "parallel";
+    this.advanceTimelineToKind("parallel-start");
+    this.tracks = seg.parallel.map((b) => newTrack(this.trafficSvg, activeView, this.dia, b, b.color));
+    this.tracks.forEach((t) => startTrackHop(t));
+    this.lastTs = 0;
+    this.loop();
+  },
+
+  beginTail() {
+    const seg = this.currentSegment();
+    if (!seg || !seg.tail || !seg.tail.length) return this.nextSegment();
+    this.phase = "tail";
+    this.advanceTimelineToKind("tail-start");
+    this.tracks = [{
+      svg: this.trafficSvg,
+      view: activeView,
+      dia: this.dia,
+      branch: { hops: seg.tail },
+      color: planeColor("success"),
+      hopIdx: 0,
+      dist: 0,
+      geom: null,
+      arc: null,
+      particle: null,
+      delayMs: 0,
+      delayLeft: 0,
+      pauseLeft: 0,
+      done: false,
+    }];
+    startTrackHop(this.tracks[0]);
+    this.lastTs = 0;
+    this.loop();
+  },
+
+  nextSegment() {
+    this.segmentIdx += 1;
+    if (this.segmentIdx >= this.scenario.segments.length) return this.finish();
+    this.waitUntil = performance.now() + 450;
+    this.phase = "segment-wait";
+    this.lastTs = 0;
+    this.loop();
+  },
+
+  finish() {
+    this.playing = false;
+    this.paused = true;
+    this.phase = "done";
+    if (this.raf) cancelAnimationFrame(this.raf);
+    this.raf = null;
+    $("#simPause").textContent = "▶";
+    this.setUiRunning(false);
+    if (this.timeline) {
+      this.maxReachedIdx = Math.max(this.maxReachedIdx, this.timeline.length - 1);
+      this.timelineIdx = this.timeline.length - 1;
+    }
+    this.refreshProgressLabel();
+    this.updateStepNavUi();
+    renderSidebar($("#search").value);
+  },
+
+  onViewReady(dia) {
+    this.dia = dia;
+    this.trafficSvg = dia.querySelector("svg.traffic-layer");
+    if (this.playing && this.resumeAfterView) {
+      this.resumeAfterView = false;
+      this.beginSegment();
+      return;
+    }
+    if (this.playing && !this.paused && this.phase !== "idle" && this.phase !== "done") {
+      this.lastTs = 0;
+      this.loop();
+    }
+  },
+
+  advanceTrack(track, dt) {
+    if (track.done) return;
+    if (track.delayLeft > 0) {
+      track.delayLeft -= dt * 1000;
+      return;
+    }
+    if (track.pauseLeft > 0) {
+      track.pauseLeft -= dt * 1000;
+      if (track.pauseLeft <= 0) {
+        if (track.awaitingDive) startTrackHop(track, true);
+        else startTrackHop(track);
+      }
+      return;
+    }
+    if (!track.geom) startTrackHop(track);
+    if (track.done || !track.geom) return;
+    track.dist += BASE_PX_PER_SEC * this.speed * dt;
+    const t = tAtDistance(track.arc, track.dist);
+    const p = bezierPoint(track.geom, t);
+    track.particle.setPos(p.x, p.y);
+    if (track.dist < track.arc.total) return;
+    const hop = track.branch.hops[track.hopIdx];
+    pulseNode(track.dia, hop.to, true);
+    if (!this._seeking) this.commitStep(hop.to);
+    if (hop.overlay) showTrafficOverlay(track.dia, hop.to, hop.overlay);
+    if (track.particle) {
+      track.particle.remove();
+      track.particle = null;
+    }
+    track.geom = null;
+    track.arc = null;
+    track.dist = 0;
+    track.hopIdx += 1;
+    if (track.hopIdx >= track.branch.hops.length) {
+      track.done = true;
+      return;
+    }
+    if (hop.pauseMs) {
+      track.pauseLeft = hop.pauseMs;
+    } else {
+      startTrackHop(track);
+    }
+  },
+
+  loop(ts) {
+    if (!this.playing || this.paused) return;
+    if (!this.lastTs) this.lastTs = ts || performance.now();
+    const now = ts || performance.now();
+    const dt = Math.min(0.05, (now - this.lastTs) / 1000);
+    this.lastTs = now;
+
+    if (this.phase === "segment-wait") {
+      if (now >= this.waitUntil) {
+        this.beginSegment();
+      } else {
+        this.raf = requestAnimationFrame((t) => this.loop(t));
+      }
+      return;
+    }
+
+    if (this.phase === "intro-wait") {
+      if (now < this.waitUntil) {
+        this.raf = requestAnimationFrame((t) => this.loop(t));
+        return;
+      }
+      this.focusRegion("overview", true, true);
+      showNarration("ov-client");
+      this.phase = "hops";
+      this.ensureMainTrack();
+      this.lastTs = now;
+      this.maxReachedIdx = Math.max(this.maxReachedIdx, 0);
+      this.refreshProgressLabel();
+    }
+
+    const seg = this.currentSegment();
+    if (!seg) return this.finish();
+
+    if (this.phase === "segment") {
+      this.beginSegment();
+      return;
+    }
+
+    if (this.phase === "hops" || this.phase === "parallel" || this.phase === "tail") {
+      this.tracks.forEach((t) => this.advanceTrack(t, dt));
+      if (!this._seeking) this.refreshProgressLabel();
+    }
+
+    if (this.phase === "hops" && this.tracks.every((t) => t.done)) {
+      if (seg.parallel && seg.parallel.length) return this.beginParallel();
+      if (seg.tail && seg.tail.length) return this.beginTail();
+      return this.nextSegment();
+    }
+    if (this.phase === "parallel" && this.tracks.every((t) => t.done)) {
+      return this.beginTail();
+    }
+    if (this.phase === "tail" && this.tracks.every((t) => t.done)) {
+      return this.nextSegment();
+    }
+
+    this.raf = requestAnimationFrame((t) => this.loop(t));
+  },
+};
+
+/* ───────────────────────── inspector */
+function openInspector(n) {
+  const detailKey = n.detailId || n.id.replace(/^(ov-|st-|wr-|rd-|c2-|c4f-|c4a-|c4-|ext-)/, "");
+  const d = DETAILS[detailKey] || DETAILS[n.id.replace(/^(c2-|c4-)/, "")];
+  document.querySelectorAll(".node.sel").forEach((el) => el.classList.remove("sel"));
+  const nodeEl = document.getElementById("n-" + n.id);
+  if (nodeEl) nodeEl.classList.add("sel");
+  selectedNode = n.id;
+
+  $("#inspTitle").textContent = n.t;
+  const plane = PLANES[(d && d.plane) || n.plane];
+  const chip = $("#inspPlane");
+  chip.textContent = plane.label;
+  chip.style.color = plane.color;
+  chip.style.border = "1px solid " + plane.color;
+  chip.style.background = "transparent";
+
+  let html = "";
+  if (d && d.facts && d.facts.length) {
+    html += '<div class="insp-sec"><h4>Facts</h4><ul>' + d.facts.map((f) => "<li>" + f + "</li>").join("") + "</ul></div>";
+  }
+  if (d && d.code && d.code.length) {
+    html += '<div class="insp-sec"><h4>Code</h4>' + d.code.map((c) => {
+      const label = c[2] ? ' · <span style="color:var(--muted)">' + c[2] + "</span>" : "";
+      const ln = c[1] ? '<span class="ln">:' + c[1] + "</span>" : "";
+      return '<a class="file-tag" href="' + vscodeUrl(c[0], c[1]) + '">' + c[0] + ln + label + "</a>";
+    }).join("") + "</div>";
+  }
+  if (d && d.docs && d.docs.length) {
+    html += '<div class="insp-sec"><h4>Decisions &amp; Runbooks</h4>' + d.docs.map((doc) => {
+      const kind = doc[0].includes("/adr/") ? "ADR" : doc[0].includes("/runbooks/") ? "RUNBOOK" : "DOC";
+      return '<a class="doc-link" href="' + vscodeUrl(doc[0], null) + '"><span class="kind">' + kind + "</span>" + doc[1] + "</a>";
+    }).join("") + "</div>";
+  }
+  html += '<div class="insp-foot">Facts verified against source 2026-06-10 · links open in VS Code (root configurable in header, shared with the codemap).</div>';
+  $("#inspBody").innerHTML = html;
+  $("#inspector").classList.add("open");
+}
+function closeInspector() {
+  $("#inspector").classList.remove("open");
+  document.querySelectorAll(".node.sel").forEach((el) => el.classList.remove("sel"));
+  selectedNode = null;
+}
+
+/* ───────────────────────── wiring */
+$("#inspClose").onclick = closeInspector;
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeInspector();
+  if (!trafficEngine.simActive) return;
+  if (e.target.closest("input, textarea, select")) return;
+  if (e.key === "ArrowLeft") {
+    e.preventDefault();
+    trafficEngine.stepBack();
+  } else if (e.key === "ArrowRight") {
+    e.preventDefault();
+    trafficEngine.stepForward();
+  }
+});
+$("#canvas").addEventListener("click", (e) => { if (!e.target.closest(".node")) closeInspector(); });
+$("#search").addEventListener("input", (e) => renderSidebar(e.target.value));
+
+const rootBtn = $("#rootBtn");
+function refreshRootBtn() {
+  const short = WORKSPACE_ROOT.length > 34 ? "…" + WORKSPACE_ROOT.slice(-32) : WORKSPACE_ROOT;
+  rootBtn.textContent = "root: " + short;
+}
+rootBtn.onclick = () => {
+  const v = prompt("Workspace root for vscode:// links (shared with codemap):", WORKSPACE_ROOT);
+  if (v) {
+    WORKSPACE_ROOT = v.trim();
+    localStorage.setItem("codemapRoot", WORKSPACE_ROOT);
+    refreshRootBtn();
+    if (selectedNode) {
+      const n = findBrowseNode(selectedNode);
+      if (n) openInspector(n);
+    }
+  }
+};
+refreshRootBtn();
+
+SCENARIO_GROUPS.forEach((g) => {
+  const og = document.createElement("optgroup");
+  og.label = g.label;
+  SCENARIOS.filter((s) => s.group === g.id).forEach((s) => {
+    const opt = document.createElement("option");
+    opt.value = s.id;
+    opt.textContent = s.label;
+    og.appendChild(opt);
+  });
+  $("#simScenario").appendChild(og);
+});
+
+$("#simPlay").onclick = () => {
+  if (trafficEngine.simActive && trafficEngine.paused) {
+    trafficEngine.paused = false;
+    trafficEngine.playing = true;
+    $("#simPause").textContent = "⏸";
+    trafficEngine.setUiRunning(true);
+    trafficEngine.lastTs = 0;
+    trafficEngine.loop();
+    return;
+  }
+  trafficEngine.play($("#simScenario").value);
+};
+$("#simBack").onclick = () => trafficEngine.stepBack();
+$("#simForward").onclick = () => trafficEngine.stepForward();
+$("#simPause").onclick = () => trafficEngine.pause();
+$("#simReset").onclick = () => trafficEngine.reset();
+$("#simSpeed").oninput = (e) => {
+  trafficEngine.speed = parseFloat(e.target.value);
+  $("#simSpeedLbl").textContent = trafficEngine.speed.toFixed(2).replace(/\.00$/, "") + "×";
+};
+trafficEngine.speed = parseFloat($("#simSpeed").value) || 0.35;
+$("#simSpeedLbl").textContent = trafficEngine.speed.toFixed(2).replace(/\.00$/, "") + "×";
+
+(function bindMegaViewportControls() {
+  const canvas = $("#canvas");
+  if (!canvas || canvas.dataset.panBound) return;
+  canvas.dataset.panBound = "1";
+  let panEngine = null;
+
+  function viewportEngine(vp) {
+    if (!vp) return null;
+    if (vp.classList.contains("mega-mode")) return trafficEngine;
+    return null;
+  }
+
+  canvas.addEventListener("pointerdown", (e) => {
+    const vp = e.target.closest(".canvas-viewport.mega-mode");
+    const eng = viewportEngine(vp);
+    if (!eng) return;
+    if (e.target.closest(".node")) return;
+    if (e.button !== 0 && e.button !== 1) return;
+    panEngine = eng;
+    eng.panDrag = {
+      x: e.clientX,
+      y: e.clientY,
+      tx: eng.camera.tx,
+      ty: eng.camera.ty,
+    };
+    vp.classList.add("is-panning");
+    vp.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+
+  canvas.addEventListener("pointermove", (e) => {
+    if (!panEngine || !panEngine.panDrag) return;
+    panEngine.camera.tx = panEngine.panDrag.tx + (e.clientX - panEngine.panDrag.x);
+    panEngine.camera.ty = panEngine.panDrag.ty + (e.clientY - panEngine.panDrag.y);
+    panEngine.applyCamera(false);
+  });
+
+  function endPan() {
+    if (panEngine) panEngine.panDrag = null;
+    panEngine = null;
+    document.querySelector(".canvas-viewport.is-panning")?.classList.remove("is-panning");
+  }
+  canvas.addEventListener("pointerup", endPan);
+  canvas.addEventListener("pointercancel", endPan);
+
+  canvas.addEventListener("wheel", (e) => {
+    const vp = e.target.closest(".canvas-viewport.mega-mode");
+    const eng = viewportEngine(vp);
+    if (!eng) return;
+    e.preventDefault();
+    const rect = vp.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const c = eng.camera;
+    const factor = e.deltaY < 0 ? 1.08 : 1 / 1.08;
+    const nextScale = Math.min(2.5, Math.max(0.12, c.scale * factor));
+    const ratio = nextScale / c.scale;
+    c.tx = mx - ratio * (mx - c.tx);
+    c.ty = my - ratio * (my - c.ty);
+    c.scale = nextScale;
+    eng.applyCamera(false);
+  }, { passive: false });
+})();
+
+renderSidebar("");
+renderView();
+</script>
+</body>
+</html>

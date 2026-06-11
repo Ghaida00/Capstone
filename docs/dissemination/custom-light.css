@@ -1,0 +1,57 @@
+/* Peakload — Light variant (FILKOM WordPress)
+   Paste AFTER custom.css in Appearance → Customize → Additional CSS,
+   OR use preview-light.html locally.
+
+   Recommended for filkom.ub.ac.id — matches the site's light theme. */
+
+.pl-page.pl-theme-light {
+  --pl-bg: #ffffff;
+  --pl-bg-alt: #f4f7fb;
+  --pl-elevated: #ffffff;
+  --pl-card: #ffffff;
+  --pl-border: #e2e8f0;
+  --pl-border-strong: #cbd5e1;
+  --pl-rust: #e04400;
+  --pl-blue: #1565b0;
+  --pl-gold: #b45309;
+  --pl-metric-value: #0f766e;
+  --pl-success: #15803d;
+  --pl-text: #1a2332;
+  --pl-muted: #5a6578;
+  --pl-code-bg: #f1f5f9;
+  --pl-code-text: #334155;
+  --pl-frame-bg: #eef2f7;
+  --pl-badge-accent-text: #c2410c;
+  --pl-badge-accent-border: rgba(224, 68, 0, 0.28);
+  --pl-team-card-bg: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+  --pl-hero-glow-blue: rgba(21, 101, 176, 0.1);
+  --pl-hero-glow-rust: rgba(224, 68, 0, 0.06);
+  --pl-hero-dot: #cbd5e1;
+  --pl-hero-dot-opacity: 0.55;
+  --pl-brand-gradient-end: #1565b0;
+  --pl-tab-active-bg: rgba(21, 101, 176, 0.08);
+  --pl-tab-active-border: rgba(21, 101, 176, 0.35);
+  --pl-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+  color: var(--pl-text);
+}
+
+.pl-page.pl-theme-light .pl-card,
+.pl-page.pl-theme-light .pl-metric {
+  backdrop-filter: none;
+}
+
+.pl-page.pl-theme-light .pl-frame {
+  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
+}
+
+.pl-page.pl-theme-light .pl-frame img {
+  border-bottom: 1px solid var(--pl-border);
+}
+
+.pl-page.pl-theme-light .pl-btn--ghost:hover {
+  background: var(--pl-bg-alt);
+}
+
+.pl-page.pl-theme-light .pl-status-yes {
+  color: var(--pl-success);
+}

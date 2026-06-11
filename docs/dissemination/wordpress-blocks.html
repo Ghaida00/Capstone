@@ -1,0 +1,443 @@
+<!--
+  Peakload Capstone — WordPress HTML Blocks
+  Paste each <section> into Kadence Advanced HTML block, OR use preview.html locally.
+  Light theme (filkom): paste custom.css + custom-light.css, then use class="pl-page pl-theme-light"
+  Upload assets/curated/*.png to WordPress Media Library and replace src URLs.
+  Add custom.css via Appearance → Customize → Additional CSS
+-->
+
+<div class="pl-page">
+
+<!-- ========== 1. HERO ========== -->
+<section class="pl-hero" id="hero">
+  <div class="pl-inner pl-fade">
+    <p class="pl-eyebrow">Capstone · Topik B.4 · Tim FullTIm · FILKOM UB 2026</p>
+    <h1 class="pl-title">Optimasi Skalabilitas Transaksi Perbankan untuk Mengatasi Exploding User Data</h1>
+    <p class="pl-brand">Peakload</p>
+    <span class="pl-brand-accent" aria-hidden="true"></span>
+    <p class="pl-subtitle">Peak Load Management &amp; Read/Write Separation Berbasis Rust — backend yang menahan lonjakan <strong>1 juta transaksi/jam</strong> dengan latensi P95 milidetik.</p>
+    <div class="pl-badges">
+      <span class="pl-badge pl-badge--accent">capstone</span>
+      <span class="pl-badge">Exploding User Data Scalabilities</span>
+      <span class="pl-badge">Kelompok 8</span>
+      <span class="pl-badge">Bank X · Studi Kasus</span>
+    </div>
+    <div class="pl-metrics">
+      <div class="pl-metric"><div class="pl-metric-value">1M</div><div class="pl-metric-label">transaksi / jam</div></div>
+      <div class="pl-metric"><div class="pl-metric-value">4,43 ms</div><div class="pl-metric-label">HTTP P95 latency</div></div>
+      <div class="pl-metric"><div class="pl-metric-value">0,00%</div><div class="pl-metric-label">error rate (k6)</div></div>
+      <div class="pl-metric"><div class="pl-metric-value">23</div><div class="pl-metric-label">container healthy</div></div>
+    </div>
+    <div class="pl-cta-row">
+      <a class="pl-btn pl-btn--primary" href="#demo">Lihat Demo</a>
+      <a class="pl-btn pl-btn--ghost" href="https://github.com/Ghaida00/Capstone" target="_blank" rel="noopener">Repositori GitHub</a>
+      <a class="pl-btn pl-btn--ghost" href="#repositori">Dokumentasi</a>
+    </div>
+  </div>
+</section>
+
+<!-- ========== 2. TIM ========== -->
+<section class="pl-section pl-section--dark" id="tim">
+  <div class="pl-fade">
+    <p class="pl-eyebrow">Tim Proyek</p>
+    <h2 class="pl-title">Meet Our Team — FullTIm</h2>
+    <p class="pl-subtitle">Enam anggota Teknik Informatika FILKOM UB — tim capstone Kelompok 8.</p>
+    <div class="pl-team-grid">
+      <article class="pl-team-card">
+        <h3>Ghaida Nayla</h3>
+        <p class="pl-team-role">Technical Lead &amp; System Architect</p>
+        <p class="pl-team-nim">235150700111001 · TI</p>
+        <p>Tech stack &amp; arsitektur, Docker Compose 4 profil skala, read/write separation HAProxy, Patroni HA, demo ops dashboard (React), QA.</p>
+        <p class="pl-team-email"><a href="mailto:ghaidanayla@student.ub.ac.id">ghaidanayla@student.ub.ac.id</a></p>
+      </article>
+      <article class="pl-team-card">
+        <h3>Lovely Ito Panjaitan</h3>
+        <p class="pl-team-role">Backend API Engineer</p>
+        <p class="pl-team-nim">235150700111012 · TI</p>
+        <p>Endpoint API Rust, consumer batch debit-credit, idempotency, POST /api/v2/accounts, validasi &amp; testing.</p>
+        <p class="pl-team-email"><a href="mailto:lovelyito@student.ub.ac.id">lovelyito@student.ub.ac.id</a></p>
+      </article>
+      <article class="pl-team-card">
+        <h3>Verda Aulia Setri</h3>
+        <p class="pl-team-role">Observability &amp; Performance Engineer</p>
+        <p class="pl-team-nim">235150701111014 · TI</p>
+        <p>k6 load testing 1M txn/jam, cross-shard analysis, poison message/DLQ, monitoring Docker, design banner.</p>
+        <p class="pl-team-email"><a href="mailto:verdaaulia@student.ub.ac.id">verdaaulia@student.ub.ac.id</a></p>
+      </article>
+      <article class="pl-team-card">
+        <h3>M. DAFFA RIYADLUSSALAM</h3>
+        <p class="pl-team-nim">235150700111043 · TI</p>
+      </article>
+      <article class="pl-team-card">
+        <h3>YOHANES DAMAR SATRIATMOKO</h3>
+        <p class="pl-team-nim">235150701111012 · TI</p>
+      </article>
+      <article class="pl-team-card">
+        <h3>AMELINDA DEVOTA</h3>
+        <p class="pl-team-nim">235150701111043 · TI</p>
+      </article>
+    </div>
+    <article class="pl-card" style="margin-top:1.5rem">
+      <h3>Dosen Pembimbing</h3>
+      <p><strong>Ir. Lutfi Fanani, S.Kom., M.T., M.Sc.</strong><br>Departemen Teknik Informatika, FILKOM UB<br>
+      <a href="mailto:lutfifanani@ub.ac.id">lutfifanani@ub.ac.id</a> ·
+      <a href="https://filkom.ub.ac.id/profile/dosen/lutfi.fanani" target="_blank" rel="noopener">Profil dosen</a></p>
+    </article>
+  </div>
+</section>
+
+<!-- ========== 3. MITRA ========== -->
+<section class="pl-section pl-section--alt" id="mitra">
+  <div class="pl-fade">
+    <p class="pl-eyebrow">Mitra Studi Kasus</p>
+    <h2 class="pl-title">Bank X</h2>
+    <p class="pl-subtitle">Studi kasus perbankan digital — masalah nyata, solusi terukur SLO, tanpa mengekspos data confidential.</p>
+    <div class="pl-grid-3">
+      <div class="pl-card"><h3>Downtime saat peak</h3><p>1 juta txn/jam, P95 &gt; 10 detik — kegagalan layanan total standar perbankan digital.</p></div>
+      <div class="pl-card"><h3>Monolit tanpa RW-split</h3><p>Connection pool exhaustion &amp; lock contention — primary DB jadi bottleneck baca dan tulis.</p></div>
+      <div class="pl-card"><h3>Blind spots operasional</h3><p>Tanpa backpressure &amp; metrik per-endpoint — cascading failure sulit didiagnosis.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== 4. RINGKASAN ========== -->
+<section class="pl-section pl-section--dark" id="tentang">
+  <div class="pl-fade">
+    <p class="pl-eyebrow">Tentang Proyek</p>
+    <h2 class="pl-title">Ringkasan Peakload</h2>
+    <p class="pl-subtitle">Tim FullTIm membangun backend Rust production-style: 2 replika stateless, PostgreSQL sharded Patroni HA, Redis Sentinel, RabbitMQ + Transactional Outbox, middleware resilience, dan demo ops dashboard web.</p>
+    <p>Pengujian k6 (300 VU, 15 menit) membuktikan throughput ~1 juta txn/jam, P95 4,43 ms, error rate 0,00%. Seluruh stack naik dengan <code>docker compose up</code>.</p>
+  </div>
+</section>
+
+<!-- ========== 5–6. PAIN & SOLUSI ========== -->
+<section class="pl-section pl-section--alt" id="solusi">
+  <div class="pl-fade">
+    <p class="pl-eyebrow">Solusi</p>
+    <h2 class="pl-title">Dari Pain Point ke Arsitektur Tahan Beban</h2>
+    <div class="pl-grid-2" style="margin-top:2rem">
+      <div class="pl-card"><h3>Async Write Path</h3><p>HTTP 202 → Transactional Outbox → RabbitMQ → batch consumer (≤200 msg, flush 250 ms). Durabilitas meski broker sempat down.</p></div>
+      <div class="pl-card"><h3>Read/Write Separation</h3><p>Tulis via pgBouncer → HAProxy /primary; baca via /replica per-shard. P50 balance read 0,796 ms.</p></div>
+      <div class="pl-card"><h3>Resilience Berlapis</h3><p>backpressure → circuit breaker → rate limit (64-shard) → JWT auth. HTTP 503/429/401 per layer.</p></div>
+      <div class="pl-card"><h3>Observability Penuh</h3><p>Prometheus, Grafana (SLO alerts), Jaeger tracing, demo ops dashboard React di /dashboard/.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== 7. CARA KERJA ========== -->
+<section class="pl-section pl-section--dark" id="cara-kerja">
+  <div class="pl-fade">
+    <p class="pl-eyebrow">Alur Sistem</p>
+    <h2 class="pl-title">Cara Kerja Peakload</h2>
+    <div class="pl-grid-2">
+      <div>
+        <h3>Write Path</h3>
+        <ol class="pl-steps">
+          <li>Client POST → Nginx (LB + edge rate limit)</li>
+          <li>Protection stack (backpressure → CB → rate limit → auth)</li>
+          <li>Dual idempotency (Redis + PG, SHA-256)</li>
+          <li>Atomic INSERT outbox + debit (PG primary)</li>
+          <li>publish_outbox → RabbitMQ</li>
+          <li>Batch consumer apply debit/credit</li>
+          <li>Event bus → notifications + cache invalidation</li>
+          <li>Poll GET /status/{ref} → completed</li>
+        </ol>
+      </div>
+      <div>
+        <h3>Read Path</h3>
+        <p>GET /accounts/{id}/balance → moka L1 (1s TTL) → Redis L2 (10s) → HAProxy /replica → PostgreSQL.</p>
+        <div class="pl-frame" style="margin-top:1rem">
+          <img src="assets/curated/postman-202.png" alt="Postman POST transactions HTTP 202" loading="lazy" width="800" height="450">
+          <div class="pl-frame-caption">Write path — HTTP 202 Accepted + reference_id</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== 8. KEBUTUHAN vs FITUR ========== -->
+<section class="pl-section pl-section--alt" id="kebutuhan">
+  <div class="pl-fade">
+    <p class="pl-eyebrow">Traceability</p>
+    <h2 class="pl-title">Kebutuhan vs Fitur</h2>
+    <div class="pl-table-wrap">
+      <table class="pl-table">
+        <thead><tr><th>Kebutuhan</th><th>Implementasi</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td>Transfer dana</td><td>POST /api/v2/transactions</td><td class="pl-status-yes">Ya</td></tr>
+          <tr><td>Status transaksi</td><td>GET /status/{ref}</td><td class="pl-status-yes">Ya</td></tr>
+          <tr><td>Riwayat transaksi</td><td>GET /api/v2/transactions</td><td class="pl-status-yes">Ya</td></tr>
+          <tr><td>Cek saldo cepat</td><td>GET /accounts/{id}/balance</td><td class="pl-status-yes">Ya</td></tr>
+          <tr><td>Registrasi akun</td><td>POST /api/v2/accounts</td><td class="pl-status-yes">Ya</td></tr>
+          <tr><td>Anti double-spend</td><td>Dual idempotency</td><td class="pl-status-yes">Ya</td></tr>
+          <tr><td>Tahan lonjakan</td><td>Middleware resilience</td><td class="pl-status-yes">Ya</td></tr>
+          <tr><td>Read/write separation</td><td>HAProxy /primary &amp; /replica</td><td class="pl-status-yes">Ya</td></tr>
+          <tr><td>HA database</td><td>Patroni multi-shard</td><td class="pl-status-yes">Ya</td></tr>
+          <tr><td>Monitoring real-time</td><td>Prometheus + Grafana + dashboard</td><td class="pl-status-yes">Ya</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ========== 9. FITUR (interactive tabs) ========== -->
+<section class="pl-section pl-section--dark" id="fitur">
+  <div class="pl-fade">
+    <p class="pl-eyebrow">Fitur Utama</p>
+    <h2 class="pl-title">15 Fitur Production-Style</h2>
+    <div class="pl-tabs" role="tablist" aria-label="Kategori fitur">
+      <button type="button" class="pl-tab pl-tab--active" role="tab" id="pl-tab-core" aria-selected="true" aria-controls="pl-panel-core" data-pl-tab="core">Core Transaction</button>
+      <button type="button" class="pl-tab" role="tab" id="pl-tab-resilience" aria-selected="false" aria-controls="pl-panel-resilience" data-pl-tab="resilience" tabindex="-1">Resilience &amp; HA</button>
+      <button type="button" class="pl-tab" role="tab" id="pl-tab-ops" aria-selected="false" aria-controls="pl-panel-ops" data-pl-tab="ops" tabindex="-1">Ops &amp; Observability</button>
+    </div>
+    <div class="pl-tab-panels">
+      <div class="pl-tab-panel pl-tab-panel--active" role="tabpanel" id="pl-panel-core" aria-labelledby="pl-tab-core" data-pl-panel="core">
+        <div class="pl-grid-2">
+          <div class="pl-card">
+            <h3>Core Transaction</h3>
+            <ul>
+              <li>Create async (HTTP 202 + reference_id)</li>
+              <li>Registrasi akun dinamis (POST /accounts)</li>
+              <li>Inquiry saldo 2-tier cache</li>
+              <li>Cross-shard transfer + outbox</li>
+              <li>Dual idempotency SHA-256</li>
+            </ul>
+          </div>
+          <div class="pl-frame">
+            <img src="assets/curated/dashboard-metrics.png" alt="Demo ops dashboard metrik live" loading="lazy">
+            <div class="pl-frame-caption">Demo ops dashboard — metrik RPS, P95/P99, health per-service</div>
+          </div>
+        </div>
+      </div>
+      <div class="pl-tab-panel" role="tabpanel" id="pl-panel-resilience" aria-labelledby="pl-tab-resilience" data-pl-panel="resilience" hidden>
+        <div class="pl-grid-2">
+          <div class="pl-card">
+            <h3>Resilience &amp; HA</h3>
+            <ul>
+              <li>Transactional Outbox — durabilitas sebelum publish ke broker</li>
+              <li>RabbitMQ batch consumer (≤200 msg, flush 250 ms)</li>
+              <li>Middleware stack — backpressure → circuit breaker → rate limit → JWT</li>
+              <li>Multi-shard Patroni HA (profil skala A–D)</li>
+              <li>Redis Sentinel untuk cache &amp; idempotency</li>
+              <li>Graceful shutdown — drain in-flight requests</li>
+            </ul>
+          </div>
+          <div class="pl-frame">
+            <img src="assets/curated/docker-containers.png" alt="23 container Docker Compose healthy" loading="lazy">
+            <div class="pl-frame-caption">Full stack HA — Patroni, Sentinel, RabbitMQ, 2 replika app</div>
+          </div>
+        </div>
+      </div>
+      <div class="pl-tab-panel" role="tabpanel" id="pl-panel-ops" aria-labelledby="pl-tab-ops" data-pl-panel="ops" hidden>
+        <div class="pl-grid-2">
+          <div class="pl-card">
+            <h3>Ops &amp; Observability</h3>
+            <ul>
+              <li>Demo ops dashboard React di /dashboard/</li>
+              <li>Prometheus + Grafana (SLO alerts) + Jaeger tracing</li>
+              <li>k6 suite — load, soak, dan e2e scenarios</li>
+              <li>Disaster recovery — Patroni failover + outbox durability</li>
+            </ul>
+          </div>
+          <div class="pl-frame">
+            <img src="assets/curated/grafana-dashboard.png" alt="Grafana dashboard SLO dan latency" loading="lazy">
+            <div class="pl-frame-caption">Grafana — RPS, latency P95/P99, recording rules SLO</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== 10. TEKNOLOGI ========== -->
+<section class="pl-section pl-section--alt" id="teknologi">
+  <div class="pl-fade">
+    <p class="pl-eyebrow">Stack</p>
+    <h2 class="pl-title">Teknologi</h2>
+    <div class="pl-tech-grid">
+      <span class="pl-tech-pill">Rust</span><span class="pl-tech-pill">Axum</span><span class="pl-tech-pill">Tokio</span>
+      <span class="pl-tech-pill">PostgreSQL 18</span><span class="pl-tech-pill">Patroni</span><span class="pl-tech-pill">etcd</span>
+      <span class="pl-tech-pill">pgBouncer</span><span class="pl-tech-pill">HAProxy</span>
+      <span class="pl-tech-pill">Redis Sentinel</span><span class="pl-tech-pill">RabbitMQ</span>
+      <span class="pl-tech-pill">Nginx</span><span class="pl-tech-pill">Docker Compose</span>
+      <span class="pl-tech-pill">Prometheus</span><span class="pl-tech-pill">Grafana</span><span class="pl-tech-pill">Jaeger</span>
+      <span class="pl-tech-pill">OpenTelemetry</span><span class="pl-tech-pill">k6</span><span class="pl-tech-pill">mimalloc</span>
+    </div>
+  </div>
+</section>
+
+<!-- ========== 11. ARSITEKTUR ========== -->
+<section class="pl-section pl-section--dark" id="arsitektur">
+  <div class="pl-fade">
+    <p class="pl-eyebrow">Arsitektur</p>
+    <h2 class="pl-title">3 Lapisan + 5 Crate</h2>
+    <div class="pl-grid-3">
+      <div class="pl-card"><h3>Edge</h3><p>Nginx LB, CSP headers, edge rate limit, 2 upstream app replicas.</p></div>
+      <div class="pl-card"><h3>Application</h3><p>Rust modular monolith: app, accounts, transactions, notifications, shared_kernel.</p></div>
+      <div class="pl-card"><h3>Data Plane</h3><p>PG sharded Patroni, Redis Sentinel, RabbitMQ, profil skala A–D (1–3 shard).</p></div>
+    </div>
+    <div class="pl-grid-2" style="margin-top:1.5rem">
+      <div class="pl-frame">
+        <img src="assets/curated/docker-containers.png" alt="Docker Compose 23 containers running" loading="lazy">
+        <div class="pl-frame-caption">23 container healthy — full stack lokal</div>
+      </div>
+      <div class="pl-frame">
+        <img src="assets/curated/prometheus-targets.png" alt="Prometheus targets UP" loading="lazy">
+        <div class="pl-frame-caption">Prometheus scrape — observability aktif</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== 12. HASIL ========== -->
+<section class="pl-section pl-section--alt" id="hasil">
+  <div class="pl-fade">
+    <p class="pl-eyebrow">Evaluasi</p>
+    <h2 class="pl-title">Hasil Pengujian</h2>
+    <div class="pl-table-wrap" style="margin-bottom:1.5rem">
+      <table class="pl-table">
+        <thead><tr><th>Metrik (k6, 300 VU, 15m)</th><th>Hasil</th><th>Target</th></tr></thead>
+        <tbody>
+          <tr><td>Throughput</td><td>~1 juta txn/jam</td><td>1 juta txn/jam</td></tr>
+          <tr><td>HTTP P95</td><td>4,43 ms</td><td>&lt; 500 ms</td></tr>
+          <tr><td>Balance P95</td><td>4,68 ms</td><td>&lt; 10 ms</td></tr>
+          <tr><td>Error rate</td><td>0,00% (0/512.104)</td><td>&lt; 5%</td></tr>
+          <tr><td>Unit tests</td><td>152 pass</td><td>—</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="pl-frame">
+      <img src="assets/curated/grafana-dashboard.png" alt="Grafana Peakload dashboard" loading="lazy">
+      <div class="pl-frame-caption">Grafana — RPS, latency, SLO recording rules</div>
+    </div>
+    <p style="margin-top:1.5rem;color:var(--pl-muted)"><strong>Keterbatasan:</strong> Belum TLS/HTTPS production · Deploy cloud belum dilakukan (fokus Docker Compose lokal).</p>
+  </div>
+</section>
+
+<!-- ========== 13. REPOSITORI & DEMO ========== -->
+<section class="pl-section pl-section--dark" id="demo">
+  <div class="pl-fade">
+    <p class="pl-eyebrow" id="repositori">Repositori &amp; Demo</p>
+    <h2 class="pl-title">Dokumentasi &amp; Akses Produk</h2>
+    <div class="pl-code-wrap">
+      <pre class="pl-code">git clone https://github.com/Ghaida00/Capstone
+cd Capstone
+cp .env.example .env
+docker compose up -d --build</pre>
+    </div>
+    <p style="color:var(--pl-muted);font-size:0.9rem;margin:-0.75rem 0 1.25rem">
+      Kartu <strong>API Contract</strong> &amp; <strong>Arsitektur Interaktif</strong> di bawah membuka tampilan interaktif (Swagger UI &amp; diagram klik), bukan kode mentah GitHub.
+    </p>
+    <div class="pl-repo-grid">
+      <div class="pl-repo-item">
+        <a class="pl-repo-card" href="https://github.com/Ghaida00/Capstone" target="_blank" rel="noopener"><h4>GitHub</h4><p>Source code, ADR, runbooks, k6 suite</p></a>
+      </div>
+      <div class="pl-repo-item">
+        <a class="pl-repo-card" href="https://editor.swagger.io/?url=https://raw.githubusercontent.com/Ghaida00/Capstone/main/docs/apiContract.yaml" target="_blank" rel="noopener" data-pl-local="swagger-preview.html"><h4>API Contract</h4><p>Swagger UI interaktif — semua endpoint v2</p></a>
+        <p class="pl-repo-source">Sumber YAML: <a href="https://github.com/Ghaida00/Capstone/blob/main/docs/apiContract.yaml" target="_blank" rel="noopener">GitHub</a></p>
+      </div>
+      <div class="pl-repo-item">
+        <a class="pl-repo-card" href="https://htmlpreview.github.io/?https://raw.githubusercontent.com/Ghaida00/Capstone/main/docs/architecture/architecture.html" target="_blank" rel="noopener" data-pl-local="/docs/architecture/architecture.html"><h4>Arsitektur Interaktif</h4><p>Diagram klik + referensi kode</p></a>
+        <p class="pl-repo-source">Sumber HTML: <a href="https://github.com/Ghaida00/Capstone/blob/main/docs/architecture/architecture.html" target="_blank" rel="noopener">GitHub</a></p>
+      </div>
+      <div class="pl-repo-item">
+        <a class="pl-repo-card" href="#demo"><h4>Demo Lokal</h4><p>API :8080 · Grafana :3001 · /dashboard/</p></a>
+      </div>
+    </div>
+    <div class="pl-grid-2" style="margin-top:1.5rem">
+      <div class="pl-frame">
+        <img src="assets/curated/dashboard-submit.png" alt="Submit transaksi dari dashboard" loading="lazy">
+        <div class="pl-frame-caption">Submit transaksi + burst load dari ops dashboard</div>
+      </div>
+      <div class="pl-frame">
+        <img src="assets/curated/github-repo.png" alt="Repository GitHub Capstone" loading="lazy">
+        <div class="pl-frame-caption">Repository publik — reproducible full stack</div>
+      </div>
+    </div>
+    <div class="pl-video" style="margin-top:1.5rem">
+      <!-- Ganti VIDEO_ID setelah upload YouTube -->
+      <div class="pl-video-placeholder">Video demo — sisipkan iframe YouTube setelah rekam (lihat demo-script.md)</div>
+    </div>
+  </div>
+</section>
+
+<!-- ========== 14. REFLEKSI & KONTAK ========== -->
+<section class="pl-section pl-section--alt" id="kontak">
+  <div class="pl-fade">
+    <p class="pl-eyebrow">Penutup</p>
+    <h2 class="pl-title">Refleksi &amp; Kontak</h2>
+    <div class="pl-grid-3" style="margin-bottom:2rem">
+      <div class="pl-card"><h3>Teknis</h3><p>Rust async, Transactional Outbox, sharding, Patroni, k6 soak — kompetensi distributed systems.</p></div>
+      <div class="pl-card"><h3>Kolaborasi</h3><p>11 minggu Git PR workflow, 3 peran komplementer, demo dashboard untuk audiens non-teknis.</p></div>
+      <div class="pl-card"><h3>Ke depan</h3><p>TLS Nginx · Cloud/K8s staging · Validasi mitra lebih awal.</p></div>
+    </div>
+    <div class="pl-contact-grid">
+      <div class="pl-card"><h3>Ghaida Nayla</h3><p><a href="mailto:ghaidanayla@student.ub.ac.id">ghaidanayla@student.ub.ac.id</a></p></div>
+      <div class="pl-card"><h3>Lovely Ito Panjaitan</h3><p><a href="mailto:lovelyito@student.ub.ac.id">lovelyito@student.ub.ac.id</a></p></div>
+      <div class="pl-card"><h3>Verda Aulia Setri</h3><p><a href="mailto:verdaaulia@student.ub.ac.id">verdaaulia@student.ub.ac.id</a></p></div>
+      <div class="pl-card"><h3>Pembimbing</h3><p>Ir. Lutfi Fanani<br><a href="mailto:lutfifanani@ub.ac.id">lutfifanani@ub.ac.id</a></p></div>
+    </div>
+    <p style="margin-top:2rem;color:var(--pl-muted)">FILKOM UB · Jl. Veteran No.10-11, Ketawanggede, Lowokwaru, Malang 65145</p>
+  </div>
+</section>
+
+</div>
+
+<script>
+(function () {
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  var els = document.querySelectorAll(".pl-fade");
+  if (!("IntersectionObserver" in window)) {
+    els.forEach(function (e) { e.classList.add("pl-visible"); });
+    return;
+  }
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (en) {
+      if (en.isIntersecting) {
+        en.target.classList.add("pl-visible");
+        io.unobserve(en.target);
+      }
+    });
+  }, { threshold: 0.12 });
+  els.forEach(function (e) { io.observe(e); });
+})();
+
+(function () {
+  var tablist = document.querySelector(".pl-tabs[role='tablist']");
+  if (!tablist) return;
+  var tabs = tablist.querySelectorAll("[role='tab']");
+  var panels = document.querySelectorAll("[data-pl-panel]");
+  function activate(id) {
+    tabs.forEach(function (tab) {
+      var on = tab.getAttribute("data-pl-tab") === id;
+      tab.classList.toggle("pl-tab--active", on);
+      tab.setAttribute("aria-selected", on ? "true" : "false");
+      tab.tabIndex = on ? 0 : -1;
+    });
+    panels.forEach(function (panel) {
+      var on = panel.getAttribute("data-pl-panel") === id;
+      panel.classList.toggle("pl-tab-panel--active", on);
+      panel.hidden = !on;
+    });
+  }
+  tablist.addEventListener("click", function (e) {
+    var tab = e.target.closest("[role='tab']");
+    if (!tab || !tablist.contains(tab)) return;
+    activate(tab.getAttribute("data-pl-tab"));
+  });
+  tablist.addEventListener("keydown", function (e) {
+    var current = tablist.querySelector("[role='tab'][aria-selected='true']");
+    if (!current) return;
+    var idx = Array.prototype.indexOf.call(tabs, current);
+    var next = idx;
+    if (e.key === "ArrowRight") next = (idx + 1) % tabs.length;
+    else if (e.key === "ArrowLeft") next = (idx - 1 + tabs.length) % tabs.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = tabs.length - 1;
+    else return;
+    e.preventDefault();
+    tabs[next].focus();
+    activate(tabs[next].getAttribute("data-pl-tab"));
+  });
+})();
+</script>

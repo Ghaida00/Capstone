@@ -1,0 +1,104 @@
+{
+  "context": {
+    "vp": {
+      "w": 982,
+      "h": 730,
+      "bg": "rgba(0, 0, 0, 0) linear-gradient(rgb(238, 241, 246) 0%, rgb(228, 232, 239) 100%) repeat scroll 0% 0% / auto padding-box border-box"
+    },
+    "stageTransform": "translate(40px, 149.75px) scale(1.025)",
+    "dia": {
+      "w": 880,
+      "h": 420
+    },
+    "headerInStage": true,
+    "headerRect": {
+      "x": 438,
+      "y": 290.0201110839844,
+      "width": 902,
+      "height": 54.981658935546875,
+      "top": 290.0201110839844,
+      "right": 1340,
+      "bottom": 345.00177001953125,
+      "left": 438
+    },
+    "nodeCount": 2,
+    "canvasPad": "32px 48px 80px"
+  },
+  "containers": {
+    "scope": "peakload",
+    "boundary": {
+      "x": 736.3587036132812,
+      "y": 485.89849853515625,
+      "width": 610.4347534179688,
+      "height": 551.0869750976562,
+      "top": 485.89849853515625,
+      "right": 1346.79345703125,
+      "bottom": 1036.9854736328125,
+      "left": 736.3587036132812
+    },
+    "nodes": [
+      {
+        "id": "n-ext-user",
+        "rect": {
+          "x": 949.728271484375,
+          "y": 432.202880859375,
+          "width": 155.434814453125,
+          "height": 37.257965087890625,
+          "top": 432.202880859375,
+          "right": 1105.1630859375,
+          "bottom": 469.4608459472656,
+          "left": 949.728271484375
+        },
+        "bg": "rgb(27, 31, 39)"
+      },
+      {
+        "id": "n-c2-client",
+        "rect": {
+          "x": 997.771728515625,
+          "y": 497.202880859375,
+          "width": 155.434814453125,
+          "height": 37.2579345703125,
+          "top": 497.202880859375,
+          "right": 1153.20654296875,
+          "bottom": 534.4608154296875,
+          "left": 997.771728515625
+        },
+        "bg": "rgb(27, 31, 39)"
+      },
+      {
+        "id": "n-c2-nginx",
+        "rect": {
+          "x": 969.5108642578125,
+          "y": 546.659423828125,
+          "width": 211.95654296875,
+          "height": 37.2579345703125,
+          "top": 546.659423828125,
+          "right": 1181.4674072265625,
+          "bottom": 583.9173583984375,
+          "left": 969.5108642578125
+        },
+        "bg": "rgb(27, 31, 39)"
+      }
+    ],
+    "planeLabels": [
+      {
+        "text": "data plane — redis",
+        "color": "rgb(93, 101, 115)"
+      },
+      {
+        "text": "data plane — postgres",
+        "color": "rgb(93, 101, 115)"
+      },
+      {
+        "text": "async plane",
+        "color": "rgb(93, 101, 115)"
+      },
+      {
+        "text": "observability",
+        "color": "rgb(93, 101, 115)"
+      }
+    ],
+    "wiresText": 14,
+    "stageTransform": "translate(151.87px, 40px) scale(0.706522)"
+  }
+}

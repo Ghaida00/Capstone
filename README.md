@@ -30,7 +30,7 @@ Pastikan Anda sudah menginstal alat-alat berikut di sistem Anda:
 ### 2️⃣ Clone Repository
 Pertama, _clone_ repository ini:
 ```bash
-git clone <URL-REPOSITORY>
+git clone https://github.com/Ghaida00/Capstone
 cd Capstone
 ```
 
