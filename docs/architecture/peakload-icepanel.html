@@ -21,6 +21,24 @@
 #nodes{position:absolute;inset:0}
 .flowbar{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);max-width:680px;display:none}
 .btn[disabled],.btn:has(input[disabled]),.btn.disabled,[disabled]{opacity:.4;cursor:not-allowed;pointer-events:none}
+/* ═══ NODE CARDS ═══ */
+.node{position:absolute;background:var(--card);border:1px solid #d6dae2;border-radius:10px;
+  padding:10px 12px 10px 14px;box-shadow:0 1px 4px rgba(20,30,50,.10);cursor:pointer;user-select:none}
+.node::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;border-radius:10px 0 0 10px;
+  background:var(--pc)}
+.node h4{margin:0;font-size:13.5px;color:#1c2733}.node p{margin:3px 0 0;font-size:11.5px;color:#5d6573}
+.node .drill{position:absolute;right:8px;top:8px;width:22px;height:22px;border-radius:50%;
+  border:1px solid #c9d4e3;background:#fff;color:var(--accent);font-size:14px;line-height:20px;text-align:center;cursor:pointer}
+.node.ghost{opacity:.55;border-style:dashed}
+.node.pulse{box-shadow:0 0 0 4px color-mix(in srgb,var(--pc) 35%, transparent)}
+/* ═══ EDGES ═══ */
+path.edge{fill:none;stroke:var(--line);stroke-width:1.6}
+path.edge.dashed{stroke-dasharray:6 4}
+path.edge.danger{stroke:#d9534f}
+path.edge.obs{stroke:#8a5fd6;stroke-dasharray:2 5}
+path.edge.dim{opacity:.15}
+.node.dim{opacity:.25}
+text.elabel{font-size:10.5px;fill:#5d6573;paint-order:stroke;stroke:#f4f5f7;stroke-width:3px}
 </style></head><body>
 <header class="topbar">
   <strong>Peakload</strong><span style="color:var(--mut)">IcePanel-style explorer</span>
@@ -572,5 +590,160 @@ const diagrams = {
 return { nodes, diagrams };
 })();
 
-window.icepanel = { cam, MODEL };
+/* ═══ RENDER ═══ */
+let EDGEIDX = {};
+
+function rectOf(nodeId) {
+  const el = document.getElementById("n-" + nodeId);
+  if (!el) return null;
+  const d = nav.current() ? MODEL.diagrams[nav.current()] : null;
+  const layout = d && d.layout[nodeId];
+  if (!layout) return null;
+  return { x: layout.x, y: layout.y, w: layout.w, h: el.offsetHeight };
+}
+
+function edgePath(a, b, e) {
+  const side = (r, s) => ({
+    top:    [r.x + r.w / 2,  r.y],
+    bottom: [r.x + r.w / 2,  r.y + r.h],
+    left:   [r.x,             r.y + r.h / 2],
+    right:  [r.x + r.w,       r.y + r.h / 2],
+  })[s];
+  let fs = e.fromSide, ts = e.toSide;
+  if (!fs || !ts) {
+    const dy = b.y - (a.y + a.h);
+    const dx = (b.x + b.w / 2) - (a.x + a.w / 2);
+    if (!fs) fs = dy >= 0 ? "bottom" : (Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "right" : "left") : "top");
+    if (!ts) ts = dy >= 0 ? "top"    : (Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "left"  : "right") : "bottom");
+  }
+  const [x1, y1] = side(a, fs);
+  const [x2, y2] = side(b, ts);
+  const n = { top:[0,-1], bottom:[0,1], left:[-1,0], right:[1,0] };
+  const d = Math.max(40, Math.hypot(x2 - x1, y2 - y1) * 0.4);
+  return `M${x1},${y1} C${x1+n[fs][0]*d},${y1+n[fs][1]*d} ${x2+n[ts][0]*d},${y2+n[ts][1]*d} ${x2},${y2}`;
+}
+
+function renderDiagram(diagramId) {
+  const d = MODEL.diagrams[diagramId];
+  if (!d) return;
+  const nodesEl  = document.getElementById("nodes");
+  const wiresEl  = document.getElementById("wires");
+
+  // Clear
+  nodesEl.innerHTML = "";
+  // Keep defs if already present, rebuild wires content
+  wiresEl.innerHTML = "";
+  wiresEl.setAttribute("width",  d.w);
+  wiresEl.setAttribute("height", d.h);
+  wiresEl.style.width  = d.w + "px";
+  wiresEl.style.height = d.h + "px";
+
+  // SVG defs — arrowhead markers
+  const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+  defs.innerHTML =
+    '<marker id="arr-flow"   viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8b93a3"/></marker>' +
+    '<marker id="arr-dashed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8b93a3"/></marker>' +
+    '<marker id="arr-danger" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d9534f"/></marker>' +
+    '<marker id="arr-obs"    viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8a5fd6"/></marker>';
+  wiresEl.appendChild(defs);
+
+  // Create node cards
+  for (const nodeId of d.nodes) {
+    const node   = MODEL.nodes[nodeId];
+    const layout = d.layout[nodeId];
+    if (!node || !layout) continue;
+
+    const el = document.createElement("div");
+    el.className = "node" + (node.ghost ? " ghost" : "");
+    el.id = "n-" + nodeId;
+    el.style.cssText = `left:${layout.x}px;top:${layout.y}px;width:${layout.w}px;--pc:var(--c-${node.plane})`;
+
+    const h4 = document.createElement("h4");
+    h4.textContent = node.title;
+    el.appendChild(h4);
+
+    if (node.sub) {
+      const p = document.createElement("p");
+      p.textContent = node.sub;
+      el.appendChild(p);
+    }
+
+    if (node.drill) {
+      const btn = document.createElement("button");
+      btn.className = "drill";
+      btn.title = "Drill in";
+      btn.textContent = "⊕";
+      el.appendChild(btn);
+    }
+
+    nodesEl.appendChild(el);
+  }
+
+  // Force layout so offsetHeight is available
+  nodesEl.offsetHeight; // eslint-disable-line no-unused-expressions
+
+  // Build rectOf lookup (world-space rects from layout + measured heights)
+  const rects = {};
+  for (const nodeId of d.nodes) {
+    const layout = d.layout[nodeId];
+    const el = document.getElementById("n-" + nodeId);
+    if (!layout || !el) continue;
+    rects[nodeId] = { x: layout.x, y: layout.y, w: layout.w, h: el.offsetHeight };
+  }
+
+  // Draw edges
+  const newEDGEIDX = {};
+  for (const e of d.edges) {
+    const a = rects[e.from];
+    const b = rects[e.to];
+    if (!a || !b) continue;
+
+    const kind    = e.kind || "flow";
+    const pathStr = edgePath(a, b, e);
+
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", pathStr);
+    path.setAttribute("class", "edge" + (kind !== "flow" ? " " + kind : ""));
+    path.setAttribute("marker-end", "url(#arr-" + kind + ")");
+    wiresEl.appendChild(path);
+
+    // Edge label at path midpoint
+    if (e.label) {
+      // Append path temporarily to measure it (it's already in DOM)
+      const len = path.getTotalLength();
+      const mid = path.getPointAtLength(len / 2);
+      const txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      txt.setAttribute("class", "elabel");
+      txt.setAttribute("x", mid.x);
+      txt.setAttribute("y", mid.y - 4);
+      txt.setAttribute("text-anchor", "middle");
+      txt.textContent = e.label;
+      wiresEl.appendChild(txt);
+    }
+
+    // Store on edge object and in index
+    e._path = path;
+    newEDGEIDX[e.from + "→" + e.to] = e;
+  }
+
+  EDGEIDX = newEDGEIDX;
+  cam.fit(d.w, d.h);
+}
+
+/* ═══ NAV ═══ */
+const nav = (() => {
+  let _current = null;
+  return {
+    open(diagramId) {
+      _current = diagramId;
+      renderDiagram(diagramId);
+    },
+    current() { return _current; },
+  };
+})();
+
+// Boot
+nav.open("l1");
+
+window.icepanel = { cam, MODEL, nav, rectOf, EDGEIDX: () => EDGEIDX };
 </script></body></html>
