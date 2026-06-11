@@ -1,4 +1,5 @@
 <!doctype html><html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Peakload — IcePanel-style Explorer</title><style>
 :root{ --bg:#16181d; --chrome:#1e2128; --chrome2:#262a33; --txt:#e8eaf0; --mut:#9aa3b2;
   --canvas:#f4f5f7; --card:#ffffff; --line:#8b93a3; --accent:#3d7eff;
@@ -17,7 +18,9 @@
 #stage{position:absolute;left:0;top:0;transform-origin:0 0}
 #wires{position:absolute;left:0;top:0;overflow:visible}
 #fx{position:absolute;inset:0;pointer-events:none}
+#nodes{position:absolute;inset:0}
 .flowbar{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);max-width:680px;display:none}
+.btn[disabled],.btn:has(input[disabled]),.btn.disabled,[disabled]{opacity:.4;cursor:not-allowed;pointer-events:none}
 </style></head><body>
 <header class="topbar">
   <strong>Peakload</strong><span style="color:var(--mut)">IcePanel-style explorer</span>
@@ -25,11 +28,11 @@
   <button class="btn" id="btnBack">←</button><button class="btn" id="btnFwd">→</button>
   <span id="crumb" style="color:var(--mut)">Diagrams › Context</span>
   <span style="flex:1"></span>
-  <select class="btn" id="flowSel"><option value="">Flows…</option></select>
-  <button class="btn" id="btnPlay">▶</button><button class="btn" id="btnStepB">◀ step</button>
-  <button class="btn" id="btnStepF">step ▶</button>
-  <label class="btn" style="display:flex;gap:6px;align-items:center">live
-    <input type="checkbox" id="liveTgl"><input type="range" id="liveRate" min="1" max="40" value="8" style="width:90px"></label>
+  <select class="btn" id="flowSel" disabled><option value="">Flows…</option></select>
+  <button class="btn" id="btnPlay" disabled>▶</button><button class="btn" id="btnStepB" disabled>◀ step</button>
+  <button class="btn" id="btnStepF" disabled>step ▶</button>
+  <label class="btn disabled" style="display:flex;gap:6px;align-items:center">live
+    <input type="checkbox" id="liveTgl" disabled><input type="range" id="liveRate" min="1" max="40" value="8" style="width:90px" disabled></label>
 </header>
 <div class="viewer">
   <div class="canvas-card" id="card">

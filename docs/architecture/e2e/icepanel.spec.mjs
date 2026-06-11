@@ -1,8 +1,9 @@
+// explicit index.mjs: bare directory import fails under Node ESM here
 import { test, expect } from "../../dissemination/e2e/node_modules/@playwright/test/index.mjs";
 const URL = process.env.ICEPANEL_URL || "http://127.0.0.1:9876/peakload-icepanel.html";
 test.beforeEach(async ({ page }) => {
   page.on("pageerror", e => { throw new Error("pageerror: " + e.message); });
-  await page.goto(URL, { waitUntil: "networkidle" });
+  await page.goto(URL, { waitUntil: "load" });
 });
 
 test("T1: chrome renders, camera pans and zooms", async ({ page }) => {
