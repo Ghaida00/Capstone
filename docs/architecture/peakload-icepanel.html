@@ -67,8 +67,12 @@ const cam = (() => {
   };
 })();
 /* ═══ MODEL ═══ */
+// All titles/subs/facts ported verbatim from docs/architecture/architecture.html (VIEWS) and system-overview.mmd — keep in sync; never invent numbers.
 const MODEL = (() => {
 const nodes = {
+  // ghost:true = visual de-emphasis only (dashed border, faded) — ghost nodes stay
+  // fully interactive (clickable, inspectable). g_* nodes are faded reference copies
+  // of L2 containers shown in the l3 diagram so flows can reach outside the app.
   /* ── Context level ── */
   user: {
     title: "User / k6 load test",
@@ -397,8 +401,7 @@ const nodes = {
     sub: ":8080→80 · per-IP 2000 r/s · global 50k r/s",
     plane: "edge", parent: "peakload", ghost: true,
     facts: [
-      ":8080→80 · per-IP 2000 r/s · global 50 000 r/s; both return 429.",
-      "Micro-caches GET /api/v2/transactions for 1s.",
+      "Faded reference of the L2 nginx container — see Containers view for full facts.",
     ],
   },
   g_redis: {
@@ -406,8 +409,7 @@ const nodes = {
     sub: "cache + idemp reserve · AOF everysec",
     plane: "redis", parent: "peakload", ghost: true,
     facts: [
-      "Tiered-cache L2, idempotency SETNX, pending/inflight intake lists, rate-limit state.",
-      "AOF everysec → ≤1s loss bound; Sentinel-aware connection.",
+      "Faded reference of the L2 redis-master container — see Containers view for full facts.",
     ],
   },
   g_rabbit: {
@@ -415,8 +417,7 @@ const nodes = {
     sub: "transactions.process · DLQ",
     plane: "mq", parent: "peakload", ghost: true,
     facts: [
-      "Durable queue transactions.process; DLX → DLQ for poison messages.",
-      "Prefetch 200; producers: redis-intake + publish-outbox workers.",
+      "Faded reference of the L2 RabbitMQ container — see Containers view for full facts.",
     ],
   },
   g_pg: {
@@ -424,8 +425,7 @@ const nodes = {
     sub: "pgbouncer → haproxy → Patroni shards",
     plane: "pg", parent: "peakload", ghost: true,
     facts: [
-      "pgbouncer (transaction pool, max_db_conn 200) → HAProxy (primary :5000/:5001 · replica :5010/:5011) → Patroni Shard0/1 pairs.",
-      "apply_transactions_batch() bulk-claims with CTE; balance check UPDATE … WHERE balance >= $1.",
+      "Faded reference of the L2 PostgreSQL containers (pgbouncer, haproxy, shard0/1) — see Containers view for full facts.",
     ],
   },
 };
@@ -482,6 +482,7 @@ const diagrams = {
       { from: "app",      to: "haproxy", kind: "dashed", fromSide: "right", toSide: "right", label: "reads :5010/:5011" },
       { from: "haproxy",  to: "shard0" },
       { from: "haproxy",  to: "shard1" },
+      { from: "etcd",     to: "shard0",  kind: "dashed", label: "leader lease" },
       { from: "etcd",     to: "shard1",  kind: "dashed", label: "leader lease" },
       { from: "app",      to: "rabbit",  kind: "dashed", fromSide: "right", toSide: "top", label: "publish / consume (prefetch 200)" },
       { from: "rabbit",   to: "dlq",     kind: "danger", label: "poison via DLX" },
@@ -494,7 +495,7 @@ const diagrams = {
   l3: {
     title: "App components",
     crumb: "Diagrams › Peakload › App › Components",
-    w: 1400, h: 1240,
+    w: 1400, h: 1340,
     nodes: [
       "g_nginx",
       "wrap", "sl1", "sl2", "sl3", "sl4", "sl5", "sl6", "router", "idemp",
@@ -505,15 +506,15 @@ const diagrams = {
     layout: {
       g_nginx:  { x: 560,  y: 30,   w: 280 },
       wrap:     { x: 520,  y: 150,  w: 360 },
-      sl1:      { x: 520,  y: 250,  w: 360 },
-      sl2:      { x: 520,  y: 350,  w: 360 },
-      sl3:      { x: 520,  y: 450,  w: 360 },
-      sl4:      { x: 520,  y: 550,  w: 360 },
-      sl5:      { x: 520,  y: 650,  w: 360 },
-      sl6:      { x: 520,  y: 750,  w: 360 },
-      router:   { x: 520,  y: 860,  w: 360 },
-      idemp:    { x: 520,  y: 970,  w: 360 },
-      shed:     { x: 140,  y: 450,  w: 240 },
+      sl1:      { x: 520,  y: 265,  w: 360 },
+      sl2:      { x: 520,  y: 380,  w: 360 },
+      sl3:      { x: 520,  y: 495,  w: 360 },
+      sl4:      { x: 520,  y: 610,  w: 360 },
+      sl5:      { x: 520,  y: 725,  w: 360 },
+      sl6:      { x: 520,  y: 840,  w: 360 },
+      router:   { x: 520,  y: 955,  w: 360 },
+      idemp:    { x: 520,  y: 1070, w: 360 },
+      shed:     { x: 140,  y: 495,  w: 240 },
       intake:   { x: 1040, y: 250,  w: 280 },
       pubout:   { x: 1040, y: 370,  w: 280 },
       consumer: { x: 1040, y: 490,  w: 280 },
@@ -521,9 +522,9 @@ const diagrams = {
       bus:      { x: 1040, y: 730,  w: 280 },
       cacheinv: { x: 1040, y: 850,  w: 280 },
       notifd:   { x: 1040, y: 970,  w: 280 },
-      g_redis:  { x: 140,  y: 1100, w: 240 },
-      g_rabbit: { x: 560,  y: 1100, w: 280 },
-      g_pg:     { x: 920,  y: 1100, w: 300 },
+      g_redis:  { x: 140,  y: 1210, w: 240 },
+      g_rabbit: { x: 560,  y: 1210, w: 280 },
+      g_pg:     { x: 920,  y: 1210, w: 300 },
     },
     edges: [
       { from: "g_nginx",  to: "wrap" },
@@ -535,6 +536,7 @@ const diagrams = {
       { from: "sl5",      to: "sl6" },
       { from: "sl6",      to: "router" },
       { from: "router",   to: "idemp" },
+      // shed edges mirror architecture.html stack view: only l1/l3/l5 drawn (the loudest shedders) — sl2/sl4 also shed but are omitted for calm
       { from: "sl1",      to: "shed",   kind: "danger", fromSide: "left", toSide: "top",    label: "503" },
       { from: "sl3",      to: "shed",   kind: "danger", fromSide: "left", toSide: "right",  label: "429" },
       { from: "sl5",      to: "shed",   kind: "danger", fromSide: "left", toSide: "bottom", label: "503 writes" },
