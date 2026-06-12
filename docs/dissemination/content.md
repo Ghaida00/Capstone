@@ -191,7 +191,6 @@ Preferensi mitra: Rust (memory safety + performa tinggi)
 - **Quick start:** `git clone` → `cp .env.example .env` → `docker compose up -d --build`
 - **API:** http://localhost:8080 · **Grafana:** :3001 · **Dashboard:** /dashboard/
 - **Akun uji:** ACC_0000001, ACC_0000002 (100.000 akun seed)
-- **Video demo:** [ISI URL YouTube setelah rekam]
 
 ---
 
