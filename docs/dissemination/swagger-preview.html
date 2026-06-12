@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Peakload — API Contract (Swagger UI)</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui.css">
+  <style>
+    html { box-sizing: border-box; overflow-y: scroll; }
+    *, *:before, *:after { box-sizing: inherit; }
+    body { margin: 0; background: #fafafa; }
+    .pl-swagger-bar {
+      background: #0b0d12;
+      color: #e8edf4;
+      padding: 0.75rem 1.25rem;
+      font: 14px/1.4 "Segoe UI", system-ui, sans-serif;
+      border-bottom: 1px solid #262b34;
+    }
+    .pl-swagger-bar a { color: #6ea8fe; }
+  </style>
+</head>
+<body>
+  <div class="pl-swagger-bar">
+    Peakload API Contract · OpenAPI 3 ·
+    <a href="preview.html">← Kembali ke halaman diseminasi</a>
+  </div>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui-bundle.js"></script>
+  <script src="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui-standalone-preset.js"></script>
+  <script>
+    window.onload = function () {
+      window.ui = SwaggerUIBundle({
+        url: "../apiContract.yaml",
+        dom_id: "#swagger-ui",
+        deepLinking: true,
+        presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+        layout: "StandaloneLayout"
+      });
+    };
+  </script>
+</body>
+</html>

@@ -1,0 +1,1890 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Peakload Capstone — Architecture</title>
+<style>
+  :root {
+    --bg: #0b0d12;
+    --bg-2: #11141b;
+    --panel: #15191f;
+    --panel-2: #1b1f27;
+    --panel-3: #232830;
+    --border: #262b34;
+    --border-strong: #353c47;
+    --text: #e8edf4;
+    --text-2: #c2cad6;
+    --muted: #8a93a1;
+    --dim: #5d6573;
+    --accent: #6ea8fe;
+    --accent-2: #4f7cc0;
+    --success: #7ee787;
+    --warn: #f0b341;
+    --danger: #ff7b72;
+    --code-bg: #0f1218;
+    --code-text: #d6dde7;
+    --kw: #ff9bd2;
+    --str: #a5e1b8;
+    --fn: #79c0ff;
+    --cmt: #5d6573;
+    --num: #f0b341;
+    --mq: #d2a8ff;
+    --obs: #56d4dd;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 13.5px/1.5 -apple-system, "Segoe UI", "Inter", Roboto, system-ui, sans-serif;
+    display: grid;
+    grid-template-columns: 360px 1fr;
+    grid-template-rows: 56px 1fr;
+    grid-template-areas:
+      "header header"
+      "sidebar canvas";
+    overflow: hidden;
+  }
+
+  /* ────────────────────────────────────────────── header */
+  header {
+    grid-area: header;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, var(--panel) 0%, var(--bg-2) 100%);
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    gap: 14px;
+  }
+  header .logo {
+    width: 28px; height: 28px;
+    border-radius: 7px;
+    background: linear-gradient(135deg, var(--accent), #b888f6);
+    display: grid; place-items: center;
+    font-weight: 800;
+    color: #0b0d12;
+    font-size: 13px;
+  }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: 0.1px; }
+  header h1 small { color: var(--muted); font-weight: 400; margin-left: 8px; font-size: 12px; }
+  header .grow { flex: 1; }
+  header .meta {
+    color: var(--muted);
+    font-size: 11.5px;
+    font-family: ui-monospace, "JetBrains Mono", Consolas, monospace;
+    padding: 5px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-2);
+    cursor: pointer;
+    text-decoration: none;
+  }
+  header .meta:hover { border-color: var(--border-strong); color: var(--text-2); }
+
+  /* ────────────────────────────────────────────── sidebar */
+  aside {
+    grid-area: sidebar;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .search-wrap { padding: 14px; border-bottom: 1px solid var(--border); position: relative; }
+  .search-input {
+    width: 100%;
+    background: var(--bg-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 9px 12px 9px 32px;
+    font: inherit;
+    font-size: 12.5px;
+  }
+  .search-input:focus { outline: none; border-color: var(--accent); }
+  .search-wrap::before {
+    content: "🔍";
+    position: absolute;
+    left: 24px; top: 22px;
+    opacity: 0.4;
+    font-size: 12px;
+  }
+  .view-list { flex: 1; overflow-y: auto; padding: 10px; }
+  .view-list::-webkit-scrollbar { width: 8px; }
+  .view-list::-webkit-scrollbar-track { background: transparent; }
+  .view-list::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+  .view-card {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    padding: 12px 13px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: border-color 0.12s, background 0.12s;
+    user-select: none;
+  }
+  .view-card:hover { border-color: var(--border-strong); background: var(--panel-3); }
+  .view-card.active {
+    border-color: var(--accent);
+    background: var(--panel-3);
+    box-shadow: 0 0 0 1px var(--accent) inset, 0 4px 14px rgba(110,168,254,0.12);
+  }
+  .view-card .head { display: flex; align-items: center; gap: 9px; margin-bottom: 6px; }
+  .view-card .num {
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    color: var(--text-2);
+    font-weight: 700;
+    font-size: 11.5px;
+    width: 22px; height: 22px;
+    border-radius: 5px;
+    display: grid; place-items: center;
+    flex-shrink: 0;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .view-card.active .num { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .view-card .title { font-weight: 600; font-size: 13px; line-height: 1.3; flex: 1; color: var(--text); }
+  .view-card .summary { color: var(--muted); font-size: 12px; line-height: 1.45; }
+  .sidebar-foot {
+    border-top: 1px solid var(--border);
+    padding: 10px 14px;
+    color: var(--dim);
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .sidebar-foot code { color: var(--muted); font-family: ui-monospace, Consolas, monospace; font-size: 10.5px; }
+
+  /* ────────────────────────────────────────────── canvas */
+  #canvas {
+    grid-area: canvas;
+    overflow-y: auto;
+    overflow-x: auto;
+    background:
+      radial-gradient(circle at 1px 1px, rgba(255,255,255,0.018) 1px, transparent 0) 0 0/24px 24px,
+      linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%);
+    padding: 32px 48px 80px;
+  }
+  #canvas::-webkit-scrollbar { width: 10px; height: 10px; }
+  #canvas::-webkit-scrollbar-track { background: transparent; }
+  #canvas::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px; }
+
+  .view-header { max-width: 1000px; margin-bottom: 24px; display: flex; align-items: flex-start; gap: 16px; }
+  .view-header .big-num {
+    width: 48px; height: 48px;
+    background: linear-gradient(135deg, var(--accent), #b888f6);
+    border-radius: 11px;
+    display: grid; place-items: center;
+    font-weight: 800; font-size: 19px;
+    color: #0b0d12;
+    flex-shrink: 0;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .view-header h2 { margin: 0 0 5px; font-size: 19px; font-weight: 650; }
+  .view-header p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; max-width: 760px; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 18px; }
+  .legend .chip {
+    font-size: 10.5px;
+    font-family: ui-monospace, Consolas, monospace;
+    color: var(--text-2);
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    border-radius: 5px;
+    padding: 2.5px 8px;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .legend .dot { width: 8px; height: 8px; border-radius: 2.5px; display: inline-block; }
+
+  /* ────────────────────────────────────────────── diagram */
+  .diagram {
+    position: relative;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+    overflow: hidden;
+  }
+  .diagram svg.wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .diagram .wires path { fill: none; stroke-width: 1.6; }
+  .diagram .wires path.flow   { stroke: var(--accent-2); }
+  .diagram .wires path.dashed { stroke: var(--dim); stroke-dasharray: 5 4; }
+  .diagram .wires path.danger { stroke: var(--danger); stroke-dasharray: 5 4; opacity: 0.75; }
+  .diagram .wires path.obs    { stroke: var(--obs); stroke-dasharray: 2.5 4; opacity: 0.7; }
+  .diagram .wires text {
+    font: 10px ui-monospace, Consolas, monospace;
+    fill: var(--muted);
+    paint-order: stroke;
+    stroke: #15191f;
+    stroke-width: 3.5px;
+    stroke-linejoin: round;
+  }
+
+  .node {
+    position: absolute;
+    background: var(--panel-2);
+    border: 1px solid var(--border-strong);
+    border-left-width: 3px;
+    border-radius: 9px;
+    padding: 8px 11px 9px;
+    cursor: pointer;
+    transition: transform 0.1s, box-shadow 0.1s, border-color 0.1s;
+    user-select: none;
+  }
+  .node:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(0,0,0,0.45); border-color: var(--accent); }
+  .node.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset, 0 6px 18px rgba(110,168,254,0.18); }
+  .node .t { font-weight: 650; font-size: 12.5px; line-height: 1.25; display: flex; align-items: center; gap: 7px; }
+  .node .t .step {
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 10px; font-weight: 700;
+    background: var(--bg-2); color: var(--text-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.5px 5px;
+    flex-shrink: 0;
+  }
+  .node .s { color: var(--muted); font-size: 10.8px; line-height: 1.4; margin-top: 3px; font-family: ui-monospace, Consolas, monospace; }
+  .node.ghost { border-style: dashed; opacity: 0.85; background: transparent; }
+
+  .node.p-client { border-left-color: var(--muted); }
+  .node.p-edge   { border-left-color: var(--warn); }
+  .node.p-app    { border-left-color: var(--accent); }
+  .node.p-pg     { border-left-color: var(--success); }
+  .node.p-redis  { border-left-color: var(--danger); }
+  .node.p-mq     { border-left-color: var(--mq); }
+  .node.p-obs    { border-left-color: var(--obs); }
+  .node.p-infra  { border-left-color: var(--dim); }
+
+  .plane-label {
+    position: absolute;
+    font: 600 10px ui-monospace, Consolas, monospace;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    color: var(--dim);
+    pointer-events: none;
+  }
+
+  /* ────────────────────────────────────────────── inspector */
+  #inspector {
+    position: fixed;
+    top: 56px; right: 0; bottom: 0;
+    width: 400px;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    box-shadow: -14px 0 34px rgba(0,0,0,0.45);
+    transform: translateX(105%);
+    transition: transform 0.16s ease-out;
+    display: flex;
+    flex-direction: column;
+    z-index: 50;
+  }
+  #inspector.open { transform: translateX(0); }
+  #inspector .insp-head {
+    padding: 16px 18px 12px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: flex-start; gap: 10px;
+  }
+  #inspector .insp-head h3 { margin: 0; font-size: 14.5px; font-weight: 650; flex: 1; line-height: 1.3; }
+  #inspector .plane-chip {
+    font: 600 9.5px ui-monospace, Consolas, monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    border-radius: 4px;
+    padding: 2px 7px;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  #inspector .close {
+    background: none; border: 1px solid var(--border);
+    color: var(--muted);
+    width: 24px; height: 24px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px; line-height: 1;
+    flex-shrink: 0;
+  }
+  #inspector .close:hover { color: var(--text); border-color: var(--border-strong); }
+  #inspector .insp-body { flex: 1; overflow-y: auto; padding: 14px 18px 24px; }
+  #inspector .insp-body::-webkit-scrollbar { width: 8px; }
+  #inspector .insp-body::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+  .insp-sec { margin-bottom: 18px; }
+  .insp-sec h4 {
+    margin: 0 0 8px;
+    font: 600 10.5px ui-monospace, Consolas, monospace;
+    letter-spacing: 1.1px;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+  .insp-sec ul { margin: 0; padding: 0 0 0 16px; }
+  .insp-sec ul li { color: var(--text-2); font-size: 12.3px; line-height: 1.55; margin-bottom: 6px; }
+  .insp-sec ul li code, .sidebar-foot strong {
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 11px;
+    background: var(--code-bg);
+    color: var(--code-text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.5px 5px;
+  }
+  a.file-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 11px;
+    color: var(--accent);
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 9px;
+    text-decoration: none;
+    margin: 0 6px 6px 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+  a.file-tag:hover { border-color: var(--accent); background: var(--panel-3); }
+  a.file-tag .ln { color: var(--num); }
+  a.doc-link {
+    display: block;
+    color: var(--text-2);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 7px 11px;
+    font-size: 12px;
+    text-decoration: none;
+    margin-bottom: 6px;
+    line-height: 1.4;
+  }
+  a.doc-link:hover { border-color: var(--accent); color: var(--text); }
+  a.doc-link .kind { color: var(--dim); font: 600 9.5px ui-monospace, Consolas, monospace; text-transform: uppercase; letter-spacing: 0.6px; margin-right: 7px; }
+  .insp-foot { color: var(--dim); font-size: 10.5px; border-top: 1px solid var(--border); padding-top: 10px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">PC</div>
+  <h1>Peakload Capstone — Architecture<small>interactive system views · every number verified against source</small></h1>
+  <div class="grow"></div>
+  <a class="meta" href="../codemap/codemap.html">codemap →</a>
+  <div class="meta" id="rootBtn" title="Click to change the workspace root used for vscode:// links (shared with codemap)">root: …</div>
+</header>
+
+<aside>
+  <div class="search-wrap">
+    <input class="search-input" id="search" type="text" placeholder="Filter views… (Esc closes panel)">
+  </div>
+  <div class="view-list" id="viewList"></div>
+  <div class="sidebar-foot">
+    Click any component → fact panel with <code>vscode://</code> refs &amp; ADR/runbook links.
+    Solid wires = request/data flow, dashed = control/HA/async, dotted teal = telemetry.
+  </div>
+</aside>
+
+<div id="canvas"></div>
+
+<div id="inspector">
+  <div class="insp-head">
+    <h3 id="inspTitle"></h3>
+    <span class="plane-chip" id="inspPlane"></span>
+    <button class="close" id="inspClose" title="Esc">✕</button>
+  </div>
+  <div class="insp-body" id="inspBody"></div>
+</div>
+
+<script>
+"use strict";
+
+/* ───────────────────────── workspace root (shared with codemap) */
+const DEFAULT_ROOT = "c:/Users/Ikhsa/Downloads/MINE/Semester 6/Gh/Capstone";
+let WORKSPACE_ROOT = localStorage.getItem("codemapRoot") || DEFAULT_ROOT;
+
+function vscodeUrl(relPath, line) {
+  const root = WORKSPACE_ROOT.replace(/\\/g, "/").replace(/\/$/, "");
+  const abs = root + "/" + relPath.replace(/\\/g, "/");
+  const suffix = line ? (":" + line + ":1") : "";
+  return "vscode://file/" + encodeURI(abs) + suffix;
+}
+
+const PLANES = {
+  client: { label: "client",        color: "var(--muted)"   },
+  edge:   { label: "edge",          color: "var(--warn)"    },
+  app:    { label: "app",           color: "var(--accent)"  },
+  pg:     { label: "postgres",      color: "var(--success)" },
+  redis:  { label: "redis",         color: "var(--danger)"  },
+  mq:     { label: "rabbitmq",      color: "var(--mq)"      },
+  obs:    { label: "observability", color: "var(--obs)"     },
+  infra:  { label: "infra",         color: "var(--dim)"     },
+};
+
+/* ════════════════════════════════════════════════════════════════
+   VIEW + DETAIL DATA — every number below was read from source on
+   2026-06-10 (docker-compose.yml, nginx config, .env.example, and
+   the crates). file:line anchors are clickable proofs.
+   ════════════════════════════════════════════════════════════════ */
+
+const VIEWS = [
+
+/* ── 1 · SYSTEM OVERVIEW ─────────────────────────────────────── */
+{
+  id: "overview", num: 1, title: "System Overview",
+  summary: "Full compose topology: nginx edge → app ×2 → pgBouncer / HAProxy → Patroni shard pairs + etcd, Redis Sentinel set, RabbitMQ, one-shot schema jobs, observability stack.",
+  w: 960, h: 880,
+  planes: [
+    { text: "data plane — redis", x: 18,  y: 306 },
+    { text: "data plane — postgres", x: 252, y: 306 },
+    { text: "async plane", x: 18, y: 636 },
+    { text: "observability", x: 18, y: 760 },
+  ],
+  nodes: [
+    { id: "client",  x: 370, y: 16,  w: 220, plane: "client", t: "Client", s: "browser · k6 load test" },
+    { id: "nginx",   x: 330, y: 86,  w: 300, plane: "edge",   t: "nginx (edge)", s: ":8080→80 · per-IP 2000 r/s · global 50k r/s" },
+    { id: "app",     x: 280, y: 176, w: 400, plane: "app",    t: "app ×2 — axum modular monolith", s: "accounts · transactions · notifications · in-proc workers" },
+    { id: "redis-m", x: 24,  y: 330, w: 196, plane: "redis",  t: "redis-master", s: "cache + idemp reserve · AOF everysec" },
+    { id: "redis-r", x: 24,  y: 424, w: 196, plane: "redis",  t: "redis-replica", s: "read offload (REDIS_READ_URL)" },
+    { id: "sentinels", x: 24, y: 516, w: 196, plane: "redis", t: "Sentinel ×3", s: "master \"peakload-master\" · quorum promote" },
+    { id: "pgb0",    x: 258, y: 330, w: 190, plane: "pg",     t: "pgbouncer-shard0", s: "txn pooling · max_db_conn 200" },
+    { id: "pgb1",    x: 468, y: 330, w: 190, plane: "pg",     t: "pgbouncer-shard1", s: "profile shard1 — ON by default" },
+    { id: "readpool", x: 678, y: 330, w: 188, plane: "pg",    t: "pgbouncer-read ×3", s: "profile readpool — optional", ghost: true },
+    { id: "haproxy", x: 318, y: 432, w: 290, plane: "pg",     t: "pg-haproxy", s: "primary fe :5000/:5001 · replica fe :5010/:5011" },
+    { id: "etcd",    x: 678, y: 432, w: 188, plane: "infra",  t: "etcd ×3", s: "Patroni DCS · leader lease · quorum" },
+    { id: "shard0",  x: 240, y: 540, w: 190, plane: "pg",     t: "shard0 — Patroni pair", s: "node-a + node-b · streaming repl" },
+    { id: "shard1",  x: 450, y: 540, w: 190, plane: "pg",     t: "shard1 — Patroni pair", s: "profile shard1 — ON by default" },
+    { id: "shard2",  x: 660, y: 540, w: 190, plane: "pg",     t: "shard2 — Patroni pair", s: "profile shard2 — OFF by default", ghost: true },
+    { id: "rabbit",  x: 24,  y: 660, w: 230, plane: "mq",     t: "RabbitMQ", s: "transactions.process · DLX → DLQ" },
+    { id: "jobs",    x: 286, y: 660, w: 280, plane: "infra",  t: "db-bootstrap-schema · db-migrator", s: "one-shot init.sql + sqlx migrate; gate app start" },
+    { id: "obs",     x: 24,  y: 784, w: 560, plane: "obs",    t: "Observability stack", s: "prometheus + grafana (default ON) · otel→jaeger, cadvisor (profiles)" },
+  ],
+  edges: [
+    { from: "client",  to: "nginx",   label: ":8080" },
+    { from: "nginx",   to: "app",     label: "proxy_pass · GET cache 1s" },
+    { from: "app",     to: "redis-m", label: "cache + SETNX", fromSide: "left" },
+    { from: "redis-m", to: "redis-r", kind: "dashed", label: "async repl" },
+    { from: "sentinels", to: "redis-m", kind: "dashed", fromSide: "left", toSide: "left", label: "monitor / promote" },
+    { from: "app",     to: "pgb0",    label: "writes s0" },
+    { from: "app",     to: "pgb1",    label: "writes s1" },
+    { from: "pgb0",    to: "haproxy", label: ":5000" },
+    { from: "pgb1",    to: "haproxy", label: ":5001" },
+    { from: "app",     to: "haproxy", kind: "dashed", fromSide: "right", toSide: "right", label: "reads :5010/:5011" },
+    { from: "haproxy", to: "shard0" },
+    { from: "haproxy", to: "shard1" },
+    { from: "haproxy", to: "shard2",  kind: "dashed" },
+    { from: "etcd",    to: "shard1",  kind: "dashed", label: "leader lease" },
+    { from: "readpool", to: "haproxy", kind: "dashed" },
+    { from: "app",     to: "rabbit",  kind: "dashed", fromSide: "left", toSide: "top", label: "publish / consume (prefetch 200)" },
+    { from: "jobs",    to: "haproxy", kind: "dashed", fromSide: "top", toSide: "bottom", label: "one-shot via primary fe" },
+    { from: "obs",     to: "app",     kind: "obs", fromSide: "right", toSide: "right", label: "scrape /metrics · OTLP" },
+  ],
+},
+
+/* ── 2 · PROTECTION STACK ────────────────────────────────────── */
+{
+  id: "stack", num: 2, title: "Protection Stack",
+  summary: "Six middleware layers between socket and handler. Built in bootstrap.rs with sequential Router::layer calls — the last .layer() added is the outermost at runtime, so requests flow top-to-bottom exactly as drawn.",
+  w: 960, h: 870,
+  nodes: [
+    { id: "req",     x: 330, y: 16,  w: 300, plane: "client", t: "incoming request", s: "from nginx upstream" },
+    { id: "wrap",    x: 290, y: 88,  w: 380, plane: "app",   t: "outer wrappers", s: "CORS → TraceLayer → TimeoutLayer → request_id" },
+    { id: "l1",      x: 290, y: 182, w: 380, plane: "app",   t: "1 · backpressure", s: "semaphore · wait ≤ 50ms (default) → 503", step: "L1" },
+    { id: "l2",      x: 290, y: 276, w: 380, plane: "app",   t: "2 · circuit breaker", s: "CLOSED / OPEN / HALF_OPEN · threshold 50 (default)", step: "L2" },
+    { id: "l3",      x: 290, y: 370, w: 380, plane: "app",   t: "3 · rate limit", s: "64-shard counters · 2000 r/s burst 4000 (default) → 429", step: "L3" },
+    { id: "l4",      x: 290, y: 464, w: 380, plane: "app",   t: "4 · auth (JWT)", s: "HS256-pinned validator · ENABLE_AUTH=false default", step: "L4" },
+    { id: "l5",      x: 290, y: 558, w: 380, plane: "app",   t: "5 · degradation gate", s: "R-9 posture · read_only sheds writes 503", step: "L5" },
+    { id: "l6",      x: 290, y: 652, w: 380, plane: "app",   t: "6 · metrics", s: "http_requests_total — shed traffic excluded by position", step: "L6" },
+    { id: "handler", x: 290, y: 748, w: 380, plane: "app",   t: "module routers + handlers", s: "accounts · transactions · notifications · health" },
+    { id: "shed",    x: 24,  y: 380, w: 210, plane: "edge",  t: "shed responses", s: "503 / 429 / 401 + Retry-After + per-layer counters" },
+    { id: "proof",   x: 716, y: 276, w: 220, plane: "infra", t: "ordering proof", s: "bootstrap.rs — last .layer() = outermost" },
+    { id: "admin",   x: 716, y: 558, w: 220, plane: "infra", t: "admin surface", s: "/api/v2/admin — require_admin_middleware" },
+  ],
+  edges: [
+    { from: "req",  to: "wrap" },
+    { from: "wrap", to: "l1" },
+    { from: "l1",   to: "l2" },
+    { from: "l2",   to: "l3" },
+    { from: "l3",   to: "l4" },
+    { from: "l4",   to: "l5" },
+    { from: "l5",   to: "l6" },
+    { from: "l6",   to: "handler" },
+    { from: "l1", to: "shed", kind: "danger", fromSide: "left", toSide: "top", label: "503" },
+    { from: "l3", to: "shed", kind: "danger", fromSide: "left", toSide: "right", label: "429" },
+    { from: "l5", to: "shed", kind: "danger", fromSide: "left", toSide: "bottom", label: "503 writes" },
+    { from: "proof", to: "l2", kind: "dashed", toSide: "right" },
+    { from: "admin", to: "handler", kind: "dashed", toSide: "right" },
+  ],
+},
+
+/* ── 3 · WRITE PATH ──────────────────────────────────────────── */
+{
+  id: "write", num: 3, title: "Write Path — POST → 202 → settled",
+  summary: "Synchronous half: validate, reserve idempotency in Redis (hybrid backend), return 202. Asynchronous half: intake worker lands the row + publishes, consumer applies batches via one PL/pgSQL call, cross-shard credits ride a transactional outbox.",
+  w: 960, h: 1010,
+  planes: [
+    { text: "sync — request thread", x: 18, y: 20 },
+    { text: "async — workers & queue", x: 18, y: 330 },
+  ],
+  nodes: [
+    { id: "wpost",  x: 24,  y: 44,  w: 220, plane: "client", t: "POST /api/v2/transactions", s: "Idempotency via reference_id", step: "1" },
+    { id: "wval",   x: 284, y: 44,  w: 300, plane: "app",   t: "handler → service.process()", s: "amount · currency · reference_id ASCII ≤100", step: "2" },
+    { id: "wkey",   x: 624, y: 44,  w: 312, plane: "app",   t: "shard + idempotency key + SHA-256", s: "txn:{shard}:{reference_id} · injective (prop-tested)", step: "3" },
+    { id: "wres",   x: 624, y: 150, w: 312, plane: "redis", t: "reserve — IDEMPOTENCY_BACKEND=hybrid", s: "SETNX v1:idemp:{key} TTL 24h + LPUSH pending", step: "4" },
+    { id: "wfall",  x: 284, y: 246, w: 300, plane: "pg",    t: "PG fallback (Redis Err only)", s: "idempotency_keys ON CONFLICT · TTL 24h", ghost: true },
+    { id: "w202",   x: 24,  y: 150, w: 220, plane: "client", t: "202 Accepted", s: "status=pending · poll /status/{ref}", step: "5" },
+    { id: "wintake", x: 624, y: 366, w: 312, plane: "app",  t: "redis-intake worker", s: "RPOPLPUSH pending→inflight · 16-way publish · idle 10ms", step: "6" },
+    { id: "wpub",   x: 284, y: 366, w: 300, plane: "app",   t: "publish-outbox worker (fallback lane)", s: "batch 25 · lease 600s", ghost: true },
+    { id: "wq",     x: 624, y: 470, w: 312, plane: "mq",    t: "RabbitMQ — transactions.process", s: "durable · prefetch = BATCH_SIZE = 200", step: "7" },
+    { id: "wdlq",   x: 284, y: 470, w: 300, plane: "mq",    t: "DLQ (via DLX)", s: "poison: bad JSON · NULL reference_id", ghost: true },
+    { id: "wcons",  x: 624, y: 574, w: 312, plane: "app",   t: "consumer — batch & flush", s: "size-flush 200 · idle-flush 250ms · tick 50ms", step: "8" },
+    { id: "wapply", x: 624, y: 678, w: 312, plane: "pg",    t: "apply_transactions_batch()", s: "bulk claim CTE + per-row debit/credit loop", step: "9" },
+    { id: "wsame",  x: 624, y: 782, w: 312, plane: "pg",    t: "same-shard → completed", s: "debit + credit in one txn · ACK", step: "10" },
+    { id: "wxs",    x: 284, y: 678, w: 300, plane: "pg",    t: "cross-shard → outbox row", s: "processor: poll 250ms · batch 100 · lease 60s", step: "10b" },
+    { id: "wxsp",   x: 284, y: 782, w: 300, plane: "pg",    t: "cross-shard processor", s: "credit ON CONFLICT · retry ≤10 → refund (R-8)" },
+    { id: "wbus",   x: 624, y: 886, w: 312, plane: "app",   t: "event bus — transactions.committed", s: "tokio::broadcast · capacity 8192", step: "11" },
+    { id: "winval", x: 284, y: 886, w: 300, plane: "redis", t: "cache invalidator", s: "DEL txn:{id} · tx_status:{ref} · txn_list:*" },
+    { id: "wnotif", x: 24,  y: 886, w: 220, plane: "app",   t: "notifications", s: "dedupe 4096 · ring 512 · recent ≤200" },
+    { id: "wclean", x: 24,  y: 678, w: 220, plane: "infra", t: "cleanup sweeper", s: "every 30s · published-grace 300s", ghost: true },
+  ],
+  edges: [
+    { from: "wpost",  to: "wval" },
+    { from: "wval",   to: "wkey" },
+    { from: "wkey",   to: "wres" },
+    { from: "wres",   to: "wfall", kind: "danger", fromSide: "left", toSide: "right", label: "Redis Err" },
+    { from: "wres",   to: "w202", kind: "flow", fromSide: "left", toSide: "right", label: "reserved / replay" },
+    { from: "wres",   to: "wintake", label: "pending list" },
+    { from: "wfall",  to: "wpub", kind: "dashed" },
+    { from: "wintake", to: "wq",  label: "INSERT + publish" },
+    { from: "wpub",   to: "wq",   kind: "dashed", toSide: "left" },
+    { from: "wq",     to: "wcons", label: "deliver ≤200 unacked" },
+    { from: "wcons",  to: "wdlq", kind: "danger", fromSide: "left", toSide: "bottom", label: "NACK poison" },
+    { from: "wcons",  to: "wapply", label: "1 call / shard-batch" },
+    { from: "wapply", to: "wsame" },
+    { from: "wapply", to: "wxs",  kind: "dashed", fromSide: "left", toSide: "right", label: "receiver on other shard" },
+    { from: "wxs",    to: "wxsp" },
+    { from: "wsame",  to: "wbus" },
+    { from: "wxsp",   to: "wbus", kind: "dashed", toSide: "left", label: "after credit" },
+    { from: "wbus",   to: "winval", fromSide: "left", toSide: "right" },
+    { from: "winval", to: "wnotif", fromSide: "left", toSide: "right", label: "same bus" },
+    { from: "wclean", to: "wxs", kind: "dashed", fromSide: "right", toSide: "left" },
+  ],
+},
+
+/* ── 4 · READ PATH ───────────────────────────────────────────── */
+{
+  id: "read", num: 4, title: "Read Path — tiered cache & cross-shard pagination",
+  summary: "Three GET families. Balance rides a three-tier cache (moka → Redis → replica DB). Lists use cursor-only pagination with 5s bucket sharing and a limit+1 tail-probe merge. Status caching is TTL-split by state and invalidated on commit.",
+  w: 960, h: 700,
+  planes: [
+    { text: "GET balance", x: 18, y: 20 },
+    { text: "GET list", x: 348, y: 20 },
+    { text: "GET status / by id", x: 678, y: 20 },
+  ],
+  nodes: [
+    { id: "rb1", x: 24,  y: 44,  w: 280, plane: "app",   t: "L1 — moka in-process", s: "TTL 1s · ≈50 MB cap · zero TCP on hit" },
+    { id: "rb2", x: 24,  y: 148, w: 280, plane: "redis", t: "L2 — Redis acc:{id}", s: "BALANCE_CACHE_TTL_SECS = 10" },
+    { id: "rb3", x: 24,  y: 252, w: 280, plane: "app",   t: "L3 — repo via read pool", s: "DB_READ_POOL_SIZE = 40 / shard" },
+    { id: "rb4", x: 24,  y: 356, w: 280, plane: "pg",    t: "HAProxy replica fe", s: ":5010 / :5011 → Patroni replica" },
+    { id: "rl1", x: 354, y: 44,  w: 280, plane: "app",   t: "cursor params", s: "offset → 400 · limit ≤ 100 · (before, before_id)" },
+    { id: "rl2", x: 354, y: 148, w: 280, plane: "redis", t: "bucket cache", s: "cursor floored to 5s bucket · key txn_list:…" },
+    { id: "rl3", x: 354, y: 252, w: 280, plane: "pg",    t: "fan-out: limit+1 per shard", s: "tokio::spawn per shard · tail probe" },
+    { id: "rl4", x: 354, y: 356, w: 280, plane: "app",   t: "safe-cursor merge", s: "MAX(probes) → drop rows older · cache 30s" },
+    { id: "rs1", x: 684, y: 44,  w: 252, plane: "redis", t: "tx_status:{ref} cache", s: "terminal 5s · transient 1s" },
+    { id: "rs2", x: 684, y: 148, w: 252, plane: "app",   t: "status resolver", s: "PG row → else idemp reservation → pending" },
+    { id: "rs3", x: 684, y: 252, w: 252, plane: "redis", t: "txn:{id} cache (by id)", s: "TTL 30s · per-shard probe timeout 500ms" },
+    { id: "rs4", x: 684, y: 356, w: 252, plane: "app",   t: "commit-time invalidator", s: "DEL on transactions.committed", ghost: true },
+    { id: "rfb", x: 354, y: 480, w: 280, plane: "pg",    t: "replica outage fallback", s: "reads fall back to primary fe", ghost: true },
+  ],
+  edges: [
+    { from: "rb1", to: "rb2", label: "miss" },
+    { from: "rb2", to: "rb3", label: "miss" },
+    { from: "rb3", to: "rb4" },
+    { from: "rl1", to: "rl2" },
+    { from: "rl2", to: "rl3", label: "miss" },
+    { from: "rl3", to: "rl4" },
+    { from: "rs1", to: "rs2", label: "miss" },
+    { from: "rs2", to: "rs3", kind: "dashed" },
+    { from: "rs4", to: "rs1", kind: "danger", fromSide: "right", toSide: "right", label: "DEL" },
+    { from: "rb4", to: "rfb", kind: "dashed", fromSide: "right", toSide: "left" },
+    { from: "rl4", to: "rfb", kind: "dashed" },
+  ],
+},
+
+/* ── 5 · HA & FAILOVER ───────────────────────────────────────── */
+{
+  id: "ha", num: 5, title: "HA & Failover",
+  summary: "What dies, what takes over, and what the app does while it happens. Patroni + etcd handle Postgres promotion; HAProxy re-routes on REST probes; Sentinel promotes Redis; the app absorbs windows with retries, health probes, and an operator-controlled degradation switch.",
+  w: 960, h: 880,
+  planes: [
+    { text: "postgres failover", x: 18, y: 20 },
+    { text: "redis failover", x: 18, y: 420 },
+    { text: "app-side absorption", x: 508, y: 420 },
+  ],
+  nodes: [
+    { id: "hpair",  x: 24,  y: 44,  w: 300, plane: "pg",   t: "Patroni pair (per shard)", s: "node-a primary ★ · node-b streaming replica" },
+    { id: "hetcd",  x: 364, y: 44,  w: 280, plane: "infra", t: "etcd ×3 — leader lease", s: "quorum lost → primaries demote read-only" },
+    { id: "hwin",   x: 684, y: 44,  w: 252, plane: "infra", t: "promotion window", s: "typically 5–15s, bounded by lease TTL" },
+    { id: "hhap",   x: 24,  y: 168, w: 300, plane: "pg",   t: "HAProxy re-route", s: "Patroni REST probes pick the new primary" },
+    { id: "hboot",  x: 364, y: 168, w: 280, plane: "infra", t: "one-shot gates", s: "bootstrap-schema + migrator gate app start" },
+    { id: "hbackup", x: 684, y: 168, w: 252, plane: "infra", t: "pgBackRest WAL archiving", s: "BACKUP_ENABLED=false by default", ghost: true },
+    { id: "hretry", x: 508, y: 464, w: 428, plane: "app",  t: "write retry budget", s: "6 attempts × 200ms backoff — covers the window" },
+    { id: "hprobe", x: 508, y: 558, w: 428, plane: "app",  t: "per-replica health probes", s: "every 5s · unhealthy replica skipped on reads" },
+    { id: "hdeg",   x: 508, y: 652, w: 428, plane: "app",  t: "degradation switch (R-9)", s: "PUT /api/v2/admin/degradation → read_only, no restart" },
+    { id: "hheal",  x: 508, y: 746, w: 428, plane: "app",  t: "container self-heal", s: "--health-check every 10s · restart unless-stopped · 2 replicas" },
+    { id: "hsent",  x: 24,  y: 464, w: 300, plane: "redis", t: "Sentinel ×3 promote", s: "master \"peakload-master\" · monitor 5s" },
+    { id: "haof",   x: 24,  y: 558, w: 300, plane: "redis", t: "AOF everysec", s: "≤1s loss bound on master crash" },
+    { id: "hidem",  x: 24,  y: 652, w: 300, plane: "redis", t: "hybrid idempotency caveat", s: "SETNX lost in failover ≠ PG fallback — PG ON CONFLICT is the last line" },
+    { id: "hmq",    x: 24,  y: 746, w: 300, plane: "mq",   t: "RabbitMQ durability", s: "durable queue · poison → DLQ, no requeue loops" },
+    { id: "hrun",   x: 364, y: 290, w: 572, plane: "infra", t: "runbooks", s: "patroni-failover-manual · etcd-quorum-loss · redis-sentinel-post-promotion · cross-shard-outbox-reconciliation · rabbitmq-backlog-drain" },
+  ],
+  edges: [
+    { from: "hpair", to: "hhap", label: "primary dies → promote" },
+    { from: "hetcd", to: "hpair", kind: "dashed", toSide: "right", label: "lease" },
+    { from: "hetcd", to: "hwin", kind: "dashed" },
+    { from: "hwin",  to: "hretry", kind: "danger", toSide: "top", label: "absorbed by" },
+    { from: "hhap",  to: "hrun", kind: "dashed", fromSide: "bottom", toSide: "left" },
+    { from: "hsent", to: "haof", kind: "dashed" },
+    { from: "haof",  to: "hidem", kind: "dashed" },
+  ],
+},
+
+/* ── 6 · OBSERVABILITY ───────────────────────────────────────── */
+{
+  id: "obs", num: 6, title: "Observability",
+  summary: "Two exhaust pipes out of the same app: a Prometheus registry served at /metrics (scraped by Prometheus, charted in Grafana) and OTLP spans through otel-collector into Jaeger — with trace context propagated HTTP → AMQP → consumer.",
+  w: 960, h: 720,
+  planes: [
+    { text: "metrics", x: 18, y: 20 },
+    { text: "tracing", x: 18, y: 380 },
+  ],
+  nodes: [
+    { id: "oreg",  x: 24,  y: 44,  w: 300, plane: "app", t: "Prometheus registry", s: "installed at boot · histogram buckets straddle the SLO" },
+    { id: "ozero", x: 24,  y: 148, w: 300, plane: "app", t: "zero-init counters", s: "rates start at 0, not absent — PromQL-safe" },
+    { id: "omet",  x: 364, y: 44,  w: 280, plane: "app", t: "GET /metrics + /health", s: "unlimited at nginx (no rate-limit, no cache)" },
+    { id: "oprom", x: 684, y: 44,  w: 252, plane: "obs", t: "Prometheus", s: "scrapes app replicas · default ON" },
+    { id: "ograf", x: 684, y: 148, w: 252, plane: "obs", t: "Grafana", s: "provisioned dashboards · default ON" },
+    { id: "ocadv", x: 684, y: 252, w: 252, plane: "obs", t: "cAdvisor", s: "container CPU/mem → Prometheus · profile", ghost: true },
+    { id: "osig",  x: 364, y: 168, w: 280, plane: "app", t: "key signal families", s: "RED + shed counters per layer + cache_hits_total{tier} + queue depth (5s sample)" },
+    { id: "oslo",  x: 364, y: 282, w: 280, plane: "infra", t: "SLO targets", s: "99.9% availability · P95 < 500ms" },
+    { id: "orid",  x: 24,  y: 404, w: 300, plane: "app", t: "request_id middleware", s: "UUID echoed in responses + logs" },
+    { id: "otrl",  x: 24,  y: 498, w: 300, plane: "app", t: "TraceLayer — http.request span", s: "method · uri · status on every request" },
+    { id: "oprop", x: 24,  y: 592, w: 300, plane: "app", t: "context propagation", s: "traceparent rides AMQP headers → consumer joins trace" },
+    { id: "ootel", x: 364, y: 498, w: 280, plane: "obs", t: "otel-collector", s: "OTLP gRPC sink · profile, optional dep", ghost: true },
+    { id: "ojae",  x: 684, y: 498, w: 252, plane: "obs", t: "Jaeger", s: "trace UI · profile", ghost: true },
+  ],
+  edges: [
+    { from: "oreg",  to: "ozero", kind: "dashed" },
+    { from: "oreg",  to: "omet" },
+    { from: "omet",  to: "oprom", label: "scrape" },
+    { from: "oprom", to: "ograf" },
+    { from: "ocadv", to: "oprom", kind: "obs", toSide: "right" },
+    { from: "osig",  to: "omet", kind: "dashed", toSide: "bottom" },
+    { from: "orid",  to: "otrl", kind: "dashed" },
+    { from: "otrl",  to: "oprop", kind: "dashed" },
+    { from: "otrl",  to: "ootel", kind: "obs", label: "OTLP" },
+    { from: "ootel", to: "ojae",  kind: "obs" },
+  ],
+},
+];
+
+/* ════════════════════════════════════════════════════════════════
+   DETAILS — facts + clickable proofs per node
+   ════════════════════════════════════════════════════════════════ */
+
+const ADR = {
+  a1: ["docs/adr/0001-modular-monolith.md", "ADR-0001 — modular monolith"],
+  a2: ["docs/adr/0002-cargo-workspace-split.md", "ADR-0002 — cargo workspace split"],
+  a3: ["docs/adr/0003-port-adapter-shape.md", "ADR-0003 — port/adapter shape"],
+  a4: ["docs/adr/0004-in-process-event-bus.md", "ADR-0004 — in-process event bus"],
+  a5: ["docs/adr/0005-patroni-over-pg-auto-failover.md", "ADR-0005 — Patroni over pg_auto_failover"],
+  a6: ["docs/adr/0006-haproxy-primary-routing.md", "ADR-0006 — HAProxy primary routing"],
+  a7: ["docs/adr/0007-v1-cull-and-rename.md", "ADR-0007 — v1 cull & rename"],
+};
+const RB = {
+  patroni: ["docs/runbooks/patroni-failover-manual.md", "Runbook — Patroni failover (manual)"],
+  etcd: ["docs/runbooks/etcd-quorum-loss.md", "Runbook — etcd quorum loss"],
+  sentinel: ["docs/runbooks/redis-sentinel-post-promotion.md", "Runbook — Redis Sentinel post-promotion"],
+  outbox: ["docs/runbooks/cross-shard-outbox-reconciliation.md", "Runbook — cross-shard outbox reconciliation"],
+  rabbit: ["docs/runbooks/rabbitmq-backlog-drain.md", "Runbook — RabbitMQ backlog drain"],
+  hotkey: ["docs/runbooks/hot-key-spike-response.md", "Runbook — hot-key spike response"],
+  expo: ["docs/runbooks/exhibition-readiness.md", "Runbook — exhibition readiness"],
+};
+
+const DETAILS = {
+
+/* — view 1 — */
+client: {
+  plane: "client",
+  facts: [
+    "Entry point for browsers and the k6 load profiles; everything below the edge is reachable only on the internal compose network.",
+    "Single exposed HTTP port: nginx <code>:8080→80</code>.",
+  ],
+  code: [["docker-compose.yml", 358, "nginx service"]],
+  docs: [RB.expo],
+},
+nginx: {
+  plane: "edge",
+  facts: [
+    "Two limit zones: per-IP <code>2000 r/s</code> (zone per_ip, 20m) + whole-server <code>50000 r/s</code> (zone global, 2m); both return <code>429</code>.",
+    "Defaults come from <code>NGINX_PER_IP_RATE=2000</code> / <code>NGINX_GLOBAL_RATE=50000</code>.",
+    "<code>GET /api/v2/transactions</code> is micro-cached for 1s (<code>X-Cache-Status</code> header exposed); other API routes are uncached with request-body streaming (<code>proxy_request_buffering off</code>).",
+    "<code>/health</code> and <code>/metrics</code> bypass rate limits and cache.",
+    "<code>limit_conn conn_per_ip 5000</code> caps concurrent connections per client.",
+  ],
+  code: [
+    ["nginx/nginx.conf.template", 90, "limit zones"],
+    ["nginx/nginx.conf.template", 136, "GET route: cache 1s + limits"],
+    ["nginx/nginx.conf.template", 167, "other API routes"],
+    ["nginx/nginx.conf.template", 122, "/health & /metrics unlimited"],
+    [".env.example", 731, "rate defaults"],
+    ["docker-compose.yml", 358, "service"],
+  ],
+  docs: [RB.hotkey],
+},
+app: {
+  plane: "app",
+  facts: [
+    "<code>replicas: 2</code> × 1.0 CPU — deliberate: more replicas oversubscribe the 8-core host and inflate p95/p99 (comment in compose).",
+    "Hardened: distroless + nonroot (UID 65532), <code>read_only</code> rootfs, <code>cap_drop: ALL</code>, <code>no-new-privileges</code>, pids ≤ 256, /tmp tmpfs 64m.",
+    "Healthcheck execs the binary itself: <code>peakload-capstone --health-check</code> every 10s (TCP probe of /health from inside).",
+    "One binary wires three module crates (accounts, transactions, notifications) + shared_kernel; router composed in <code>bootstrap.rs</code>.",
+    "Boot is gated on pgbouncer-shard0 healthy, schema bootstrap + migrator completed, redis + sentinel + rabbitmq healthy; shard1/shard2/otel deps are <code>required: false</code>.",
+  ],
+  code: [
+    ["docker-compose.yml", 402, "app service (hardening)"],
+    ["docker-compose.yml", 496, "replicas: 2 + rationale"],
+    ["docker-compose.yml", 476, "healthcheck"],
+    ["crates/app/src/bootstrap.rs", 635, "router composition"],
+    ["crates/app/src/main.rs", 46, "--health-check gate"],
+    ["crates/app/src/main.rs", 135, "health_probe()"],
+  ],
+  docs: [ADR.a1, ADR.a2, ADR.a3, ADR.a7],
+},
+"redis-m": {
+  plane: "redis",
+  facts: [
+    "Roles: tiered-cache L2, idempotency reservations (<code>SETNX</code>), pending/inflight intake lists, rate-limit state.",
+    "Persistence: <code>appendonly yes</code> + <code>appendfsync everysec</code> → ≤1s loss bound.",
+    "App connects Sentinel-aware: <code>REDIS_SENTINEL_NODES</code> (3 nodes), master name <code>peakload-master</code>, monitor interval 5s.",
+  ],
+  code: [
+    ["docker-compose.yml", 1026, "redis-master"],
+    ["docker-compose.yml", 422, "sentinel wiring in app env"],
+  ],
+  docs: [RB.sentinel],
+},
+"redis-r": {
+  plane: "redis",
+  facts: [
+    "Async replica of the master; cache reads can be offloaded via <code>REDIS_READ_URL=redis://…@redis-replica:6379</code>.",
+    "Promotion candidate when Sentinel quorum declares the master down.",
+  ],
+  code: [
+    ["docker-compose.yml", 1045, "redis-replica"],
+    [".env.example", 468, "REDIS_READ_URL"],
+  ],
+  docs: [RB.sentinel],
+},
+sentinels: {
+  plane: "redis",
+  facts: [
+    "Three Sentinels monitor <code>peakload-master</code>; quorum promotes the replica on master failure.",
+    "The app re-resolves the master through Sentinel — no restart needed after promotion.",
+  ],
+  code: [
+    ["docker-compose.yml", 1079, "sentinel-1"],
+    ["docker-compose.yml", 1083, "sentinel-2"],
+    ["docker-compose.yml", 1087, "sentinel-3"],
+  ],
+  docs: [RB.sentinel],
+},
+pgb0: {
+  plane: "pg",
+  facts: [
+    "Transaction-pooling pgBouncer in front of shard0's primary; <code>MAX_DB_CONNECTIONS=200</code> caps backend connections.",
+    "Write path: app → pgbouncer-shard0 → HAProxy primary fe <code>:5000</code> → whichever Patroni node is primary.",
+    "Consumer prefetch (200) is sized to stay within this cap.",
+  ],
+  code: [
+    ["docker-compose.yml", 610, "pgbouncer-shard0"],
+    ["crates/transactions/src/infrastructure/consumer.rs", 58, "prefetch ↔ pool cap comment"],
+  ],
+  docs: [ADR.a6],
+},
+pgb1: {
+  plane: "pg",
+  facts: [
+    "Same as shard0's pooler but profile-gated: active because the default <code>COMPOSE_PROFILES=shard1,prometheus,grafana</code> includes <code>shard1</code>.",
+    "App dependency is <code>required: false</code> — compose without the profile boots single-shard.",
+  ],
+  code: [
+    ["docker-compose.yml", 743, "pgbouncer-shard1"],
+    [".env.example", 91, "COMPOSE_PROFILES default"],
+    ["docker-compose.yml", 452, "required:false comment"],
+  ],
+  docs: [],
+},
+readpool: {
+  plane: "pg",
+  facts: [
+    "Optional read-side poolers (profile <code>readpool</code>, off by default): app → pgbouncer-read → HAProxy replica fe.",
+    "Pool size default 30 per shard (<code>PGBOUNCER_READ_DEFAULT_POOL_SIZE</code>); 32M memory cap each.",
+    "Without the profile, app read pools (40/shard) connect straight to HAProxy <code>:5010/:5011</code>.",
+  ],
+  code: [
+    ["docker-compose.yml", 636, "pgbouncer-read-shard0"],
+    ["docker-compose.yml", 655, "pgbouncer-read-shard1"],
+    [".env.example", 133, "readpool toggle docs"],
+  ],
+  docs: [],
+},
+haproxy: {
+  plane: "pg",
+  facts: [
+    "Single HAProxy routes both directions: primary frontends <code>:5000</code> (shard0) / <code>:5001</code> (shard1), replica frontends <code>:5010</code> / <code>:5011</code>.",
+    "Backend selection via Patroni REST health probes — primary fe sends traffic to the node answering as primary, replica fe to the replica.",
+    "Failover = probes flip = routing flips; clients keep one stable address.",
+  ],
+  code: [
+    ["docker-compose.yml", 836, "pg-haproxy"],
+    ["docker-compose.yml", 642, "replica fe :5010 comment"],
+    [".env.example", 149, "read URLs → :5010/:5011"],
+  ],
+  docs: [ADR.a6, ADR.a5],
+},
+etcd: {
+  plane: "infra",
+  facts: [
+    "Three-node etcd = Patroni's DCS: leader election, cluster config, member state.",
+    "Tolerates one node loss; if quorum is lost Patroni demotes all primaries to read-only to prevent split-brain (comment in compose).",
+    "No external port exposure.",
+  ],
+  code: [
+    ["docker-compose.yml", 503, "cluster rationale comment"],
+    ["docker-compose.yml", 515, "etcd-1"],
+  ],
+  docs: [RB.etcd, ADR.a5],
+},
+shard0: {
+  plane: "pg",
+  facts: [
+    "Always-on shard: <code>pg-shard0-node-a</code> + <code>node-b</code>, Patroni-managed streaming replication.",
+    "Accounts are routed to shards by hash (<code>shard_for_account</code>); shard0 is the default home.",
+  ],
+  code: [
+    ["docker-compose.yml", 558, "node-a"],
+    ["docker-compose.yml", 584, "node-b"],
+  ],
+  docs: [ADR.a5, RB.patroni],
+},
+shard1: {
+  plane: "pg",
+  facts: [
+    "Profile <code>shard1</code> — ON in the default profile set.",
+    "Identical Patroni pair shape as shard0; writes arrive via pgbouncer-shard1 → HAProxy <code>:5001</code>.",
+  ],
+  code: [
+    ["docker-compose.yml", 699, "node-a"],
+    ["docker-compose.yml", 720, "node-b"],
+    [".env.example", 91, "COMPOSE_PROFILES default"],
+  ],
+  docs: [ADR.a5],
+},
+shard2: {
+  plane: "pg",
+  facts: [
+    "Profile <code>shard2</code> — OFF by default; the pair + its pgbouncer exist in compose but don't start.",
+    "Enabling = add the profile + uncomment <code>DATABASE_SHARD2_*</code> URLs (read fe would be <code>:5012</code>).",
+  ],
+  code: [
+    ["docker-compose.yml", 766, "node-a"],
+    ["docker-compose.yml", 787, "node-b"],
+    ["docker-compose.yml", 810, "pgbouncer-shard2"],
+    [".env.example", 155, "shard2 read URL (commented)"],
+  ],
+  docs: [],
+},
+rabbit: {
+  plane: "mq",
+  facts: [
+    "One work queue: <code>transactions.process</code>, durable, with DLX → DLQ for poison messages.",
+    "Producers: redis-intake + publish-outbox workers. Consumer: in-app batch consumer, prefetch 200.",
+  ],
+  code: [
+    ["docker-compose.yml", 1094, "rabbitmq service"],
+    ["crates/transactions/src/infrastructure/consumer.rs", 56, "QUEUE_NAME"],
+  ],
+  docs: [RB.rabbit],
+},
+jobs: {
+  plane: "infra",
+  facts: [
+    "<code>db-bootstrap-schema</code>: one-shot psql apply of <code>db/init.sql</code> per shard primary (idempotent).",
+    "<code>db-migrator</code>: the app binary with <code>--migrate</code> — applies sqlx migrations with its own 60s lock/statement timeouts (overriding the 2s/500ms server defaults).",
+    "Both must complete before the app starts (<code>service_completed_successfully</code>).",
+  ],
+  code: [
+    ["docker-compose.yml", 928, "db-bootstrap-schema"],
+    ["docker-compose.yml", 988, "db-migrator"],
+    ["crates/app/src/main.rs", 59, "--migrate gate"],
+    ["crates/app/src/main.rs", 83, "migrate_all_shards()"],
+  ],
+  docs: [],
+},
+obs: {
+  plane: "obs",
+  facts: [
+    "Default profile set is <code>shard1,prometheus,grafana</code> — so Prometheus + Grafana run by default; otel-collector, Jaeger and cAdvisor are opt-in profiles.",
+    "App's otel dependency is <code>required: false</code> — tracing export degrades gracefully when the collector is absent.",
+  ],
+  code: [
+    ["docker-compose.yml", 1142, "prometheus"],
+    ["docker-compose.yml", 1236, "grafana"],
+    ["docker-compose.yml", 1176, "otel-collector"],
+    ["docker-compose.yml", 1212, "jaeger"],
+    ["docker-compose.yml", 1272, "cadvisor"],
+    [".env.example", 91, "COMPOSE_PROFILES default"],
+  ],
+  docs: [RB.expo],
+},
+
+/* — view 2 — */
+req:  { plane: "client", facts: ["Arrives from nginx with <code>X-Real-IP</code> set — the rate limiter keys on it."], code: [["nginx/nginx.conf.template", 136, "proxied API route"]], docs: [] },
+wrap: {
+  plane: "app",
+  facts: [
+    "Outside the protection stack proper: CORS, <code>TraceLayer</code> (http.request spans), <code>TimeoutLayer</code>, request-id injector.",
+    "These run before/around everything so even shed requests get traced and stamped.",
+  ],
+  code: [
+    ["crates/app/src/bootstrap.rs", 661, "TimeoutLayer"],
+    ["crates/app/src/bootstrap.rs", 666, "TraceLayer"],
+    ["crates/app/src/middleware/request_id.rs", null, "request_id middleware"],
+  ],
+  docs: [],
+},
+l1: {
+  plane: "app",
+  facts: [
+    "Semaphore-bounded concurrency. A request waits up to <code>BACKPRESSURE_WAIT_MS=50</code> (default) for a permit, then sheds <code>503 + Retry-After</code>.",
+    "Outermost stack layer: cheapest rejection happens before any other work.",
+  ],
+  code: [
+    ["crates/app/src/middleware/backpressure.rs", null, "middleware"],
+    ["crates/app/src/config.rs", 369, "BACKPRESSURE_WAIT_MS default"],
+  ],
+  docs: [],
+},
+l2: {
+  plane: "app",
+  facts: [
+    "Three states tracked lock-free: <code>CLOSED / OPEN / HALF_OPEN</code> (CAS transitions).",
+    "Failure threshold default <code>CIRCUIT_BREAKER_FAILURE_THRESHOLD=50</code>.",
+    "Sits above rate-limit/auth so an open breaker sheds before they spend cycles.",
+  ],
+  code: [
+    ["crates/app/src/middleware/circuit_breaker.rs", 25, "state constants"],
+    ["crates/app/src/config.rs", 321, "threshold default"],
+  ],
+  docs: [],
+},
+l3: {
+  plane: "app",
+  facts: [
+    "Token accounting sharded across <code>SHARDS=64</code> lock stripes to avoid a single hot mutex.",
+    "Defaults <code>RATE_LIMIT_PER_SECOND=2000</code>, <code>RATE_LIMIT_BURST=4000</code>; rejection = <code>429 + Retry-After</code>.",
+    "Second line behind nginx's per-IP/global zones — defence in depth.",
+  ],
+  code: [
+    ["crates/app/src/middleware/rate_limit.rs", 27, "SHARDS = 64"],
+    ["crates/app/src/config.rs", 314, "rps + burst defaults"],
+  ],
+  docs: [RB.hotkey],
+},
+l4: {
+  plane: "app",
+  facts: [
+    "Validator and decoding key are process-wide statics, pinned to HS256 — an HS512-signed token is rejected (S-1 regression test).",
+    "<code>ENABLE_AUTH=false</code> by default (exhibition mode); when on, boot fails closed if issuer/audience config is missing.",
+  ],
+  code: [
+    ["crates/app/src/middleware/auth.rs", 15, "pinned statics"],
+    ["crates/app/src/middleware/auth.rs", 257, "S-1 HS512-rejection test"],
+    ["crates/app/src/config.rs", 353, "ENABLE_AUTH default"],
+    ["docker-compose.yml", 433, "fail-closed comment"],
+  ],
+  docs: [],
+},
+l5: {
+  plane: "app",
+  facts: [
+    "R-9 operator posture: <code>DEGRADATION_MODE=normal</code> default; <code>read_only</code> sheds writes with 503 while reads keep flowing.",
+    "Flippable at runtime via <code>PUT /api/v2/admin/degradation</code> — no restart.",
+  ],
+  code: [
+    ["crates/app/src/config.rs", 351, "mode default"],
+    ["docker-compose.yml", 439, "R-9 seed + admin flip comment"],
+    ["crates/app/src/degradation.rs", null, "DegradationFlag"],
+  ],
+  docs: [RB.expo],
+},
+l6: {
+  plane: "app",
+  facts: [
+    "Innermost layer records <code>http_requests_total</code> + latency histograms — by position, traffic shed at L1–L5 never pollutes success-rate metrics.",
+    "Shed traffic is counted by per-layer shed counters instead.",
+  ],
+  code: [["crates/app/src/middleware/metrics.rs", null, "metrics layer"]],
+  docs: [],
+},
+handler: {
+  plane: "app",
+  facts: [
+    "Module routers merged in bootstrap: accounts, transactions, notifications + health/metrics endpoints.",
+    "Admin router mounts with an extra <code>require_admin_middleware</code> gate.",
+  ],
+  code: [
+    ["crates/app/src/bootstrap.rs", 635, "Router::new() composition"],
+    ["crates/app/src/bootstrap.rs", 630, "admin mount"],
+  ],
+  docs: [ADR.a7],
+},
+shed: {
+  plane: "edge",
+  facts: [
+    "Every layer rejects with the cheapest possible response + <code>Retry-After</code> where meaningful.",
+    "Each shed increments its own counter family — dashboards can tell <em>which</em> layer is shedding.",
+  ],
+  code: [["crates/app/src/middleware/backpressure.rs", null, "503"], ["crates/app/src/middleware/rate_limit.rs", null, "429"]],
+  docs: [],
+},
+proof: {
+  plane: "infra",
+  facts: [
+    "With sequential <code>Router::layer</code> calls the <strong>last</strong> <code>.layer()</code> added is the <strong>outermost</strong> at runtime — the bootstrap comment spells out the resulting order: backpressure → breaker → rate-limit → auth → degradation → metrics → handler.",
+    "Stack is applied in one place: <code>apply_protection_stack(...)</code>.",
+  ],
+  code: [
+    ["crates/app/src/bootstrap.rs", 687, "apply_protection_stack + order comment"],
+    ["crates/app/src/bootstrap.rs", 563, "call site"],
+  ],
+  docs: [],
+},
+admin: {
+  plane: "infra",
+  facts: [
+    "<code>/api/v2/admin/*</code> (degradation posture, etc.) guarded by <code>require_admin_middleware</code>.",
+  ],
+  code: [["crates/app/src/bootstrap.rs", 630, "admin mount"], ["crates/app/src/admin.rs", null, "handlers"]],
+  docs: [],
+},
+
+/* — view 3 — */
+wpost: {
+  plane: "client",
+  facts: [
+    "Client supplies <code>reference_id</code> for idempotent retries (server generates a UUID if absent).",
+    "Success contract is <code>202 Accepted</code> — settlement is asynchronous.",
+  ],
+  code: [["docs/apiContract.yaml", null, "API contract"]],
+  docs: [],
+},
+wval: {
+  plane: "app",
+  facts: [
+    "Validation chain: amount (positive, matches DB constraint — property-tested), currency, reference_id ASCII-only ≤100 chars (closes NFC/NFD dedupe ambiguity).",
+    "Optional cross-module sender check is OFF by default (<code>TX_VERIFY_FROM_ACCOUNT=false</code>): the consumer re-validates balance under <code>UPDATE … WHERE balance &gt;= $1</code> anyway.",
+  ],
+  code: [
+    ["crates/transactions/src/api/handlers.rs", null, "handler"],
+    ["crates/transactions/src/application/mod.rs", 335, "optional sender check"],
+    ["crates/app/src/config.rs", 365, "TX_VERIFY_FROM_ACCOUNT default"],
+  ],
+  docs: [ADR.a3],
+},
+wkey: {
+  plane: "app",
+  facts: [
+    "Shard = hash(from_account). Idempotency key = <code>txn:{shard}:{reference_id}</code> — shard embedded so equal reference_ids on different shards stay distinct (injectivity property-tested).",
+    "SHA-256 of the canonical payload becomes <code>request_hash</code> — replays with different bodies are detected as conflicts.",
+  ],
+  code: [["crates/transactions/src/application/mod.rs", 360, "key + hash build"]],
+  docs: [],
+},
+wres: {
+  plane: "redis",
+  facts: [
+    "<code>IDEMPOTENCY_BACKEND=hybrid</code> (default): Redis is the primary reservation store, PG engages only when Redis errors synchronously.",
+    "Reserve = <code>SETNX v1:idemp:{key}</code> (TTL <code>86_400</code>s = 24h) storing request_hash + both payloads + shard, then <code>LPUSH v1:idemp_pending:s{shard}</code>.",
+    "Replay with same hash → replays stored 202; different hash → conflict.",
+  ],
+  code: [
+    ["crates/app/src/config.rs", 159, "backend selection"],
+    ["crates/transactions/src/infrastructure/redis_idempotency.rs", 67, "TTL_SECS = 86_400"],
+    ["crates/transactions/src/infrastructure/redis_idempotency.rs", 82, "entry/pending/inflight keys"],
+    ["crates/transactions/src/infrastructure/redis_idempotency.rs", 135, "SETNX reserve"],
+  ],
+  docs: [],
+},
+wfall: {
+  plane: "pg",
+  facts: [
+    "Fallback lane only on synchronous Redis <code>Err</code>: reservation row in PG with the same 24h TTL semantics (<code>IDEMPOTENCY_TTL_SECS=86_400</code>).",
+    "A SETNX that succeeds and is later lost in failover does NOT trigger fallback — the PG <code>ON CONFLICT</code> in the batch apply is the last line of dedupe.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/repository.rs", 433, "PG TTL"],
+    ["crates/transactions/src/infrastructure/redis_idempotency.rs", 38, "hybrid semantics doc"],
+  ],
+  docs: [],
+},
+w202: {
+  plane: "client",
+  facts: [
+    "Returned as soon as the reservation lands — DB write happens later on the intake worker.",
+    "Client polls <code>GET /api/v2/transactions/status/{reference_id}</code>.",
+  ],
+  code: [["crates/transactions/src/api/handlers.rs", 286, "status endpoint"]],
+  docs: [],
+},
+wintake: {
+  plane: "app",
+  facts: [
+    "Drains <code>v1:idemp_pending:s{shard}</code> with <code>RPOPLPUSH pending → inflight</code> — atomic claim; crash-restart drains inflight first so nothing is lost between SETNX and PG commit.",
+    "Idle tick 10ms · error backoff 500ms · publish concurrency 16 · queue-depth sampled every 5s.",
+    "GETs the full entry from the <em>master</em> pool to avoid replication-lag staleness.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/redis_intake.rs", 45, "ticks + backoff"],
+    ["crates/transactions/src/infrastructure/redis_intake.rs", 65, "PUBLISH_CONCURRENCY = 16"],
+    ["crates/transactions/src/infrastructure/redis_idempotency.rs", 94, "inflight key"],
+  ],
+  docs: [],
+},
+wpub: {
+  plane: "app",
+  facts: [
+    "Companion worker for the PG-fallback lane: leases unpublished outbox rows (lease 600s), publishes to RabbitMQ in batches of 25, concurrency 8.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/publish_outbox.rs", 28, "BATCH_SIZE = 25"],
+    ["crates/transactions/src/infrastructure/publish_outbox.rs", 57, "LEASE_SECS = 600"],
+  ],
+  docs: [],
+},
+wq: {
+  plane: "mq",
+  facts: [
+    "Durable queue <code>transactions.process</code>; AMQP prefetch derives from <code>BATCH_SIZE=200</code> (<code>basic_qos</code>), sized within pgbouncer's 200-connection cap.",
+    "Dead-letter exchange routes poison messages to the DLQ.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/consumer.rs", 56, "queue + tag"],
+    ["crates/transactions/src/infrastructure/consumer.rs", 58, "prefetch rationale"],
+  ],
+  docs: [RB.rabbit],
+},
+wdlq: {
+  plane: "mq",
+  facts: [
+    "Rejected without requeue: undeserializable JSON, NULL <code>reference_id</code> (would bypass <code>ON CONFLICT (reference_id, …)</code> dedupe).",
+    "Drain procedure lives in the runbook.",
+  ],
+  code: [["crates/transactions/src/infrastructure/consumer.rs", 547, "deserialize + guard"]],
+  docs: [RB.rabbit],
+},
+wcons: {
+  plane: "app",
+  facts: [
+    "Buffers deliveries; flushes on size (<code>BATCH_SIZE=200</code>) or idle (<code>IDLE_FLUSH_MS=250</code>, checked every <code>CHECK_INTERVAL_MS=50</code>).",
+    "250ms idle window exists because the old fixed 50ms timer fired before batches accumulated (avg 2.1 msgs/batch — see the doc comment).",
+    "Each message's span is parented to the originating HTTP trace via AMQP headers.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/consumer.rs", 66, "BATCH_SIZE"],
+    ["crates/transactions/src/infrastructure/consumer.rs", 67, "IDLE_FLUSH_MS doc + 2.1 rationale"],
+    ["crates/transactions/src/infrastructure/consumer.rs", 85, "CHECK_INTERVAL_MS"],
+  ],
+  docs: [ADR.a4],
+},
+wapply: {
+  plane: "pg",
+  facts: [
+    "One PL/pgSQL call per shard-batch: bulk-claims rows with a <code>WITH ins AS (INSERT … ON CONFLICT DO NOTHING RETURNING …)</code> CTE, then loops rows for debit/credit.",
+    "<code>UNIQUE (reference_id, from_account)</code> is the serialization point — losers of the conflict are 'skipped' (already processed) and ACKed without re-debiting.",
+    "Balance check inside: <code>UPDATE … WHERE balance &gt;= $1</code> — insufficient funds → row marked failed, no partial debit.",
+  ],
+  code: [
+    ["db/init.sql", 366, "bulk claim CTE"],
+    ["db/init.sql", 387, "per-row loop"],
+  ],
+  docs: [],
+},
+wsame: {
+  plane: "pg",
+  facts: [
+    "Receiver on the same shard → debit + credit inside the same transaction; status flips to <code>completed</code>; message ACKed.",
+  ],
+  code: [["db/init.sql", 387, "debit/credit loop"]],
+  docs: [],
+},
+wxs: {
+  plane: "pg",
+  facts: [
+    "Receiver lives on another shard → the function emits a row into the transactional outbox on the sender's shard (same txn as the debit).",
+    "Processor claims with <code>FOR UPDATE SKIP LOCKED</code>, lease 60s; poll 250ms; batch 100; apply concurrency 8.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/cross_shard_processor.rs", 49, "poll + batch"],
+    ["crates/transactions/src/infrastructure/cross_shard_processor.rs", 61, "concurrency + attempts + lease"],
+  ],
+  docs: [RB.outbox],
+},
+wxsp: {
+  plane: "pg",
+  facts: [
+    "Credits the receiver shard idempotently (<code>ON CONFLICT … DO NOTHING</code>); on success marks applied + DELs the stale <code>tx_status:</code> cache immediately.",
+    "Retries ≤ <code>MAX_ATTEMPTS=10</code>; exhaustion → refund path marks sender <code>failed</code> (R-8); stuck refunds back off 300s.",
+    "Applied rows pruned after retention (floor 3600s), batched 10k × ≤50.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/cross_shard_processor.rs", 62, "MAX_ATTEMPTS"],
+    ["crates/transactions/src/infrastructure/cross_shard_processor.rs", 74, "refund backoff"],
+    ["crates/transactions/src/infrastructure/cross_shard_processor.rs", 96, "retention floor"],
+    ["crates/transactions/src/infrastructure/cross_shard_processor.rs", 233, "immediate tx_status DEL"],
+  ],
+  docs: [RB.outbox],
+},
+wbus: {
+  plane: "app",
+  facts: [
+    "<code>tokio::broadcast</code> bus, capacity <code>8192</code>; event name <code>transactions.committed</code>.",
+    "In-process by design (ADR-0004): consumers are the cache invalidator and the notifications dispatcher.",
+  ],
+  code: [
+    ["crates/shared_kernel/src/events.rs", 45, "DEFAULT_BUS_CAPACITY"],
+    ["crates/shared_kernel/src/events.rs", 51, "event name"],
+  ],
+  docs: [ADR.a4],
+},
+winval: {
+  plane: "redis",
+  facts: [
+    "Subscriber DELs <code>txn:{id}</code>, <code>tx_status:{reference_id}</code> and the <code>txn_list:*</code> buckets on every commit event — bounds read staleness to the TTLs even if an event is missed.",
+  ],
+  code: [["crates/transactions/src/infrastructure/cache_invalidator.rs", 81, "DEL keys"]],
+  docs: [],
+},
+wnotif: {
+  plane: "app",
+  facts: [
+    "Dispatcher dedupes on a 4096-entry sliding window, stores into a 512-slot ring buffer; <code>GET /api/v2/notifications/recent</code> clamps limit to ≤200.",
+  ],
+  code: [
+    ["crates/notifications/src/application/mod.rs", 98, "DEDUPE_WINDOW = 4096"],
+    ["crates/notifications/src/infrastructure/mod.rs", 49, "ring capacity 512"],
+    ["crates/notifications/src/application/mod.rs", 30, "MAX_RECENT = 200"],
+  ],
+  docs: [ADR.a4],
+},
+wclean: {
+  plane: "infra",
+  facts: [
+    "Background sweeper: every 30s, cleans expired idempotency reservations and stale outbox state; published rows get a 300s grace; sweep statements run with a 60s timeout.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/cleanup.rs", 23, "interval"],
+    ["crates/transactions/src/infrastructure/cleanup.rs", 33, "published grace"],
+  ],
+  docs: [],
+},
+
+/* — view 4 — */
+rb1: {
+  plane: "app",
+  facts: [
+    "In-process moka cache, TTL <code>1s</code>, sized for ≈50 MB (≈80-byte entries) — zero TCP on hit.",
+    "Hit increments <code>cache_hits_total{tier=\"moka\"}</code>.",
+    "Worst-case staleness for a warm key = moka TTL + Redis TTL (1s + 10s).",
+  ],
+  code: [
+    ["crates/accounts/src/infrastructure/mod.rs", 56, "MOKA_BALANCE_TTL_SECS = 1"],
+    ["crates/accounts/src/api/handlers.rs", 125, "L1 lookup + metric"],
+  ],
+  docs: [RB.hotkey],
+},
+rb2: {
+  plane: "redis",
+  facts: [
+    "Shared L2 across both app replicas: key <code>acc:{account}</code>, TTL <code>BALANCE_CACHE_TTL_SECS=10</code>.",
+    "Filled on miss by handler and service layer; debit-path correctness never depends on it (balance is enforced in SQL).",
+  ],
+  code: [
+    ["crates/accounts/src/application/mod.rs", 36, "TTL = 10"],
+    ["crates/accounts/src/api/handlers.rs", 165, "L2 fill"],
+  ],
+  docs: [],
+},
+rb3: {
+  plane: "app",
+  facts: [
+    "Read pools are separate from write pools: <code>DB_READ_POOL_SIZE=40</code> per shard, pointed at the replica frontends.",
+    "Repo wraps queries in retry + dependency breaker (R-7).",
+  ],
+  code: [
+    [".env.example", 213, "DB_READ_POOL_SIZE"],
+    ["crates/accounts/src/infrastructure/mod.rs", null, "repo wiring"],
+  ],
+  docs: [],
+},
+rb4: {
+  plane: "pg",
+  facts: [
+    "Replica frontends <code>:5010</code> (shard0) / <code>:5011</code> (shard1); Patroni REST probes keep them pointed at the live replica.",
+  ],
+  code: [
+    [".env.example", 149, "read URLs"],
+    ["docker-compose.yml", 836, "pg-haproxy"],
+  ],
+  docs: [ADR.a6],
+},
+rl1: {
+  plane: "app",
+  facts: [
+    "<code>offset</code> is rejected with 400 — cursor-only (<code>before</code> RFC3339 + <code>before_id</code> tiebreaker).",
+    "<code>limit</code> defaults 20, capped at 100.",
+  ],
+  code: [["crates/transactions/src/api/handlers.rs", 205, "param handling"]],
+  docs: [],
+},
+rl2: {
+  plane: "redis",
+  facts: [
+    "Cursor timestamp floored to <code>CACHE_BUCKET_SECS=5</code> → near-simultaneous pagers share one cache entry.",
+    "Key shape <code>txn_list:{limit}:{bucket}:{before_id}</code>; <code>before_id</code> stays un-bucketed (it's the tiebreaker).",
+  ],
+  code: [["crates/transactions/src/api/handlers.rs", 227, "bucket + key build"]],
+  docs: [],
+},
+rl3: {
+  plane: "pg",
+  facts: [
+    "One <code>tokio::spawn</code> per shard, each fetching <code>limit+1</code> rows — the extra row is a <em>tail probe</em>: the oldest row that shard would have dropped.",
+    "Replaces a slack-based heuristic that silently dropped tail rows on lopsided pages (D-3 audit fix).",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/repository.rs", 156, "two-phase comment"],
+    ["crates/transactions/src/infrastructure/repository.rs", 177, "per-shard spawn"],
+  ],
+  docs: [],
+},
+rl4: {
+  plane: "app",
+  facts: [
+    "MAX of the tail probes = <em>safe cursor</em>; merged rows older than it are dropped so the client's next-page cursor never skips rows.",
+    "Result cached 30s — amortizes the fan-out across the 5s bucket window (worst staleness ≈ bucket + TTL).",
+  ],
+  code: [["crates/transactions/src/api/handlers.rs", 262, "TTL rationale comment"]],
+  docs: [],
+},
+rs1: {
+  plane: "redis",
+  facts: [
+    "TTL split by state: terminal (<code>completed/failed/reversed</code>) 5s, transient 1s — long enough to absorb poll bursts, short enough that DEL + 1s ceiling keep staleness ≈1s.",
+  ],
+  code: [["crates/transactions/src/api/handlers.rs", 279, "status_cache_ttl()"]],
+  docs: [],
+},
+rs2: {
+  plane: "app",
+  facts: [
+    "Resolution order: PG row wins; else a live idempotency reservation ⇒ <code>pending</code>; else 404.",
+  ],
+  code: [["crates/transactions/src/application/mod.rs", 472, "get_status_by_reference"]],
+  docs: [],
+},
+rs3: {
+  plane: "redis",
+  facts: [
+    "By-id GET: cache key <code>txn:{id}</code>, TTL 30s; on miss the repo probes shards with a 500ms per-shard timeout.",
+  ],
+  code: [
+    ["crates/transactions/src/api/handlers.rs", 182, "cache + TTL"],
+    ["crates/transactions/src/infrastructure/repository.rs", 22, "per-shard timeout"],
+  ],
+  docs: [],
+},
+rs4: {
+  plane: "app",
+  facts: [
+    "Cache invalidator DELs status/by-id/list keys on <code>transactions.committed</code>; the cross-shard processor additionally DELs <code>tx_status:</code> immediately when the receiver credit lands.",
+  ],
+  code: [
+    ["crates/transactions/src/infrastructure/cache_invalidator.rs", 81, "DELs"],
+    ["crates/transactions/src/infrastructure/cross_shard_processor.rs", 233, "immediate DEL"],
+  ],
+  docs: [],
+},
+rfb: {
+  plane: "pg",
+  facts: [
+    "If a replica goes unhealthy, reads fall back to the primary frontend rather than failing — per-replica health is probed every <code>DB_HEALTH_CHECK_INTERVAL_SECS=5</code>.",
+  ],
+  code: [["crates/app/src/config.rs", 285, "probe interval default"]],
+  docs: [ADR.a6],
+},
+
+/* — view 5 — */
+hpair: {
+  plane: "pg",
+  facts: [
+    "Each shard = 2 Postgres nodes managed by Patroni; replication is streaming, promotion is automatic via the DCS lease.",
+  ],
+  code: [["docker-compose.yml", 558, "shard0 pair"]],
+  docs: [ADR.a5, RB.patroni],
+},
+hetcd: {
+  plane: "infra",
+  facts: [
+    "Leader lease lives in etcd; majority required. Quorum loss ⇒ Patroni demotes ALL primaries to read-only (split-brain prevention).",
+  ],
+  code: [["docker-compose.yml", 503, "comment in compose"]],
+  docs: [RB.etcd],
+},
+hwin: {
+  plane: "infra",
+  facts: [
+    "Promotion window is typically 5–15s, bounded by the etcd leader-lease TTL (compose comment above the retry config).",
+  ],
+  code: [["docker-compose.yml", 427, "window comment"]],
+  docs: [],
+},
+hhap: {
+  plane: "pg",
+  facts: [
+    "HAProxy continuously probes each node's Patroni REST API; the primary frontend follows whoever answers as primary. Apps never re-configure.",
+  ],
+  code: [["docker-compose.yml", 836, "pg-haproxy"]],
+  docs: [ADR.a6],
+},
+hboot: {
+  plane: "infra",
+  facts: [
+    "App start is gated on schema bootstrap + migrations completing (<code>service_completed_successfully</code>) — a half-initialized shard can't receive traffic.",
+  ],
+  code: [["docker-compose.yml", 463, "depends_on gates"]],
+  docs: [],
+},
+hbackup: {
+  plane: "infra",
+  facts: [
+    "pgBackRest WAL archiving is wired into the Patroni nodes but OFF by default (<code>BACKUP_ENABLED=false</code>); enabling pushes lz4-compressed WAL segments to the configured repo for PITR.",
+  ],
+  code: [
+    ["docker-compose.yml", 168, "BACKUP_ENABLED plumbing"],
+    [".env.example", 394, "default off + docs"],
+  ],
+  docs: [],
+},
+hretry: {
+  plane: "app",
+  facts: [
+    "Write retry budget <code>DB_WRITE_RETRY_MAX_ATTEMPTS=6</code> × <code>DB_WRITE_RETRY_BACKOFF_MS=200</code> ≈ 1.2s+ of cover — tuned to ride out the Patroni promotion window.",
+    "Dependency breaker around the DB (R-7): recovery ≈30s, so a dead shard doesn't hold request threads.",
+  ],
+  code: [
+    ["docker-compose.yml", 431, "retry env + rationale"],
+    ["crates/app/src/config.rs", 295, "defaults in code"],
+    ["crates/shared_kernel/src/db/shard.rs", 14, "breaker recovery comment"],
+  ],
+  docs: [],
+},
+hprobe: {
+  plane: "app",
+  facts: [
+    "Per-replica health probes every <code>DB_HEALTH_CHECK_INTERVAL_SECS=5</code>; unhealthy replicas are skipped, reads fall back to primary.",
+  ],
+  code: [
+    ["docker-compose.yml", 426, "interval env"],
+    ["crates/app/src/config.rs", 285, "default"],
+  ],
+  docs: [],
+},
+hdeg: {
+  plane: "app",
+  facts: [
+    "Operator switch, not auto: seed via <code>DEGRADATION_MODE</code> env or flip live with <code>PUT /api/v2/admin/degradation</code> — writes shed 503, reads continue.",
+  ],
+  code: [["docker-compose.yml", 439, "R-9 comment"], ["crates/app/src/degradation.rs", null, "flag"]],
+  docs: [RB.expo],
+},
+hheal: {
+  plane: "app",
+  facts: [
+    "Docker healthcheck runs the binary's own <code>--health-check</code> TCP probe every 10s (3 retries, 15s start period); <code>restart: unless-stopped</code>; 2 replicas so one crash leaves a survivor.",
+  ],
+  code: [
+    ["docker-compose.yml", 476, "healthcheck"],
+    ["crates/app/src/main.rs", 135, "health_probe()"],
+  ],
+  docs: [],
+},
+hsent: {
+  plane: "redis",
+  facts: [
+    "Sentinel quorum (3 nodes) promotes the replica; the app's Sentinel-aware client re-resolves <code>peakload-master</code> (monitor interval 5s) without restart.",
+  ],
+  code: [["docker-compose.yml", 422, "sentinel env"]],
+  docs: [RB.sentinel],
+},
+haof: {
+  plane: "redis",
+  facts: [
+    "<code>appendonly yes</code> + <code>appendfsync everysec</code> bounds loss on a master crash to ≤1s of acknowledged writes.",
+  ],
+  code: [["docker-compose.yml", 1026, "redis-master args"]],
+  docs: [],
+},
+hidem: {
+  plane: "redis",
+  facts: [
+    "Hybrid backend's honest caveat (module doc): a SETNX that succeeded then vanished in failover is NOT detected — the PG <code>ON CONFLICT (reference_id, from_account)</code> claim is the final dedupe line.",
+  ],
+  code: [["crates/transactions/src/infrastructure/redis_idempotency.rs", 38, "semantics doc"]],
+  docs: [],
+},
+hmq: {
+  plane: "mq",
+  facts: [
+    "Queue and messages are durable; consumer NACKs poison without requeue (straight to DLQ) so a bad message can't wedge the pipeline.",
+  ],
+  code: [["crates/transactions/src/infrastructure/consumer.rs", 547, "NACK path"]],
+  docs: [RB.rabbit],
+},
+hrun: {
+  plane: "infra",
+  facts: ["Step-by-step operator procedures for every failure domain in this view."],
+  code: [],
+  docs: [RB.patroni, RB.etcd, RB.sentinel, RB.outbox, RB.rabbit, RB.expo],
+},
+
+/* — view 6 — */
+oreg: {
+  plane: "app",
+  facts: [
+    "<code>metrics-exporter-prometheus</code> recorder installed at boot; ~50+ metric families described up front.",
+    "Latency histogram buckets are chosen to straddle the 500ms SLO so the P95 question is answerable from buckets, not guesses.",
+  ],
+  code: [
+    ["crates/app/src/bootstrap.rs", 131, "recorder + buckets"],
+    ["crates/app/src/bootstrap.rs", 143, "describe_*"],
+  ],
+  docs: [],
+},
+ozero: {
+  plane: "app",
+  facts: [
+    "Counters that alerting depends on are zero-initialized at boot — <code>rate()</code> over an absent series silently returns nothing; over a zero series it returns 0.",
+  ],
+  code: [["crates/app/src/bootstrap.rs", 342, "zero-init block"]],
+  docs: [],
+},
+omet: {
+  plane: "app",
+  facts: [
+    "<code>/metrics</code> renders the Prometheus registry; <code>/health</code> aggregates dependency state. nginx exempts both from rate limiting and caching.",
+  ],
+  code: [
+    ["crates/app/src/health.rs", null, "handlers"],
+    ["nginx/nginx.conf.template", 122, "unlimited locations"],
+  ],
+  docs: [],
+},
+oprom: {
+  plane: "obs",
+  facts: ["Scrapes app replicas (and cAdvisor when enabled). Part of the default profile set."],
+  code: [["docker-compose.yml", 1142, "service"], [".env.example", 91, "default profiles"]],
+  docs: [],
+},
+ograf: {
+  plane: "obs",
+  facts: ["Dashboards + datasource provisioned from the repo's <code>grafana/</code> directory; default ON."],
+  code: [["docker-compose.yml", 1236, "service"]],
+  docs: [RB.expo],
+},
+ocadv: {
+  plane: "obs",
+  facts: ["Container-level CPU/memory/network metrics into Prometheus; profile-gated."],
+  code: [["docker-compose.yml", 1272, "service"]],
+  docs: [],
+},
+osig: {
+  plane: "app",
+  facts: [
+    "RED metrics from L6 (shed traffic excluded by stack position) + per-layer shed counters + <code>cache_hits_total{tier}</code> + intake queue depth sampled every 5s.",
+  ],
+  code: [
+    ["crates/accounts/src/api/handlers.rs", 127, "tiered cache metric"],
+    ["crates/transactions/src/infrastructure/redis_intake.rs", 100, "depth sample interval"],
+  ],
+  docs: [],
+},
+oslo: {
+  plane: "infra",
+  facts: ["Targets documented in the architecture overview: 99.9% availability, P95 &lt; 500ms under the k6 exhibition profile."],
+  code: [["docs/architecture.md", null, "overview §1"]],
+  docs: [RB.expo],
+},
+orid: {
+  plane: "app",
+  facts: ["UUID per request, echoed in the response header and stamped on logs — correlate a user report to traces in seconds."],
+  code: [["crates/app/src/middleware/request_id.rs", null, "middleware"]],
+  docs: [],
+},
+otrl: {
+  plane: "app",
+  facts: ["Tower-http <code>TraceLayer</code> opens an <code>http.request</code> span per request with method/uri/status."],
+  code: [["crates/app/src/bootstrap.rs", 666, "TraceLayer init"]],
+  docs: [],
+},
+oprop: {
+  plane: "app",
+  facts: [
+    "The producer injects <code>traceparent</code> into AMQP headers; the consumer extracts it and parents its span — one trace spans HTTP → storage → worker → AMQP → consumer.",
+  ],
+  code: [["crates/transactions/src/infrastructure/consumer.rs", null, "set_parent on consume"]],
+  docs: [],
+},
+ootel: {
+  plane: "obs",
+  facts: [
+    "OTLP gRPC sink (<code>OTEL_EXPORTER_OTLP_ENDPOINT</code>); app dependency is <code>required: false</code> so the stack boots without it.",
+  ],
+  code: [
+    ["docker-compose.yml", 1176, "service"],
+    ["docker-compose.yml", 444, "app env"],
+  ],
+  docs: [],
+},
+ojae: {
+  plane: "obs",
+  facts: ["Trace UI; receives from otel-collector. Profile-gated."],
+  code: [["docker-compose.yml", 1212, "service"]],
+  docs: [],
+},
+};
+
+/* ════════════════════════════════════════════════════════════════
+   RENDER
+   ════════════════════════════════════════════════════════════════ */
+
+const $ = (s) => document.querySelector(s);
+let activeView = VIEWS[0];
+let selectedNode = null;
+
+function renderSidebar(filter) {
+  const list = $("#viewList");
+  list.innerHTML = "";
+  const q = (filter || "").toLowerCase();
+  VIEWS.forEach((v) => {
+    const hay = (v.title + " " + v.summary + " " + v.nodes.map(n => n.t + " " + n.s).join(" ")).toLowerCase();
+    if (q && !hay.includes(q)) return;
+    const card = document.createElement("div");
+    card.className = "view-card" + (v === activeView ? " active" : "");
+    card.innerHTML =
+      '<div class="head"><div class="num">' + v.num + '</div><div class="title">' + v.title + '</div></div>' +
+      '<div class="summary">' + v.summary + '</div>';
+    card.onclick = () => { activeView = v; closeInspector(); renderSidebar($("#search").value); renderView(); };
+    list.appendChild(card);
+  });
+}
+
+function legendHtml() {
+  let chips = "";
+  for (const k in PLANES) {
+    chips += '<span class="chip"><span class="dot" style="background:' + PLANES[k].color + '"></span>' + PLANES[k].label + '</span>';
+  }
+  return '<div class="legend">' + chips + '</div>';
+}
+
+function renderView() {
+  const c = $("#canvas");
+  c.innerHTML = "";
+
+  const head = document.createElement("div");
+  head.className = "view-header";
+  head.innerHTML =
+    '<div class="big-num">' + activeView.num + '</div>' +
+    '<div><h2>' + activeView.title + '</h2><p>' + activeView.summary + '</p></div>';
+  c.appendChild(head);
+
+  const lg = document.createElement("div");
+  lg.innerHTML = legendHtml();
+  c.appendChild(lg.firstChild);
+
+  const dia = document.createElement("div");
+  dia.className = "diagram";
+  dia.style.width = activeView.w + "px";
+  dia.style.height = activeView.h + "px";
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "wires");
+  svg.innerHTML =
+    '<defs>' +
+    '<marker id="arr-flow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#4f7cc0"/></marker>' +
+    '<marker id="arr-dashed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5d6573"/></marker>' +
+    '<marker id="arr-danger" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#ff7b72"/></marker>' +
+    '<marker id="arr-obs" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#56d4dd"/></marker>' +
+    '</defs>';
+  dia.appendChild(svg);
+
+  (activeView.planes || []).forEach((p) => {
+    const el = document.createElement("div");
+    el.className = "plane-label";
+    el.style.left = p.x + "px";
+    el.style.top = p.y + "px";
+    el.textContent = p.text;
+    dia.appendChild(el);
+  });
+
+  activeView.nodes.forEach((n) => {
+    const el = document.createElement("div");
+    el.className = "node p-" + n.plane + (n.ghost ? " ghost" : "");
+    el.id = "n-" + n.id;
+    el.style.left = n.x + "px";
+    el.style.top = n.y + "px";
+    el.style.width = n.w + "px";
+    el.innerHTML =
+      '<div class="t">' + (n.step ? '<span class="step">' + n.step + '</span>' : '') + n.t + '</div>' +
+      (n.s ? '<div class="s">' + n.s + '</div>' : '');
+    el.onclick = (ev) => { ev.stopPropagation(); openInspector(n); };
+    dia.appendChild(el);
+  });
+
+  c.appendChild(dia);
+  requestAnimationFrame(() => drawEdges(svg, dia));
+}
+
+function rectOf(dia, id) {
+  const el = dia.querySelector("#n-" + id);
+  return { x: el.offsetLeft, y: el.offsetTop, w: el.offsetWidth, h: el.offsetHeight };
+}
+function anchor(r, side) {
+  switch (side) {
+    case "top":    return { x: r.x + r.w / 2, y: r.y, nx: 0, ny: -1 };
+    case "bottom": return { x: r.x + r.w / 2, y: r.y + r.h, nx: 0, ny: 1 };
+    case "left":   return { x: r.x, y: r.y + r.h / 2, nx: -1, ny: 0 };
+    default:       return { x: r.x + r.w, y: r.y + r.h / 2, nx: 1, ny: 0 };
+  }
+}
+function autoSides(a, b) {
+  const acx = a.x + a.w / 2, acy = a.y + a.h / 2;
+  const bcx = b.x + b.w / 2, bcy = b.y + b.h / 2;
+  const dx = bcx - acx, dy = bcy - acy;
+  if (Math.abs(dy) >= Math.abs(dx)) {
+    return dy > 0 ? ["bottom", "top"] : ["top", "bottom"];
+  }
+  return dx > 0 ? ["right", "left"] : ["left", "right"];
+}
+function drawEdges(svg, dia) {
+  const NS = "http://www.w3.org/2000/svg";
+  activeView.edges.forEach((e) => {
+    const ra = rectOf(dia, e.from), rb = rectOf(dia, e.to);
+    const sides = autoSides(ra, rb);
+    const sa = anchor(ra, e.fromSide || sides[0]);
+    const sb = anchor(rb, e.toSide || sides[1]);
+    const dist = Math.hypot(sb.x - sa.x, sb.y - sa.y);
+    const k = Math.min(64, Math.max(28, dist * 0.38));
+    const c1x = sa.x + sa.nx * k, c1y = sa.y + sa.ny * k;
+    const c2x = sb.x + sb.nx * k, c2y = sb.y + sb.ny * k;
+    const kind = e.kind || "flow";
+    const p = document.createElementNS(NS, "path");
+    p.setAttribute("d", "M " + sa.x + " " + sa.y + " C " + c1x + " " + c1y + ", " + c2x + " " + c2y + ", " + sb.x + " " + sb.y);
+    p.setAttribute("class", kind);
+    p.setAttribute("marker-end", "url(#arr-" + kind + ")");
+    svg.appendChild(p);
+    if (e.label) {
+      const t = 0.5;
+      const mt = 1 - t;
+      const mx = mt*mt*mt*sa.x + 3*mt*mt*t*c1x + 3*mt*t*t*c2x + t*t*t*sb.x;
+      const my = mt*mt*mt*sa.y + 3*mt*mt*t*c1y + 3*mt*t*t*c2y + t*t*t*sb.y;
+      const txt = document.createElementNS(NS, "text");
+      txt.setAttribute("x", mx);
+      txt.setAttribute("y", my - 4);
+      txt.setAttribute("text-anchor", "middle");
+      txt.textContent = e.label;
+      svg.appendChild(txt);
+    }
+  });
+}
+
+/* ───────────────────────── inspector */
+function openInspector(n) {
+  const d = DETAILS[n.id];
+  document.querySelectorAll(".node.sel").forEach((el) => el.classList.remove("sel"));
+  const nodeEl = document.getElementById("n-" + n.id);
+  if (nodeEl) nodeEl.classList.add("sel");
+  selectedNode = n.id;
+
+  $("#inspTitle").textContent = n.t;
+  const plane = PLANES[(d && d.plane) || n.plane];
+  const chip = $("#inspPlane");
+  chip.textContent = plane.label;
+  chip.style.color = plane.color;
+  chip.style.border = "1px solid " + plane.color;
+  chip.style.background = "transparent";
+
+  let html = "";
+  if (d && d.facts && d.facts.length) {
+    html += '<div class="insp-sec"><h4>Facts</h4><ul>' + d.facts.map((f) => "<li>" + f + "</li>").join("") + "</ul></div>";
+  }
+  if (d && d.code && d.code.length) {
+    html += '<div class="insp-sec"><h4>Code</h4>' + d.code.map((c) => {
+      const label = c[2] ? ' · <span style="color:var(--muted)">' + c[2] + "</span>" : "";
+      const ln = c[1] ? '<span class="ln">:' + c[1] + "</span>" : "";
+      return '<a class="file-tag" href="' + vscodeUrl(c[0], c[1]) + '">' + c[0] + ln + label + "</a>";
+    }).join("") + "</div>";
+  }
+  if (d && d.docs && d.docs.length) {
+    html += '<div class="insp-sec"><h4>Decisions &amp; Runbooks</h4>' + d.docs.map((doc) => {
+      const kind = doc[0].includes("/adr/") ? "ADR" : doc[0].includes("/runbooks/") ? "RUNBOOK" : "DOC";
+      return '<a class="doc-link" href="' + vscodeUrl(doc[0], null) + '"><span class="kind">' + kind + "</span>" + doc[1] + "</a>";
+    }).join("") + "</div>";
+  }
+  html += '<div class="insp-foot">Facts verified against source 2026-06-10 · links open in VS Code (root configurable in header, shared with the codemap).</div>';
+  $("#inspBody").innerHTML = html;
+  $("#inspector").classList.add("open");
+}
+function closeInspector() {
+  $("#inspector").classList.remove("open");
+  document.querySelectorAll(".node.sel").forEach((el) => el.classList.remove("sel"));
+  selectedNode = null;
+}
+
+/* ───────────────────────── wiring */
+$("#inspClose").onclick = closeInspector;
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeInspector(); });
+$("#canvas").addEventListener("click", (e) => { if (!e.target.closest(".node")) closeInspector(); });
+$("#search").addEventListener("input", (e) => renderSidebar(e.target.value));
+
+const rootBtn = $("#rootBtn");
+function refreshRootBtn() {
+  const short = WORKSPACE_ROOT.length > 34 ? "…" + WORKSPACE_ROOT.slice(-32) : WORKSPACE_ROOT;
+  rootBtn.textContent = "root: " + short;
+}
+rootBtn.onclick = () => {
+  const v = prompt("Workspace root for vscode:// links (shared with codemap):", WORKSPACE_ROOT);
+  if (v) {
+    WORKSPACE_ROOT = v.trim();
+    localStorage.setItem("codemapRoot", WORKSPACE_ROOT);
+    refreshRootBtn();
+    if (selectedNode) {
+      const n = activeView.nodes.find((x) => x.id === selectedNode);
+      if (n) openInspector(n);
+    }
+  }
+};
+refreshRootBtn();
+
+renderSidebar("");
+renderView();
+</script>
+</body>
+</html>

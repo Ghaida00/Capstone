@@ -240,6 +240,27 @@ postgresql:
     commit_siblings: ${PG_COMMIT_SIBLINGS}
     wal_compression: "${PG_WAL_COMPRESSION}"
 
+    # ── WAL archiving (BACKUP_ENABLED toggle) ────────────
+    # Rendered by patroni-entrypoint.sh from BACKUP_ENABLED:
+    #   false → archive_mode=off, archive_command=/bin/true
+    #           (byte-identical behavior to a stack without
+    #           the toggle — no archiver work at all)
+    #   true  → archive_mode=on, archive_command=pgbackrest
+    #           archive-push into the repo described by
+    #           /etc/pgbackrest/pgbackrest.conf
+    # archive_mode is a restart-only GUC; like the durability
+    # knobs above it moves on node recreate, not live.
+    # `on` (not `always`): replicas carry the config but
+    # archive nothing until promoted — exactly the failover
+    # semantics the shared stanza wants.
+    # archive_timeout bounds idle RPO: a non-full segment is
+    # switched + archived after this long. Each forced switch
+    # uploads a (mostly empty, compressed) segment, so don't
+    # set it below ~60s. 0 = disabled (when toggle is off).
+    archive_mode: "${PG_ARCHIVE_MODE}"
+    archive_command: '${PG_ARCHIVE_COMMAND}'
+    archive_timeout: ${PG_ARCHIVE_TIMEOUT}
+
   authentication:
     superuser:
       username: postgres

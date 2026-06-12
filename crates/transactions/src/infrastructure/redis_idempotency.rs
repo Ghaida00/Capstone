@@ -49,7 +49,7 @@
 //!   "shard": 0 }
 //! ```
 //!
-//! The pending list `idempotency:pending:s{shard}` carries only the
+//! The pending list `v1:idemp_pending:s{shard}` carries only the
 //! `idempotency_key` strings; the intake worker GETs the full entry
 //! by key from the master pool to avoid replication-lag staleness.
 
@@ -66,7 +66,7 @@ use super::repository::SqlxIdempotencyWriter;
 /// land as fresh requests.
 const TTL_SECS: u64 = 86_400;
 
-/// Wire shape persisted at `idempotency:{idempotency_key}`. Carries
+/// Wire shape persisted at `v1:idemp:{idempotency_key}`. Carries
 /// everything the intake worker needs to land the row in PG and
 /// publish it to RabbitMQ, plus the request_hash for replay
 /// detection on subsequent reservations of the same key.

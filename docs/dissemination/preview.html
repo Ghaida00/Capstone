@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Peakload Capstone — Preview Diseminasi</title>
+  <meta name="description" content="Optimasi Skalabilitas Transaksi Perbankan — Peak Load Management & Read/Write Separation Berbasis Rust. Tim FullTIm, FILKOM UB.">
+  <link rel="stylesheet" href="custom.css" id="pl-theme-base">
+  <link rel="stylesheet" href="custom-light.css" id="pl-theme-light" disabled>
+  <style>
+    html, body { margin: 0; background: #0b0d12; }
+    html.pl-light, html.pl-light body { background: #f4f7fb; }
+  </style>
+</head>
+<body>
+  <!-- Content injected from wordpress-blocks.html body -->
+  <div id="root"></div>
+  <script>
+    if (location.search.indexOf('theme=light') !== -1 || location.hash.indexOf('light') !== -1) {
+      document.documentElement.classList.add('pl-light');
+      document.getElementById('pl-theme-light').disabled = false;
+    }
+    fetch('wordpress-blocks.html')
+      .then(function (r) { return r.text(); })
+      .then(function (html) {
+        var parser = new DOMParser();
+        var doc = parser.parseFromString(html, 'text/html');
+        var page = doc.querySelector('.pl-page');
+        if (page) {
+          if (document.documentElement.classList.contains('pl-light')) {
+            page.classList.add('pl-theme-light');
+          }
+          document.getElementById('root').appendChild(page);
+          doc.querySelectorAll('script').forEach(function (s) {
+            var ns = document.createElement('script');
+            ns.textContent = s.textContent;
+            document.body.appendChild(ns);
+          });
+          var host = location.hostname;
+          if (host === 'localhost' || host === '127.0.0.1') {
+            page.querySelectorAll('a[data-pl-local]').forEach(function (a) {
+              a.setAttribute('href', a.getAttribute('data-pl-local'));
+            });
+          }
+        }
+      })
+      .catch(function () {
+        document.getElementById('root').innerHTML =
+          '<p style="color:#8a93a1;padding:2rem">Buka via local server agar preview.html dapat memuat wordpress-blocks.html. Atau buka wordpress-blocks.html langsung di WordPress.</p>';
+      });
+  </script>
+</body>
+</html>

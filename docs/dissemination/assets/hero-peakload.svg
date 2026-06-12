@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-label="Peakload Capstone Hero">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0B0D12"/>
+      <stop offset="50%" stop-color="#111827"/>
+      <stop offset="100%" stop-color="#0B0D12"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#F74C00"/>
+      <stop offset="100%" stop-color="#6EA8FE"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#262B34" stroke-width="0.5" opacity="0.4"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect width="1200" height="630" fill="url(#grid)"/>
+  <circle cx="980" cy="120" r="180" fill="#6EA8FE" opacity="0.08"/>
+  <circle cx="200" cy="500" r="220" fill="#F74C00" opacity="0.06"/>
+  <text x="80" y="200" fill="#8A93A1" font-family="system-ui,sans-serif" font-size="18" letter-spacing="0.12em">FULLTIM · TOPik B.4 · CAPSTONE 2026</text>
+  <text x="80" y="280" fill="#E8EDF4" font-family="system-ui,sans-serif" font-size="56" font-weight="700">Peakload</text>
+  <rect x="80" y="300" width="320" height="4" fill="url(#accent)"/>
+  <text x="80" y="360" fill="#C2CAD6" font-family="system-ui,sans-serif" font-size="24">Peak Load Management &amp; Read/Write Separation</text>
+  <text x="80" y="400" fill="#C2CAD6" font-family="system-ui,sans-serif" font-size="24">Berbasis Rust</text>
+  <g font-family="system-ui,sans-serif" font-size="20">
+    <rect x="80" y="460" width="200" height="56" rx="8" fill="#15191F" stroke="#262B34"/>
+    <text x="110" y="495" fill="#7EE787">1M txn/jam</text>
+    <rect x="300" y="460" width="160" height="56" rx="8" fill="#15191F" stroke="#262B34"/>
+    <text x="330" y="495" fill="#6EA8FE">P95 4.43ms</text>
+    <rect x="480" y="460" width="160" height="56" rx="8" fill="#15191F" stroke="#262B34"/>
+    <text x="510" y="495" fill="#F0B341">0.00% error</text>
+    <rect x="660" y="460" width="180" height="56" rx="8" fill="#15191F" stroke="#262B34"/>
+    <text x="690" y="495" fill="#E8EDF4">23 services</text>
+  </g>
+</svg>

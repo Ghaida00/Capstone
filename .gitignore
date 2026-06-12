@@ -60,6 +60,7 @@ diag/*
 # ─── Scratch / throwaway ──────────────────────────────────
 .tmp-*
 .env.bak
+.playwright-mcp/
 
 # ─── Cloud deploy (local-only, not committed) ─────────────
 deploy/cloud/

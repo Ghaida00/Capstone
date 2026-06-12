@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Peakload Capstone — Preview Diseminasi (Light)</title>
+  <meta name="description" content="Optimasi Skalabilitas Transaksi Perbankan — Peak Load Management & Read/Write Separation Berbasis Rust. Tim FullTIm, FILKOM UB.">
+  <link rel="stylesheet" href="custom.css">
+  <link rel="stylesheet" href="custom-light.css">
+  <style>
+    html, body { margin: 0; background: #f4f7fb; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    fetch('wordpress-blocks.html')
+      .then(function (r) { return r.text(); })
+      .then(function (html) {
+        var parser = new DOMParser();
+        var doc = parser.parseFromString(html, 'text/html');
+        var page = doc.querySelector('.pl-page');
+        if (page) {
+          page.classList.add('pl-theme-light');
+          document.getElementById('root').appendChild(page);
+          doc.querySelectorAll('script').forEach(function (s) {
+            var ns = document.createElement('script');
+            ns.textContent = s.textContent;
+            document.body.appendChild(ns);
+          });
+          var host = location.hostname;
+          if (host === 'localhost' || host === '127.0.0.1') {
+            page.querySelectorAll('a[data-pl-local]').forEach(function (a) {
+              a.setAttribute('href', a.getAttribute('data-pl-local'));
+            });
+          }
+        }
+      })
+      .catch(function () {
+        document.getElementById('root').innerHTML =
+          '<p style="color:#5a6578;padding:2rem">Buka via local server agar preview-light.html dapat memuat wordpress-blocks.html.</p>';
+      });
+  </script>
+</body>
+</html>

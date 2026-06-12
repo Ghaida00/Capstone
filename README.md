@@ -30,7 +30,7 @@ Pastikan Anda sudah menginstal alat-alat berikut di sistem Anda:
 ### 2️⃣ Clone Repository
 Pertama, _clone_ repository ini:
 ```bash
-git clone <URL-REPOSITORY>
+git clone https://github.com/Ghaida00/Capstone
 cd Capstone
 ```
 
@@ -87,4 +87,6 @@ docker-compose down
 ```
 _Gunakan perintah `docker-compose down -v` jika Anda ingin ikut menghapus semua volume/data dari Database, Redis, dsb yang tersimpan._
 
-<img width="8192" height="4971" alt="Rust API Cluster Load-2026-03-01-174806" src="https://github.com/user-attachments/assets/f5e6f21d-baef-4d1c-9804-a12f1f3040e9" />
+## 🗺️ Arsitektur Sistem
+
+![Diagram arsitektur sistem Peakload](docs/architecture/system-overview.png)

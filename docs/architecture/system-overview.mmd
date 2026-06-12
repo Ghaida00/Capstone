@@ -1,0 +1,150 @@
+---
+title: Peakload Capstone — System Architecture
+config:
+  layout: elk
+  look: neo
+  theme: base
+  themeVariables:
+    primaryColor: "#eef4ff"
+    primaryBorderColor: "#4f7cc0"
+    primaryTextColor: "#1c2733"
+    secondaryColor: "#fff7e8"
+    tertiaryColor: "#f0fdf4"
+    lineColor: "#5d6573"
+    clusterBkg: "#f7f9fc"
+    clusterBorder: "#c9d4e3"
+    edgeLabelBackground: "#ffffff"
+    fontSize: "13px"
+  elk:
+    mergeEdges: true
+    nodePlacementStrategy: NETWORK_SIMPLEX
+---
+%% Peakload Capstone — whole-system architecture (verified against
+%% docker-compose.yml + crates/* on 2026-06-10). Default profile:
+%% COMPOSE_PROFILES=shard1,prometheus,grafana → 2 active PG shards.
+%% Dashed/faded nodes are profile-gated and OFF by default.
+%% Layout: ELK (mermaid v11) — renderers without the ELK plugin
+%% fall back to dagre automatically.
+flowchart TB
+    client["API client / k6 load generator"]
+
+    subgraph EDGE["Edge"]
+        nginx["nginx :8080→:80<br/>reverse proxy + LB<br/>edge rate-limit per-IP + global"]
+    end
+
+    subgraph APP["App plane — peakload-capstone (Rust · axum) ×2 replicas · distroless · read-only fs"]
+        direction TB
+        stack["Protection stack — per request, inbound order<br/>trace/request-id → backpressure → circuit breaker<br/>→ rate-limit 64-shard → JWT auth HS256<br/>→ degradation gate → metrics"]
+        modules["HTTP modules — /api/v2<br/>accounts · transactions · notifications · admin<br/>+ /health · /metrics"]
+        bus(["event bus — tokio broadcast 8192<br/>transactions.committed"])
+        intake["redis-intake workers<br/>Tier-2 reservations → PG + publish"]
+        pubout["publish-outbox worker<br/>unpublished PG reservations"]
+        consumer["AMQP consumer<br/>batch ≤ 200 · idle-flush 250 ms<br/>apply_transactions_batch"]
+        xshard["cross-shard processor<br/>250 ms drain · lease claim<br/>credit CTE · refund · prune"]
+        cacheinv["cache invalidator"]
+        notifd["notifications dispatcher<br/>dedup 4096 → ring buffer"]
+        stack --> modules
+    end
+
+    subgraph REDISPLANE["Redis plane — Sentinel HA"]
+        direction TB
+        rmaster[("redis-master<br/>L2 cache · Tier-2 idempotency<br/>pending lists · AOF everysec")]
+        rreplica[("redis-replica<br/>read offload")]
+        sentinels["redis-sentinel ×3<br/>monitor · failover<br/>master discovery for app"]
+    end
+
+    subgraph MQPLANE["Messaging — RabbitMQ"]
+        direction TB
+        queue["transactions.process — durable"]
+        dlq["DLQ transactions.dead_letter<br/>via DLX peakload.transactions.dlx"]
+    end
+
+    subgraph PGPLANE["PostgreSQL plane — 2 active shards · hash(from_account) mod NUM_SHARDS"]
+        direction TB
+        pgbw["pgbouncer-shard0 / shard1<br/>transaction pooling — writes"]
+        hap["pg-haproxy<br/>primary fe :5000/:5001 · replica fe :5010/:5011<br/>routes via Patroni REST probes"]
+        shard0[("Shard 0 — Patroni pair PG 18<br/>node-a + node-b<br/>streaming replication")]
+        shard1[("Shard 1 — Patroni pair PG 18<br/>node-a + node-b<br/>streaming replication")]
+        etcd["etcd ×3 — DCS<br/>leader election · quorum"]
+        pgbr["pgBackRest — WAL + PITR<br/>BACKUP_ENABLED, default off"]
+        shard2[("Shard 2 + pgbouncer-shard2<br/>profile shard2 — off")]
+        rpool["pgbouncer-read ×3<br/>profile readpool — off"]
+    end
+
+    subgraph OBSPLANE["Observability"]
+        direction TB
+        prom["Prometheus"]
+        graf["Grafana"]
+        otel["otel-collector"]
+        jaeger["Jaeger"]
+        cad["cAdvisor"]
+    end
+
+    jobs["one-shot jobs<br/>db-bootstrap-schema · db-migrator"]
+
+    %% client → edge → app
+    client -->|"HTTPS :8080"| nginx
+    nginx -->|"proxy · X-Real-IP"| stack
+
+    %% read path
+    modules -->|"reads — replica fe"| hap
+
+    %% write path — the 202 Accepted pipeline (follow ① … ⑧)
+    modules -->|"① reserve idempotency<br/>SETNX+LPUSH → 202 Accepted"| rmaster
+    modules -.->|"①b fallback reserve<br/>when Redis down"| pgbw
+    rmaster -->|"② drain pending list"| intake
+    intake -->|"③ durable INSERT"| pgbw
+    intake -->|"④ publish"| queue
+    pubout -.->|"④b publish fallback rows"| queue
+    queue -->|"⑤ deliver · prefetch ≤ 200"| consumer
+    consumer -->|"⑥ apply batch<br/>debit + credit / outbox"| pgbw
+    xshard -->|"⑥b cross-shard credit<br/>lease claim · credit CTE"| pgbw
+    queue -. "poison / NACK" .-> dlq
+
+    %% events → read-side freshness
+    consumer -->|"⑦ transactions.committed"| bus
+    xshard -->|"⑦ transactions.committed"| bus
+    bus --> cacheinv
+    bus --> notifd
+    cacheinv -->|"⑧ DEL stale keys"| rmaster
+
+    %% PG internals
+    pgbw -->|"primary fe"| hap
+    hap --> shard0
+    hap --> shard1
+    hap -.-> shard2
+    etcd -. "leader lease" .- shard0
+    etcd -. "leader lease" .- shard1
+    shard0 -. "WAL" .-> pgbr
+    shard1 -. "WAL" .-> pgbr
+    modules -.-> rpool
+    rpool -.-> hap
+
+    %% Redis HA
+    rmaster -. "async replication" .-> rreplica
+    sentinels -. "monitor" .-> rmaster
+
+    %% one-shot jobs
+    jobs -->|"init.sql + sqlx via primary fe"| hap
+
+    %% observability
+    prom -. "scrape :3000 /metrics" .-> modules
+    prom -. "scrape" .-> cad
+    graf --> prom
+    modules -. "OTLP traces" .-> otel
+    otel --> jaeger
+
+    %% legend
+    legend["Cara baca — ①…⑧ urutan write path (202 → committed)<br/>panah solid: alur request/data · panah putus: HA / ops / fallback<br/>node pudar: profile-gated, OFF by default"]
+
+    %% plane colors
+    style EDGE fill:#e8f1ff,stroke:#4f7cc0
+    style APP fill:#eef0fb,stroke:#6470d6
+    style REDISPLANE fill:#fdeeee,stroke:#c96666
+    style MQPLANE fill:#fdf3e3,stroke:#cf8a1d
+    style PGPLANE fill:#eaf7ee,stroke:#3f8f5f
+    style OBSPLANE fill:#f3ecfd,stroke:#8a5fd6
+    style legend fill:#fffbe8,stroke:#cfc06a,text-align:left
+
+    classDef gated stroke-dasharray:6 4,opacity:0.65
+    class shard2,rpool,pgbr gated

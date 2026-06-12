@@ -1,0 +1,802 @@
+<!doctype html><html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Peakload — IcePanel-style Explorer</title><style>
+:root{ --bg:#16181d; --chrome:#1e2128; --chrome2:#262a33; --txt:#e8eaf0; --mut:#9aa3b2;
+  --canvas:#f4f5f7; --card:#ffffff; --line:#8b93a3; --accent:#3d7eff;
+  --c-client:#5b6472; --c-edge:#4f7cc0; --c-app:#6470d6; --c-redis:#c96666;
+  --c-mq:#cf8a1d; --c-pg:#3f8f5f; --c-obs:#8a5fd6; --c-infra:#7a8294;
+  --p-req:#3d7eff; --p-ok:#2fbf71; --p-err:#ff5d5d; --p-async:#f0a832; }
+*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);
+  font:14px/1.45 "Segoe UI",system-ui,sans-serif;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+.topbar{height:52px;background:var(--chrome);display:flex;align-items:center;gap:10px;padding:0 14px;
+  border-bottom:1px solid #000}
+.btn{background:var(--chrome2);border:1px solid #343945;color:var(--txt);border-radius:8px;
+  padding:5px 12px;cursor:pointer;font-size:13px} .btn:hover{border-color:var(--accent)}
+.viewer{flex:1;display:flex;min-height:0;padding:14px;gap:14px}
+.canvas-card{flex:1;position:relative;background:var(--canvas);border-radius:14px;overflow:hidden;
+  box-shadow:0 8px 40px rgba(0,0,0,.5)}
+#stage{position:absolute;left:0;top:0;transform-origin:0 0}
+#wires{position:absolute;left:0;top:0;overflow:visible}
+#fx{position:absolute;inset:0;pointer-events:none}
+#nodes{position:absolute;inset:0}
+.flowbar{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);max-width:680px;display:none}
+.btn[disabled],.btn:has(input[disabled]),.btn.disabled,[disabled]{opacity:.4;cursor:not-allowed;pointer-events:none}
+/* ═══ NODE CARDS ═══ */
+.node{position:absolute;background:var(--card);border:1px solid #d6dae2;border-radius:10px;
+  padding:10px 12px 10px 14px;box-shadow:0 1px 4px rgba(20,30,50,.10);cursor:pointer;user-select:none}
+.node::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;border-radius:10px 0 0 10px;
+  background:var(--pc)}
+.node h4{margin:0;font-size:13.5px;color:#1c2733}.node p{margin:3px 0 0;font-size:11.5px;color:#5d6573}
+.node .drill{position:absolute;right:8px;top:8px;width:22px;height:22px;border-radius:50%;
+  border:1px solid #c9d4e3;background:#fff;color:var(--accent);font-size:14px;line-height:20px;text-align:center;cursor:pointer}
+.node.ghost{opacity:.55;border-style:dashed}
+.node.pulse{box-shadow:0 0 0 4px color-mix(in srgb,var(--pc) 35%, transparent)}
+/* ═══ EDGES ═══ */
+path.edge{fill:none;stroke:var(--line);stroke-width:1.6}
+path.edge.dashed{stroke-dasharray:6 4}
+path.edge.danger{stroke:#d9534f}
+path.edge.obs{stroke:#8a5fd6;stroke-dasharray:2 5}
+path.edge.dim{opacity:.15}
+.node.dim{opacity:.25}
+text.elabel{font-size:10.5px;fill:#5d6573;paint-order:stroke;stroke:#f4f5f7;stroke-width:3px}
+</style></head><body>
+<header class="topbar">
+  <strong>Peakload</strong><span style="color:var(--mut)">IcePanel-style explorer</span>
+  <button class="btn" id="btnHome" title="Home">⌂</button>
+  <button class="btn" id="btnBack">←</button><button class="btn" id="btnFwd">→</button>
+  <span id="crumb" style="color:var(--mut)">Diagrams › Context</span>
+  <span style="flex:1"></span>
+  <select class="btn" id="flowSel" disabled><option value="">Flows…</option></select>
+  <button class="btn" id="btnPlay" disabled>▶</button><button class="btn" id="btnStepB" disabled>◀ step</button>
+  <button class="btn" id="btnStepF" disabled>step ▶</button>
+  <label class="btn disabled" style="display:flex;gap:6px;align-items:center">live
+    <input type="checkbox" id="liveTgl" disabled><input type="range" id="liveRate" min="1" max="40" value="8" style="width:90px" disabled></label>
+</header>
+<div class="viewer">
+  <div class="canvas-card" id="card">
+    <div id="stage"><svg id="wires"></svg><div id="nodes"></div></div>
+    <canvas id="fx"></canvas>
+    <div class="flowbar" id="flowbar"></div>
+  </div>
+  <aside id="inspector" style="display:none;width:300px"></aside>
+</div>
+<script>
+"use strict";
+/* ═══ CAMERA ═══ */
+const cam = (() => {
+  let x=0, y=0, scale=1; const stage=document.getElementById("stage");
+  const apply=()=>{ stage.style.transform=`translate(${x}px,${y}px) scale(${scale})`; };
+  const card=document.getElementById("card");
+  let drag=null;
+  card.addEventListener("mousedown",e=>{ if(e.target.closest(".node"))return; drag={mx:e.clientX,my:e.clientY,x,y}; });
+  window.addEventListener("mousemove",e=>{ if(!drag)return; x=drag.x+e.clientX-drag.mx; y=drag.y+e.clientY-drag.my; apply(); });
+  window.addEventListener("mouseup",()=>drag=null);
+  card.addEventListener("wheel",e=>{ e.preventDefault();
+    const r=card.getBoundingClientRect(), px=e.clientX-r.left, py=e.clientY-r.top;
+    const k=Math.exp(-e.deltaY*0.0012), ns=Math.min(2.5,Math.max(0.15,scale*k));
+    x=px-(px-x)*(ns/scale); y=py-(py-y)*(ns/scale); scale=ns; apply(); },{passive:false});
+  return {
+    get:()=>({x,y,scale}),
+    set:(nx,ny,ns)=>{x=nx;y=ny;scale=ns;apply();},
+    fit:(w,h)=>{ const r=card.getBoundingClientRect();
+      const s=Math.min((r.width-80)/w,(r.height-80)/h,1.4);
+      x=(r.width-w*s)/2; y=(r.height-h*s)/2; scale=s; apply(); },
+    toScreen:(wx,wy)=>({x:wx*scale+x, y:wy*scale+y}),
+  };
+})();
+/* ═══ MODEL ═══ */
+// All titles/subs/facts ported verbatim from docs/architecture/architecture.html (VIEWS) and system-overview.mmd — keep in sync; never invent numbers.
+const MODEL = (() => {
+const nodes = {
+  // ghost:true = visual de-emphasis only (dashed border, faded) — ghost nodes stay
+  // fully interactive (clickable, inspectable). g_* nodes are faded reference copies
+  // of L2 containers shown in the l3 diagram so flows can reach outside the app.
+  /* ── Context level ── */
+  user: {
+    title: "User / k6 load test",
+    sub: "browser · synthetic HTTP client",
+    plane: "client", parent: null,
+    facts: [
+      "Single exposed HTTP port: nginx :8080→80.",
+      "Entry point for browsers and the k6 load profiles; everything below the edge is reachable only on the internal compose network.",
+    ],
+  },
+  peakload: {
+    title: "Peakload Capstone System",
+    sub: "REST API · accounts · transactions · async settlement · HA Postgres/Redis",
+    plane: "app", parent: null, drill: "l2",
+    facts: [
+      "axum (Rust) ×2 replicas; modular monolith: accounts, transactions, notifications + shared_kernel.",
+      "202 Accepted write pipeline: reserve in Redis → intake worker → RabbitMQ → consumer batch → Patroni shards.",
+      "replicas: 2 × 1.0 CPU — deliberate; more replicas oversubscribe the 8-core host and inflate p95/p99.",
+      "Distroless + nonroot (UID 65532), read_only rootfs, cap_drop: ALL, no-new-privileges, pids ≤ 256.",
+    ],
+  },
+  obssys: {
+    title: "Observability",
+    sub: "Prometheus · Grafana · OTLP → Jaeger",
+    plane: "obs", parent: null,
+    facts: [
+      "Scrape /metrics on app replicas; default ON with shard1,prometheus,grafana COMPOSE_PROFILES.",
+      "Trace context propagated HTTP → AMQP headers → consumer joins the same trace.",
+      "otel-collector, Jaeger and cAdvisor are opt-in profiles; otel dep is required: false so tracing degrades gracefully.",
+    ],
+  },
+
+  /* ── L2 — containers (parent: peakload) ── */
+  nginx: {
+    title: "nginx (edge)",
+    sub: ":8080→80 · per-IP 2000 r/s · global 50k r/s",
+    plane: "edge", parent: "peakload",
+    facts: [
+      ":8080→80 · per-IP 2000 r/s (zone per_ip, 20m) · global 50 000 r/s (zone global, 2m); both return 429.",
+      "proxy_pass · GET /api/v2/transactions micro-cached 1s (X-Cache-Status header); other API routes uncached.",
+      "/health and /metrics bypass rate limits and cache entirely.",
+      "limit_conn conn_per_ip 5000 caps concurrent connections per client.",
+    ],
+  },
+  app: {
+    title: "app ×2 — axum modular monolith",
+    sub: "accounts · transactions · notifications · in-proc workers",
+    plane: "app", parent: "peakload", drill: "l3",
+    facts: [
+      "replicas: 2 × 1.0 CPU; one binary wires three module crates (accounts, transactions, notifications) + shared_kernel.",
+      "Boot is gated on pgbouncer-shard0 healthy, schema bootstrap + migrator completed, redis + sentinel + rabbitmq healthy.",
+      "Healthcheck execs the binary itself: peakload-capstone --health-check every 10s.",
+      "Hardened: distroless + nonroot UID 65532, read_only rootfs, cap_drop: ALL, pids ≤ 256, /tmp tmpfs 64m.",
+    ],
+  },
+  redism: {
+    title: "redis-master",
+    sub: "cache + idemp reserve · AOF everysec",
+    plane: "redis", parent: "peakload",
+    facts: [
+      "Roles: tiered-cache L2, idempotency reservations (SETNX), pending/inflight intake lists, rate-limit state.",
+      "Persistence: appendonly yes + appendfsync everysec → ≤1s loss bound on master crash.",
+      "App connects Sentinel-aware: REDIS_SENTINEL_NODES (3 nodes), master name peakload-master, monitor interval 5s.",
+    ],
+  },
+  redisr: {
+    title: "redis-replica",
+    sub: "read offload (REDIS_READ_URL)",
+    plane: "redis", parent: "peakload",
+    facts: [
+      "Async replica of the master; cache reads offloaded via REDIS_READ_URL=redis://…@redis-replica:6379.",
+      "Promotion candidate when Sentinel quorum declares the master down.",
+    ],
+  },
+  sentinels: {
+    title: "Sentinel ×3",
+    sub: "master \"peakload-master\" · quorum promote",
+    plane: "redis", parent: "peakload",
+    facts: [
+      "Three Sentinels monitor peakload-master; quorum promotes the replica on master failure.",
+      "The app re-resolves the master through Sentinel — no restart needed after promotion.",
+    ],
+  },
+  rabbit: {
+    title: "RabbitMQ",
+    sub: "transactions.process · DLX → DLQ",
+    plane: "mq", parent: "peakload",
+    facts: [
+      "One work queue: transactions.process, durable, with DLX → DLQ for poison messages.",
+      "Producers: redis-intake + publish-outbox workers. Consumer: in-app batch consumer, prefetch 200.",
+      "Dead-letter exchange routes undeserializable or NULL reference_id messages to the DLQ.",
+    ],
+  },
+  dlq: {
+    title: "DLQ — transactions.dead_letter",
+    sub: "via DLX peakload.transactions.dlx",
+    plane: "mq", parent: "peakload",
+    facts: [
+      "Receives poison messages: bad JSON, NULL reference_id (would bypass ON CONFLICT dedupe).",
+      "No automatic requeue — drain procedure lives in the RabbitMQ backlog-drain runbook.",
+    ],
+  },
+  pgb: {
+    title: "pgbouncer shard0 · shard1",
+    sub: "transaction pooling — writes · max_db_conn 200",
+    plane: "pg", parent: "peakload",
+    facts: [
+      "Transaction-pooling pgBouncer in front of each shard's primary; MAX_DB_CONNECTIONS=200 caps backend connections.",
+      "Write path: app → pgbouncer-shard0 → HAProxy primary fe :5000 (shard0) / :5001 (shard1) → Patroni primary.",
+      "Consumer prefetch (200) is sized to stay within this connection cap.",
+      "pgbouncer-shard1 is profile-gated: active because COMPOSE_PROFILES=shard1,prometheus,grafana includes shard1.",
+    ],
+  },
+  haproxy: {
+    title: "pg-haproxy",
+    sub: "primary fe :5000/:5001 · replica fe :5010/:5011",
+    plane: "pg", parent: "peakload",
+    facts: [
+      "Single HAProxy routes both directions: primary frontends :5000 (shard0) / :5001 (shard1), replica frontends :5010 / :5011.",
+      "Backend selection via Patroni REST health probes — primary fe routes to the primary node, replica fe to the replica.",
+      "Failover = probes flip = routing flips; clients keep one stable address.",
+    ],
+  },
+  shard0: {
+    title: "shard0 — Patroni pair",
+    sub: "node-a + node-b · streaming repl",
+    plane: "pg", parent: "peakload",
+    facts: [
+      "Always-on shard: pg-shard0-node-a + node-b, Patroni-managed streaming replication.",
+      "Accounts are routed to shards by hash (shard_for_account); shard0 is the default home.",
+    ],
+  },
+  shard1: {
+    title: "shard1 — Patroni pair",
+    sub: "profile shard1 — ON by default",
+    plane: "pg", parent: "peakload",
+    facts: [
+      "Profile shard1 — ON in the default COMPOSE_PROFILES=shard1,prometheus,grafana.",
+      "Identical Patroni pair shape as shard0; writes arrive via pgbouncer-shard1 → HAProxy :5001.",
+    ],
+  },
+  etcd: {
+    title: "etcd ×3",
+    sub: "Patroni DCS · leader lease · quorum",
+    plane: "infra", parent: "peakload",
+    facts: [
+      "Three-node etcd = Patroni's DCS: leader election, cluster config, member state.",
+      "Tolerates one node loss; quorum lost → Patroni demotes all primaries to read-only (split-brain prevention).",
+      "No external port exposure.",
+    ],
+  },
+  jobs: {
+    title: "db-bootstrap-schema · db-migrator",
+    sub: "one-shot init.sql + sqlx migrate; gate app start",
+    plane: "infra", parent: "peakload",
+    facts: [
+      "db-bootstrap-schema: one-shot psql apply of db/init.sql per shard primary (idempotent).",
+      "db-migrator: the app binary with --migrate applies sqlx migrations with 60s lock/statement timeouts.",
+      "Both must complete before the app starts (service_completed_successfully).",
+    ],
+  },
+
+  /* ── L3 — app components (parent: app) ── */
+  wrap: {
+    title: "outer wrappers",
+    sub: "CORS → TraceLayer → TimeoutLayer → request_id",
+    plane: "app", parent: "app",
+    facts: [
+      "Outside the protection stack proper: CORS, TraceLayer (http.request spans), TimeoutLayer, request-id injector.",
+      "These run before/around everything so even shed requests get traced and stamped.",
+    ],
+  },
+  sl1: {
+    title: "1 · backpressure",
+    sub: "semaphore · wait ≤ 50ms → 503",
+    plane: "app", parent: "app",
+    facts: [
+      "Semaphore-bounded concurrency. A request waits up to BACKPRESSURE_WAIT_MS=50 (default) for a permit, then sheds 503 + Retry-After.",
+      "Outermost stack layer: cheapest rejection happens before any other work.",
+    ],
+  },
+  sl2: {
+    title: "2 · circuit breaker",
+    sub: "CLOSED / OPEN / HALF_OPEN · threshold 50",
+    plane: "app", parent: "app",
+    facts: [
+      "Three states tracked lock-free: CLOSED / OPEN / HALF_OPEN (CAS transitions).",
+      "Failure threshold default CIRCUIT_BREAKER_FAILURE_THRESHOLD=50.",
+      "Sits above rate-limit/auth so an open breaker sheds before they spend cycles.",
+    ],
+  },
+  sl3: {
+    title: "3 · rate limit",
+    sub: "64-shard counters · 2000 r/s burst 4000 → 429",
+    plane: "app", parent: "app",
+    facts: [
+      "Token accounting sharded across SHARDS=64 lock stripes to avoid a single hot mutex.",
+      "Defaults RATE_LIMIT_PER_SECOND=2000, RATE_LIMIT_BURST=4000; rejection = 429 + Retry-After.",
+      "Second line behind nginx's per-IP/global zones — defence in depth.",
+    ],
+  },
+  sl4: {
+    title: "4 · auth (JWT)",
+    sub: "HS256-pinned validator · ENABLE_AUTH=false default",
+    plane: "app", parent: "app",
+    facts: [
+      "Validator and decoding key are process-wide statics, pinned to HS256 — an HS512-signed token is rejected (S-1 regression test).",
+      "ENABLE_AUTH=false by default (exhibition mode); when on, boot fails closed if issuer/audience config is missing.",
+    ],
+  },
+  sl5: {
+    title: "5 · degradation gate",
+    sub: "R-9 posture · read_only sheds writes 503",
+    plane: "app", parent: "app",
+    facts: [
+      "R-9 operator posture: DEGRADATION_MODE=normal default; read_only sheds writes with 503 while reads keep flowing.",
+      "Flippable at runtime via PUT /api/v2/admin/degradation — no restart required.",
+    ],
+  },
+  sl6: {
+    title: "6 · metrics",
+    sub: "http_requests_total — shed traffic excluded",
+    plane: "app", parent: "app",
+    facts: [
+      "Innermost layer records http_requests_total + latency histograms — by position, traffic shed at L1–L5 never pollutes success-rate metrics.",
+      "Shed traffic is counted by per-layer shed counters instead.",
+    ],
+  },
+  router: {
+    title: "module routers + handlers",
+    sub: "accounts · transactions · notifications · health",
+    plane: "app", parent: "app",
+    facts: [
+      "Module routers merged in bootstrap: accounts, transactions, notifications + health/metrics endpoints.",
+      "Admin router mounts with an extra require_admin_middleware gate (/api/v2/admin/*).",
+    ],
+  },
+  idemp: {
+    title: "shard + idempotency key",
+    sub: "txn:{shard}:{reference_id} · SHA-256 · injective",
+    plane: "app", parent: "app",
+    facts: [
+      "Shard = hash(from_account). Key = txn:{shard}:{reference_id} — shard embedded so equal reference_ids on different shards stay distinct (injectivity property-tested).",
+      "SHA-256 of the canonical payload becomes request_hash — replays with different bodies are detected as conflicts.",
+      "Reserve = SETNX v1:idemp:{key} (TTL 86 400s = 24h) + LPUSH v1:idemp_pending:s{shard}.",
+    ],
+  },
+  shed: {
+    title: "shed responses",
+    sub: "503 / 429 / 401 + Retry-After",
+    plane: "edge", parent: "app",
+    facts: [
+      "Every layer rejects with the cheapest possible response + Retry-After where meaningful.",
+      "Each shed increments its own counter family — dashboards can tell which layer is shedding.",
+    ],
+  },
+  intake: {
+    title: "redis-intake worker",
+    sub: "RPOPLPUSH pending→inflight · 16-way publish · idle 10ms",
+    plane: "app", parent: "app",
+    facts: [
+      "Drains v1:idemp_pending:s{shard} with RPOPLPUSH pending→inflight — atomic claim; crash-restart drains inflight first so nothing is lost.",
+      "Idle tick 10ms · error backoff 500ms · publish concurrency 16 · queue-depth sampled every 5s.",
+      "GETs the full entry from the master pool to avoid replication-lag staleness.",
+    ],
+  },
+  pubout: {
+    title: "publish-outbox worker",
+    sub: "fallback lane · batch 25 · lease 600s",
+    plane: "app", parent: "app", ghost: true,
+    facts: [
+      "Companion worker for the PG-fallback lane: leases unpublished outbox rows (lease 600s), publishes to RabbitMQ in batches of 25, concurrency 8.",
+    ],
+  },
+  consumer: {
+    title: "consumer — batch & flush",
+    sub: "size-flush 200 · idle-flush 250ms · tick 50ms",
+    plane: "app", parent: "app",
+    facts: [
+      "Buffers deliveries; flushes on size (BATCH_SIZE=200) or idle (IDLE_FLUSH_MS=250, checked every CHECK_INTERVAL_MS=50).",
+      "250ms idle window exists because the old fixed 50ms timer fired before batches accumulated (avg 2.1 msgs/batch).",
+      "Each message's span is parented to the originating HTTP trace via AMQP headers (traceparent propagation).",
+    ],
+  },
+  xshard: {
+    title: "cross-shard processor",
+    sub: "poll 250ms · lease 60s · credit CTE · retry ≤10 → refund",
+    plane: "app", parent: "app",
+    facts: [
+      "Receiver lives on another shard → function emits a row into the transactional outbox (same txn as the debit).",
+      "Processor claims with FOR UPDATE SKIP LOCKED, lease 60s; poll 250ms; batch 100; apply concurrency 8.",
+      "Credits receiver shard idempotently (ON CONFLICT … DO NOTHING); retries ≤ MAX_ATTEMPTS=10 → refund (R-8).",
+    ],
+  },
+  bus: {
+    title: "event bus",
+    sub: "transactions.committed · tokio broadcast 8192",
+    plane: "app", parent: "app",
+    facts: [
+      "tokio::broadcast bus, capacity 8192; event name transactions.committed.",
+      "In-process by design (ADR-0004): consumers are the cache invalidator and the notifications dispatcher.",
+    ],
+  },
+  cacheinv: {
+    title: "cache invalidator",
+    sub: "DEL txn:{id} · tx_status:{ref} · txn_list:*",
+    plane: "redis", parent: "app",
+    facts: [
+      "Subscriber DELs txn:{id}, tx_status:{reference_id} and txn_list:* buckets on every commit event.",
+      "Bounds read staleness to the TTLs even if an event is missed.",
+    ],
+  },
+  notifd: {
+    title: "notifications dispatcher",
+    sub: "dedupe 4096 · ring 512",
+    plane: "app", parent: "app",
+    facts: [
+      "Dispatcher dedupes on a 4096-entry sliding window, stores into a 512-slot ring buffer.",
+      "GET /api/v2/notifications/recent clamps limit to ≤200.",
+    ],
+  },
+
+  /* ── L3 ghost context neighbors (parent: peakload, ghost: true) ── */
+  g_nginx: {
+    title: "nginx (edge)",
+    sub: ":8080→80 · per-IP 2000 r/s · global 50k r/s",
+    plane: "edge", parent: "peakload", ghost: true,
+    facts: [
+      "Faded reference of the L2 nginx container — see Containers view for full facts.",
+    ],
+  },
+  g_redis: {
+    title: "redis-master",
+    sub: "cache + idemp reserve · AOF everysec",
+    plane: "redis", parent: "peakload", ghost: true,
+    facts: [
+      "Faded reference of the L2 redis-master container — see Containers view for full facts.",
+    ],
+  },
+  g_rabbit: {
+    title: "RabbitMQ",
+    sub: "transactions.process · DLQ",
+    plane: "mq", parent: "peakload", ghost: true,
+    facts: [
+      "Faded reference of the L2 RabbitMQ container — see Containers view for full facts.",
+    ],
+  },
+  g_pg: {
+    title: "PostgreSQL plane",
+    sub: "pgbouncer → haproxy → Patroni shards",
+    plane: "pg", parent: "peakload", ghost: true,
+    facts: [
+      "Faded reference of the L2 PostgreSQL containers (pgbouncer, haproxy, shard0/1) — see Containers view for full facts.",
+    ],
+  },
+};
+
+const diagrams = {
+  l1: {
+    title: "Context",
+    crumb: "Diagrams › Context",
+    w: 1200, h: 720,
+    nodes: ["user", "peakload", "obssys"],
+    layout: {
+      user:     { x: 90,  y: 300, w: 260 },
+      peakload: { x: 520, y: 240, w: 430 },
+      obssys:   { x: 560, y: 540, w: 320 },
+    },
+    edges: [
+      { from: "user",     to: "peakload", label: "HTTPS :8080" },
+      { from: "peakload", to: "obssys",   kind: "obs", label: "metrics · traces" },
+    ],
+    aliases: { "*": "peakload", user: "user", obssys: "obssys" },
+  },
+
+  l2: {
+    title: "Containers",
+    crumb: "Diagrams › Peakload › Containers",
+    w: 1400, h: 1000,
+    nodes: ["user", "nginx", "app", "jobs", "obssys", "redism", "redisr", "sentinels",
+            "pgb", "haproxy", "shard0", "shard1", "etcd", "rabbit", "dlq"],
+    layout: {
+      user:     { x: 200,  y: 40,  w: 200 },
+      nginx:    { x: 560,  y: 40,  w: 280 },
+      app:      { x: 520,  y: 200, w: 360 },
+      jobs:     { x: 140,  y: 200, w: 260 },
+      obssys:   { x: 1080, y: 60,  w: 260 },
+      redism:   { x: 80,   y: 420, w: 220 },
+      redisr:   { x: 80,   y: 545, w: 220 },
+      sentinels:{ x: 80,   y: 670, w: 220 },
+      pgb:      { x: 560,  y: 430, w: 280 },
+      haproxy:  { x: 560,  y: 570, w: 280 },
+      shard0:   { x: 440,  y: 730, w: 220 },
+      shard1:   { x: 690,  y: 730, w: 220 },
+      etcd:     { x: 1010, y: 730, w: 180 },
+      rabbit:   { x: 1060, y: 430, w: 240 },
+      dlq:      { x: 1060, y: 570, w: 240 },
+    },
+    edges: [
+      { from: "user",     to: "nginx",   label: ":8080" },
+      { from: "nginx",    to: "app",     label: "proxy · X-Real-IP" },
+      // app→redism: drop below jobs (bottom=278) at x=450, then go left to redism, avoiding jobs
+      { from: "app",      to: "redism",  fromSide: "bottom", toSide: "top",
+        via: [{x: 450, y: 320}, {x: 190, y: 320}],                        label: "cache + SETNX" },
+      { from: "redism",   to: "redisr",  kind: "dashed", label: "async repl" },
+      { from: "sentinels",to: "redism",  kind: "dashed", fromSide: "left", toSide: "left", label: "monitor / promote" },
+      { from: "app",      to: "pgb",     label: "writes" },
+      { from: "pgb",      to: "haproxy", label: "primary fe :5000/:5001" },
+      { from: "app",      to: "haproxy", kind: "dashed", fromSide: "right", toSide: "right", label: "reads :5010/:5011" },
+      { from: "haproxy",  to: "shard0" },
+      { from: "haproxy",  to: "shard1" },
+      // etcd→shard0: route below shard1 (bottom=791) to avoid crossing it
+      { from: "etcd",     to: "shard0",  kind: "dashed", fromSide: "bottom", toSide: "bottom",
+        via: [{x: 550, y: 860}],                                           label: "leader lease" },
+      { from: "etcd",     to: "shard1",  kind: "dashed", label: "leader lease" },
+      { from: "app",      to: "rabbit",  kind: "dashed", fromSide: "right", toSide: "top", label: "publish / consume (prefetch 200)" },
+      { from: "rabbit",   to: "dlq",     kind: "danger", label: "poison via DLX" },
+      // jobs→haproxy: route via x=460 corridor (between jobs.right=400 and pgb.left=560) to avoid pgb
+      { from: "jobs",     to: "haproxy", kind: "dashed", fromSide: "right", toSide: "left",
+        via: [{x: 460, y: 600}],                                           label: "one-shot via primary fe" },
+      { from: "obssys",   to: "app",     kind: "obs", fromSide: "left", toSide: "right", label: "scrape /metrics · OTLP" },
+    ],
+    aliases: { "*": "app" },
+  },
+
+  l3: {
+    title: "App components",
+    crumb: "Diagrams › Peakload › App › Components",
+    w: 1750, h: 1280,
+    nodes: [
+      "g_nginx",
+      "wrap", "sl1", "sl2", "sl3", "sl4", "sl5", "sl6", "router", "idemp",
+      "shed",
+      "intake", "pubout", "consumer", "xshard", "bus", "cacheinv", "notifd",
+      "g_redis", "g_rabbit", "g_pg",
+    ],
+    layout: {
+      // ── center lane (protection stack) ──────────────────────────────────
+      g_nginx:  { x: 560,  y: 30,   w: 280 },
+      wrap:     { x: 480,  y: 150,  w: 380 },
+      sl1:      { x: 480,  y: 265,  w: 380 },
+      sl2:      { x: 480,  y: 380,  w: 380 },
+      sl3:      { x: 480,  y: 495,  w: 380 },
+      sl4:      { x: 480,  y: 610,  w: 380 },
+      sl5:      { x: 480,  y: 725,  w: 380 },
+      sl6:      { x: 480,  y: 840,  w: 380 },
+      router:   { x: 480,  y: 955,  w: 380 },
+      idemp:    { x: 480,  y: 1070, w: 380 },
+      // ── left lane (shed responses) ──────────────────────────────────────
+      shed:     { x: 100,  y: 495,  w: 240 },
+      // ── right lane (async workers) ─ x=1060, corridor right of x=1340 ──
+      // Order follows the data flow chain: intake→pubout→consumer→bus→cacheinv→notifd→xshard
+      // Adjacent ordering eliminates consumer→bus and bus→cacheinv crossings.
+      intake:   { x: 1060, y: 250,  w: 280 },
+      pubout:   { x: 1060, y: 390,  w: 280 },
+      consumer: { x: 1060, y: 510,  w: 280 },
+      bus:      { x: 1060, y: 630,  w: 280 },
+      cacheinv: { x: 1060, y: 750,  w: 280 },
+      notifd:   { x: 1060, y: 870,  w: 280 },
+      xshard:   { x: 1060, y: 990,  w: 280 },
+      // ── far-right column (external deps) ─ x=1450, clear of worker lane ─
+      // g_rabbit and g_pg sit beside consumer/xshard rows; g_redis above g_rabbit
+      // so the g_redis→intake riser stays in the far-right corridor (x≈1390-1450).
+      g_redis:  { x: 1450, y: 120,  w: 240 },
+      g_rabbit: { x: 1450, y: 430,  w: 240 },
+      g_pg:     { x: 1450, y: 600,  w: 240 },
+    },
+    edges: [
+      { from: "g_nginx",  to: "wrap" },
+      { from: "wrap",     to: "sl1" },
+      { from: "sl1",      to: "sl2" },
+      { from: "sl2",      to: "sl3" },
+      { from: "sl3",      to: "sl4" },
+      { from: "sl4",      to: "sl5" },
+      { from: "sl5",      to: "sl6" },
+      { from: "sl6",      to: "router" },
+      { from: "router",   to: "idemp" },
+      // shed edges — only l1/l3/l5 drawn (the loudest shedders)
+      { from: "sl1",      to: "shed",   kind: "danger", fromSide: "left", toSide: "top",    label: "503" },
+      { from: "sl3",      to: "shed",   kind: "danger", fromSide: "left", toSide: "right",  label: "429" },
+      { from: "sl5",      to: "shed",   kind: "danger", fromSide: "left", toSide: "bottom", label: "503 writes" },
+      // idemp → g_redis: go right, then down below worker column, then right to x=1395 corridor,
+      // then up to g_redis (which sits above all worker/depot cards at y=120).
+      // via hugs the far-right corridor so no worker card is crossed.
+      { from: "idemp",    to: "g_redis",                fromSide: "right", toSide: "left",
+        via: [{x: 1395, y: 1150}, {x: 1395, y: 150}],                                       label: "SETNX + LPUSH" },
+      // g_redis→intake: g_redis bottom → intake right; both are in far-right / worker area,
+      // short downward+leftward hop that stays above g_rabbit (y=430).
+      { from: "g_redis",  to: "intake",                 fromSide: "bottom", toSide: "right", label: "pending list" },
+      // intake → g_rabbit: direct rightward; intake → g_pg: via waypoint below g_rabbit
+      { from: "intake",   to: "g_rabbit",               fromSide: "right", toSide: "left",  label: "publish" },
+      { from: "intake",   to: "g_pg",                   fromSide: "right", toSide: "top",
+        via: [{x: 1395, y: 580}],                                                            label: "durable INSERT" },
+      { from: "pubout",   to: "g_rabbit", kind: "dashed", fromSide: "right", toSide: "left" },
+      { from: "g_rabbit", to: "consumer",               fromSide: "left",  toSide: "right", label: "deliver ≤200" },
+      { from: "consumer", to: "g_pg",                   fromSide: "right", toSide: "left",  label: "apply batch" },
+      { from: "consumer", to: "bus" },
+      { from: "xshard",   to: "g_pg",                   fromSide: "right", toSide: "left" },
+      // xshard→bus goes UP past notifd+cacheinv — route through left corridor (x≈940)
+      { from: "xshard",   to: "bus",     kind: "dashed", fromSide: "left", toSide: "left",
+        via: [{x: 940, y: 660}] },
+      { from: "bus",      to: "cacheinv" },
+      // bus→notifd skips cacheinv — route through left corridor (x≈940)
+      { from: "bus",      to: "notifd",                 fromSide: "left",  toSide: "left",
+        via: [{x: 940, y: 900}] },
+      // cacheinv → g_redis: go right, past the depot column, then up to g_redis top.
+      // Route via x=1720 (right of depot right edge=1690) to avoid clipping g_pg and g_rabbit.
+      { from: "cacheinv", to: "g_redis", kind: "danger", fromSide: "right", toSide: "right",
+        via: [{x: 1720, y: 780}, {x: 1720, y: 150}],                                        label: "DEL" },
+    ],
+    aliases: {
+      "*":      "router",
+      user:     "g_nginx",
+      nginx:    "g_nginx",
+      redism:   "g_redis",
+      rabbit:   "g_rabbit",
+      dlq:      "g_rabbit",
+      pgb:      "g_pg",
+      haproxy:  "g_pg",
+      shard0:   "g_pg",
+      shard1:   "g_pg",
+    },
+  },
+};
+
+return { nodes, diagrams };
+})();
+
+/* ═══ RENDER ═══ */
+let EDGEIDX = {};
+
+function rectOf(nodeId) {
+  const el = document.getElementById("n-" + nodeId);
+  if (!el) return null;
+  const d = nav.current() ? MODEL.diagrams[nav.current()] : null;
+  const layout = d && d.layout[nodeId];
+  if (!layout) return null;
+  return { x: layout.x, y: layout.y, w: layout.w, h: el.offsetHeight };
+}
+
+function edgePath(a, b, e) {
+  const side = (r, s) => ({
+    top:    [r.x + r.w / 2,  r.y],
+    bottom: [r.x + r.w / 2,  r.y + r.h],
+    left:   [r.x,             r.y + r.h / 2],
+    right:  [r.x + r.w,       r.y + r.h / 2],
+  })[s];
+  let fs = e.fromSide, ts = e.toSide;
+  if (!fs || !ts) {
+    const dy = b.y - (a.y + a.h);
+    const dx = (b.x + b.w / 2) - (a.x + a.w / 2);
+    if (!fs) fs = dy >= 0 ? "bottom" : (Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "right" : "left") : "top");
+    if (!ts) ts = dy >= 0 ? "top"    : (Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "left"  : "right") : "bottom");
+  }
+  const [x1, y1] = side(a, fs);
+  const [x2, y2] = side(b, ts);
+  const n = { top:[0,-1], bottom:[0,1], left:[-1,0], right:[1,0] };
+  const tension = Math.max(40, Math.hypot(x2 - x1, y2 - y1) * 0.4);
+
+  // Support optional via waypoints: e.via = [{x,y}, ...].
+  // Each waypoint is a pass-through point; tangents are axis-aligned (horizontal
+  // departure/arrival) so the path hugs corridors cleanly. We build a chain of
+  // cubic Bézier segments: start→via[0]→via[1]→…→end.
+  if (e.via && e.via.length) {
+    const pts = [{x: x1, y: y1, nx: n[fs][0], ny: n[fs][1]},
+                 ...e.via.map(v => ({x: v.x, y: v.y, nx: 0, ny: 0})),
+                 {x: x2, y: y2, nx: n[ts][0], ny: n[ts][1]}];
+    let d = `M${x1},${y1}`;
+    for (let i = 1; i < pts.length; i++) {
+      const p0 = pts[i - 1], p1 = pts[i];
+      const segLen = Math.max(40, Math.hypot(p1.x - p0.x, p1.y - p0.y) * 0.45);
+      // Outgoing tangent from p0
+      const ox = p0.nx !== 0 || p0.ny !== 0 ? p0.nx * segLen : (p1.x - p0.x) * 0.5;
+      const oy = p0.nx !== 0 || p0.ny !== 0 ? p0.ny * segLen : 0;
+      // Incoming tangent into p1
+      const ix = p1.nx !== 0 || p1.ny !== 0 ? p1.nx * segLen : (p0.x - p1.x) * 0.5;
+      const iy = p1.nx !== 0 || p1.ny !== 0 ? p1.ny * segLen : 0;
+      d += ` C${p0.x + ox},${p0.y + oy} ${p1.x + ix},${p1.y + iy} ${p1.x},${p1.y}`;
+    }
+    return d;
+  }
+
+  return `M${x1},${y1} C${x1+n[fs][0]*tension},${y1+n[fs][1]*tension} ${x2+n[ts][0]*tension},${y2+n[ts][1]*tension} ${x2},${y2}`;
+}
+
+function renderDiagram(diagramId) {
+  const d = MODEL.diagrams[diagramId];
+  if (!d) return;
+  const nodesEl  = document.getElementById("nodes");
+  const wiresEl  = document.getElementById("wires");
+
+  // Clear
+  nodesEl.innerHTML = "";
+  // Keep defs if already present, rebuild wires content
+  wiresEl.innerHTML = "";
+  wiresEl.setAttribute("width",  d.w);
+  wiresEl.setAttribute("height", d.h);
+  wiresEl.style.width  = d.w + "px";
+  wiresEl.style.height = d.h + "px";
+
+  // SVG defs — arrowhead markers
+  const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+  defs.innerHTML =
+    '<marker id="arr-flow"   viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8b93a3"/></marker>' +
+    '<marker id="arr-dashed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8b93a3"/></marker>' +
+    '<marker id="arr-danger" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d9534f"/></marker>' +
+    '<marker id="arr-obs"    viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8a5fd6"/></marker>';
+  wiresEl.appendChild(defs);
+
+  // Create node cards
+  for (const nodeId of d.nodes) {
+    const node   = MODEL.nodes[nodeId];
+    const layout = d.layout[nodeId];
+    if (!node || !layout) continue;
+
+    const el = document.createElement("div");
+    el.className = "node" + (node.ghost ? " ghost" : "");
+    el.id = "n-" + nodeId;
+    el.style.cssText = `left:${layout.x}px;top:${layout.y}px;width:${layout.w}px;--pc:var(--c-${node.plane})`;
+
+    const h4 = document.createElement("h4");
+    h4.textContent = node.title;
+    el.appendChild(h4);
+
+    if (node.sub) {
+      const p = document.createElement("p");
+      p.textContent = node.sub;
+      el.appendChild(p);
+    }
+
+    if (node.drill) {
+      const btn = document.createElement("button");
+      btn.className = "drill";
+      btn.title = "Drill in";
+      btn.textContent = "⊕";
+      el.appendChild(btn);
+    }
+
+    nodesEl.appendChild(el);
+  }
+
+  // Force layout so offsetHeight is available
+  nodesEl.offsetHeight; // eslint-disable-line no-unused-expressions
+
+  // Build rectOf lookup (world-space rects from layout + measured heights)
+  const rects = {};
+  for (const nodeId of d.nodes) {
+    const layout = d.layout[nodeId];
+    const el = document.getElementById("n-" + nodeId);
+    if (!layout || !el) continue;
+    rects[nodeId] = { x: layout.x, y: layout.y, w: layout.w, h: el.offsetHeight };
+  }
+
+  // Draw edges
+  const newEDGEIDX = {};
+  for (const e of d.edges) {
+    const a = rects[e.from];
+    const b = rects[e.to];
+    if (!a || !b) continue;
+
+    const kind    = e.kind || "flow";
+    const pathStr = edgePath(a, b, e);
+
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", pathStr);
+    path.setAttribute("class", "edge" + (kind !== "flow" ? " " + kind : ""));
+    path.setAttribute("marker-end", "url(#arr-" + kind + ")");
+    wiresEl.appendChild(path);
+
+    // Edge label at path midpoint
+    if (e.label) {
+      // Append path temporarily to measure it (it's already in DOM)
+      const len = path.getTotalLength();
+      const mid = path.getPointAtLength(len / 2);
+      const txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      txt.setAttribute("class", "elabel");
+      txt.setAttribute("x", mid.x);
+      txt.setAttribute("y", mid.y - 4);
+      txt.setAttribute("text-anchor", "middle");
+      txt.textContent = e.label;
+      wiresEl.appendChild(txt);
+    }
+
+    // Store on edge object and in index
+    e._path = path;
+    newEDGEIDX[e.from + "→" + e.to] = e;
+  }
+
+  EDGEIDX = newEDGEIDX;
+  cam.fit(d.w, d.h);
+}
+
+/* ═══ NAV ═══ */
+const nav = (() => {
+  let _current = null;
+  return {
+    open(diagramId) {
+      _current = diagramId;
+      renderDiagram(diagramId);
+    },
+    current() { return _current; },
+  };
+})();
+
+// Boot
+nav.open("l1");
+
+window.icepanel = { cam, MODEL, nav, rectOf, EDGEIDX: () => EDGEIDX };
+</script></body></html>
